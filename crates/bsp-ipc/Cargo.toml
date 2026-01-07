@@ -1,0 +1,10 @@
+[package]
+name = "bsp-ipc"
+description = "bspwm-compatible control socket protocol."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bsp-core = { path = "../bsp-core" }

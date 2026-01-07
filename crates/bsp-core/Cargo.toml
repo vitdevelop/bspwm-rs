@@ -1,0 +1,13 @@
+[package]
+name = "bsp-core"
+description = "Pure-logic bspwm tree, desktop, monitor and rule engine (no Wayland dependency)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"

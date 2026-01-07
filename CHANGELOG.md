@@ -1,0 +1,52 @@
+# Changelog
+
+Every function added, changed or removed, newest first. The matching `docs/<crate>.md` file is updated in the same commit.
+
+| Date | Crate | Change | Function | Summary |
+| --- | --- | --- | --- | --- |
+| 2026-01-07 | bsp-core | Added | `Rule::matches` | Matches a window's class/instance/title against a rule's patterns (`*` or exact string, not a glob) |
+| 2026-01-07 | bsp-core | Added | `adapt_geometry` | Proportionally repositions floating clients when their bounding rectangle changes |
+| 2026-01-07 | bsp-core | Added | `Monitor::arrange` | Computes a desktop's starting rectangle from monitor/desktop padding and gap, then lays it out |
+| 2026-01-07 | bsp-core | Added | `Monitor::swap_desktops` | Swaps two desktops' positions on one monitor |
+| 2026-01-07 | bsp-core | Added | `Monitor::activate_desktop` | Focuses a desktop by index |
+| 2026-01-07 | bsp-core | Added | `Monitor::remove_desktop` | Removes a desktop, refocusing a neighbor |
+| 2026-01-07 | bsp-core | Added | `Monitor::add_desktop` | Appends a desktop, inheriting the monitor's gap/border width |
+| 2026-01-07 | bsp-core | Added | `Monitor::rename` | Renames a monitor |
+| 2026-01-07 | bsp-core | Added | `Monitor::new` | Creates a monitor with no desktops |
+| 2026-01-07 | bsp-core | Added | `Desktop::set_layout` | Sets tiled/monocle layout, tracking the user's choice separately from `single_monocle` overrides |
+| 2026-01-07 | bsp-core | Added | `Desktop::rename` | Renames a desktop |
+| 2026-01-07 | bsp-core | Added | `Desktop::new` | Creates an empty desktop with settings-derived defaults |
+| 2026-01-07 | bsp-core | Added | `Tree::apply_layout` | Computes every node's rectangle for tiled/monocle layout, honoring split ratios and size constraints |
+| 2026-01-07 | bsp-core | Added | `Tree::circulate_leaves` | Rotates tiled leaves forward/backward through their tree positions |
+| 2026-01-07 | bsp-core | Added | `Tree::transplant_to` / `Tree::transplant_within` | Moves a node (and its subtree) to a new anchor, across trees or within one (**transplant**) |
+| 2026-01-07 | bsp-core | Added | `Tree::swap_nodes` | Exchanges two nodes' tree positions (**swap**) |
+| 2026-01-07 | bsp-core | Added | `Tree::adjust_ratios` | Recomputes split ratios so fences keep their pixel position under a new rectangle |
+| 2026-01-07 | bsp-core | Added | `Tree::balance_tree` | Sets split ratios proportional to each side's leaf count (**balance**) |
+| 2026-01-07 | bsp-core | Added | `Tree::equalize_tree` | Resets every split ratio in a subtree to the default (**equalize**) |
+| 2026-01-07 | bsp-core | Added | `Tree::flip_tree` | Mirrors a subtree across an axis (**flip**) |
+| 2026-01-07 | bsp-core | Added | `Tree::rotate_tree` | Rotates a subtree by 90/180/270 degrees (**rotate**) |
+| 2026-01-07 | bsp-core | Added | `Tree::remove_node` / `Tree::unlink_node` / `Tree::free_node` | Removes a node from the tree and frees its subtree |
+| 2026-01-07 | bsp-core | Added | `Tree::insert_node` | Inserts a node next to an anchor, splitting it (automatic scheme or preselection) (**split**) |
+| 2026-01-07 | bsp-core | Added | `Tree::find_public` | Finds the best non-private leaf for redirected automatic insertion |
+| 2026-01-07 | bsp-core | Added | `Tree::set_state` / `set_floating` / `set_fullscreen` | Client tiling-state transitions and their vacancy side effects |
+| 2026-01-07 | bsp-core | Added | `Tree::set_layer` | Sets a client's stacking layer |
+| 2026-01-07 | bsp-core | Added | `Tree::set_urgent` / `set_sticky` / `set_private` / `set_locked` / `set_marked` | Node/client flag setters |
+| 2026-01-07 | bsp-core | Added | `Tree::set_hidden` | Hides/shows a node, propagating vacancy for tiled clients |
+| 2026-01-07 | bsp-core | Added | `Tree::set_vacant` | Marks a node's slot vacant/occupied, propagating up and down the tree |
+| 2026-01-07 | bsp-core | Added | `Tree::rebuild_constraints_from_leaves` / `rebuild_constraints_towards_root` | Recomputes minimum-size constraints after a structural change |
+| 2026-01-07 | bsp-core | Added | `Tree::presel_dir` / `presel_ratio` / `cancel_presel` / `cancel_presel_in` | Preselection (pending split) management |
+| 2026-01-07 | bsp-core | Added | `Tree::get_rectangle` / `node_area` | Reads a node's effective/area rectangle |
+| 2026-01-07 | bsp-core | Added | `Tree::tiled_count` / `clients_count_in` / `sticky_count` / `private_count` / `locked_count` | Subtree counting helpers |
+| 2026-01-07 | bsp-core | Added | `Tree::is_focusable` | Whether a subtree has a visible client |
+| 2026-01-07 | bsp-core | Added | `Tree::next_leaf` / `prev_leaf` / `next_tiled_leaf` / `prev_tiled_leaf` | Leaf-order traversal |
+| 2026-01-07 | bsp-core | Added | `Tree::first_extrema` / `second_extrema` | Deepest first/second-child descendant |
+| 2026-01-07 | bsp-core | Added | `Tree::is_child` / `is_descendant` | Ancestry queries |
+| 2026-01-07 | bsp-core | Added | `Tree::brother` / `is_first_child` / `is_second_child` | Sibling/position queries |
+| 2026-01-07 | bsp-core | Added | `Tree::is_leaf` / `is_receptacle` | Leaf/receptacle queries |
+| 2026-01-07 | bsp-core | Added | `Tree::new` / `new_node` / `new_client_node` / `node` / `node_mut` / `contains` | Arena construction and access |
+| 2026-01-07 | bsp-core | Added | `Node::is_leaf` / `is_receptacle` / `parent` / `first_child` / `second_child` | Read-only node accessors |
+| 2026-01-07 | bsp-core | Added | `Client::new` | Creates a client in its default (tiled, normal layer) state |
+| 2026-01-07 | bsp-core | Added | `ClientState::is_tiled` | Whether a state counts as tiled (tiled or pseudo-tiled) |
+| 2026-01-07 | bsp-core | Added | `IdGen::new` / `alloc` | Monotonic id generator for desktops and monitors |
+| 2026-01-07 | bsp-core | Added | `WindowId`'s `Display` impl | Formats a window id |
+| 2026-01-07 | bsp-core | Added | `Rect::new` / `area` / `right` / `bottom` / `contains_rect` / `contains_point` | Rectangle geometry |

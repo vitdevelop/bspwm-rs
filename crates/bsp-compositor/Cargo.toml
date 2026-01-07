@@ -1,0 +1,16 @@
+[package]
+name = "bsp-compositor"
+description = "The Wayland compositor binary (bspwm-rs): rendering, input, outputs, protocols, XWayland."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bspwm-rs"
+path = "src/main.rs"
+
+[dependencies]
+bsp-core = { path = "../bsp-core" }
+bsp-ipc = { path = "../bsp-ipc" }
+bsp-hotkeys = { path = "../bsp-hotkeys" }
