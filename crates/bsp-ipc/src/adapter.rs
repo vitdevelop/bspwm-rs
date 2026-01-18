@@ -1,0 +1,100 @@
+//! The interface [`crate::exec`] needs from whatever manages real windows:
+//! `bsp-compositor` eventually, [`FakeAdapter`] for tests now (the "fake
+//! adapter" the the IPC roadmap names, `docs/design.md`).
+//!
+//! `bsp-core::node::Client` deliberately does not store a window's class
+//! and instance name (`docs/design.md`: "the adapter keeps the map from
+//! `WindowId` to Smithay windows"), and closing/killing a window is an
+//! action on the real window system that `bsp-ipc` cannot perform itself
+//! — both need this trait.
+
+use bsp_core::id::WindowId;
+
+/// What the executor needs from the window-system adapter.
+pub trait Adapter {
+    /// The class and instance name of `window`, for `query -T`'s JSON and
+    /// the `same_class` selector modifier. Returns empty strings for an
+    /// unknown window rather than failing: every caller treats "unknown"
+    /// the same as "empty" (bspwm always has this data by the time a
+    /// window is manageable, so the empty case does not arise there).
+    fn window_class(&self, window: WindowId) -> (String, String);
+
+    /// Asks `window` to close itself (bspwm: `close_node()`, `WM_DELETE_WINDOW`
+    /// on X11; the Wayland equivalent is `xdg_toplevel::close`).
+    fn close_window(&mut self, window: WindowId);
+
+    /// Forcibly terminates `window`'s client (bspwm: `kill_node()`,
+    /// `xcb_kill_client`; on Wayland this is killing the client process).
+    fn kill_window(&mut self, window: WindowId);
+}
+
+/// A recording, in-memory [`Adapter`] for tests: no real window system,
+/// just a class/instance lookup table and a record of what was closed or
+/// killed.
+#[derive(Debug, Clone, Default)]
+pub struct FakeAdapter {
+    /// Class/instance names to answer [`Adapter::window_class`] with.
+    pub classes: std::collections::HashMap<WindowId, (String, String)>,
+    /// Windows [`Adapter::close_window`] was called with, in call order.
+    pub closed: Vec<WindowId>,
+    /// Windows [`Adapter::kill_window`] was called with, in call order.
+    pub killed: Vec<WindowId>,
+}
+
+impl FakeAdapter {
+    /// An adapter with no windows registered yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `window`'s class/instance name for
+    /// [`Adapter::window_class`] to return.
+    pub fn set_class(&mut self, window: WindowId, class_name: &str, instance_name: &str) {
+        self.classes
+            .insert(window, (class_name.to_string(), instance_name.to_string()));
+    }
+}
+
+impl Adapter for FakeAdapter {
+    fn window_class(&self, window: WindowId) -> (String, String) {
+        self.classes.get(&window).cloned().unwrap_or_default()
+    }
+
+    fn close_window(&mut self, window: WindowId) {
+        self.closed.push(window);
+    }
+
+    fn kill_window(&mut self, window: WindowId) {
+        self.killed.push(window);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_adapter_returns_registered_class() {
+        let mut a = FakeAdapter::new();
+        a.set_class(WindowId(1), "Firefox", "Navigator");
+        assert_eq!(
+            a.window_class(WindowId(1)),
+            ("Firefox".to_string(), "Navigator".to_string())
+        );
+    }
+
+    #[test]
+    fn fake_adapter_returns_empty_for_unknown_window() {
+        let a = FakeAdapter::new();
+        assert_eq!(a.window_class(WindowId(9)), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn fake_adapter_records_close_and_kill() {
+        let mut a = FakeAdapter::new();
+        a.close_window(WindowId(1));
+        a.kill_window(WindowId(2));
+        assert_eq!(a.closed, vec![WindowId(1)]);
+        assert_eq!(a.killed, vec![WindowId(2)]);
+    }
+}

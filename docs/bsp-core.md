@@ -14,7 +14,8 @@ The pure-logic crate: it owns every piece of bspwm state and behavior and has no
 | `monitor` | Monitor name, rectangle, padding, desktop list, focused desktop, `arrange`, `adapt_geometry` |
 | `rules` | `bspc rule` entries matched on class, instance and name; `RuleConsequence` |
 | `settings` | Every `bspc config` key the tree engine reads, with bspwm's defaults |
-| `event` / `effect` / `state` (planned) | `Event` enum, `Effect` enum, `Wm` struct tying everything to an adapter — not started; needs the IPC/3's command and adapter layers to have a shape worth committing to |
+| `wm` | `Wm`: every monitor, the focused one, the global rule list and settings — bspwm's `mon_head`/`mon_tail`/`mon`/`rule_head` globals collected into one struct, for `bsp-ipc` to resolve selectors and run commands against |
+| `event` / `effect` (planned) | `Event` enum, `Effect` enum tying `bsp-core` to an adapter — not started; needs the nested compositor's compositor layer to have a shape worth committing to |
 
 ## scope
 
@@ -104,6 +105,13 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Monitor::arrange` | `fn(&mut self, usize, &Settings)` | `src/tree.c` `arrange()`. |
 | `adapt_geometry` | `fn(&mut Tree, Option<NodeId>, Rect, Rect)` | `src/monitor.c` `adapt_geometry()`. |
 | `Rule::matches` | `fn(&self, &str, &str, &str) -> bool` | `src/rule.c` `apply_rules()`'s matching (exact string or `*`, not a glob). |
+| `Wm::new` | `fn(Settings) -> Wm` | No monitors, no rules. |
+| `Wm::add_monitor` | `fn(&mut self, Monitor) -> usize` | `src/monitor.c` `add_monitor()` (minus RandR/EWMH). |
+| `Wm::remove_monitor` | `fn(&mut self, usize) -> Monitor` | `src/monitor.c` `remove_monitor()` (minus EWMH; caller empties `desktops` first). |
+| `Wm::focus_monitor` | `fn(&mut self, usize) -> bool` | `src/monitor.c` `focus_node()`'s monitor-focusing half. |
+| `Wm::swap_monitors` | `fn(&mut self, usize, usize)` | `src/monitor.c` `swap_monitors()`. |
+| `Wm::focused_monitor`/`focused_monitor_mut` | `fn(&self/&mut self) -> Option<&/&mut Monitor>` | The focused monitor, if any. |
+| `Wm::monitor_index` | `fn(&self, MonitorId) -> Option<usize>` | Finds a monitor's slot by id. |
 
 ## Testing
 

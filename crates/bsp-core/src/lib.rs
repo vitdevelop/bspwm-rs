@@ -29,3 +29,4 @@ pub mod node;
 pub mod rules;
 pub mod settings;
 pub mod tree;
+pub mod wm;

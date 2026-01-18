@@ -64,7 +64,7 @@ impl Rule {
 /// are left for `bsp-ipc`, which owns selector parsing;
 /// `manage`/`focus`/`border`/`center`/`follow` (all plain bools in bspwm)
 /// are included since they need no parsing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuleConsequence {
     /// Force a split direction for the window's insertion.
     pub split_dir: Option<Direction>,
