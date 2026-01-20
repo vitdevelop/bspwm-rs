@@ -4,6 +4,12 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-01-20 | bsp-compositor | Added | `render::render_frame`, `border_elements` | Damage-tracked per-frame rendering: client surfaces plus four-strip solid-color borders per node |
+| 2026-01-20 | bsp-compositor | Added | `input::process_input_event`, `focus_node`, `focus_under_pointer` | Forwards winit keyboard/pointer events to the seat; click-to-focus and focus-follows-map wired to `bsp-core::tree::Tree::focus` |
+| 2026-01-20 | bsp-compositor | Added | `shell::map_new_toplevel`, `unmap_toplevel`, `on_commit` | `XdgShellHandler`/`CompositorHandler` wiring: a new `xdg_toplevel` becomes a `bsp-core` client node (inserted, arranged, sized back via `configure`); a destroyed one is removed and re-arranged |
+| 2026-01-20 | bsp-compositor | Added | `adapter::WindowAdapter` | `WindowId` ↔ Smithay `Window` map and `bsp_ipc::adapter::Adapter` impl (class/instance lookup, close via `xdg_toplevel::send_close`) |
+| 2026-01-20 | bsp-compositor | Added | `state::State`, `insert_client` | The compositor's Smithay state: compositor/shm/output/seat/xdg-shell globals, `bsp-core::wm::Wm`, `bsp-ipc::registry::NodeRegistry` |
+| 2026-01-20 | bsp-compositor | Added | `winit_backend::run` | The nested (winit) backend: opens a window, creates the Wayland socket, runs the main loop — run and confirmed against a real client (`alacritty`) inside a live Wayland session |
 | 2026-01-18 | bspc-rs | Added | `main` | A working `bspc`-compatible client over `bsp-ipc::wire`: connects, sends the request, streams replies to stdout/stderr, exits non-zero on failure |
 | 2026-01-18 | bsp-ipc | Added | `server::Listener` (`bind`/`accept`) | Non-blocking Unix socket bound at mode 0600, cleaned up on drop |
 | 2026-01-18 | bsp-ipc | Added | `server::Connection` (`try_read_request`/`send_reply`/`send_line`) | One-`recv()`-per-request reading and reply/event writing |

@@ -14,3 +14,18 @@ path = "src/main.rs"
 bsp-core = { path = "../bsp-core" }
 bsp-ipc = { path = "../bsp-ipc" }
 bsp-hotkeys = { path = "../bsp-hotkeys" }
+smithay = { version = "0.7", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "renderer_pixman",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xkbcommon = "0.8"
+
+[features]
+default = ["nested"]
+# The nested (winit) backend used for development, kept out of release
+# builds (`docs/design.md`, Performance budget).
+nested = ["smithay/backend_winit"]
