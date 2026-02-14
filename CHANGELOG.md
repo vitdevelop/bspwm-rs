@@ -4,6 +4,10 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-02-14 | bsp-compositor | Added | `ipc::init` | Binds `bsp-ipc`'s control socket and drives its `Listener`/`Connection`/`Subscribers` from the calloop event loop; every request runs through `bsp_ipc::exec::execute` — live-verified end to end with `bspc-rs` against a running `alacritty` client |
+| 2026-02-14 | bsp-compositor | Added | `shell::sync_wayland_from_core` | Reconciles every mapped client's `Space` position and `xdg_toplevel` size with `bsp-core`'s tree; called after every executed IPC command and after a nested-window resize |
+| 2026-02-14 | bsp-compositor | Changed | `shell::map_new_toplevel` | Seeds `floating_rectangle` from the tiled slot at map time; fixes a live-tested bug where `bspc node -t floating` collapsed a window to 0×0 (bspwm has no Wayland-equivalent geometry source at map time, `src/window.c` `initialize_floating_rectangle()`) |
+| 2026-02-14 | bsp-ipc | Changed | `exec::build_report` | Takes `&Wm` instead of `&ExecCtx<A>`, since it only ever read the `Wm` field |
 | 2026-01-20 | bsp-compositor | Added | `render::render_frame`, `border_elements` | Damage-tracked per-frame rendering: client surfaces plus four-strip solid-color borders per node |
 | 2026-01-20 | bsp-compositor | Added | `input::process_input_event`, `focus_node`, `focus_under_pointer` | Forwards winit keyboard/pointer events to the seat; click-to-focus and focus-follows-map wired to `bsp-core::tree::Tree::focus` |
 | 2026-01-20 | bsp-compositor | Added | `shell::map_new_toplevel`, `unmap_toplevel`, `on_commit` | `XdgShellHandler`/`CompositorHandler` wiring: a new `xdg_toplevel` becomes a `bsp-core` client node (inserted, arranged, sized back via `configure`); a destroyed one is removed and re-arranged |

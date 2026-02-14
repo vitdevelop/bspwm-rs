@@ -1440,7 +1440,7 @@ fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Ve
                 break 'actions;
             }
             WmAction::GetStatus => {
-                let report = build_report(ctx);
+                let report = build_report(ctx.wm);
                 return (Reply::Ok(report.to_string()), events);
             }
             WmAction::RecordHistory(_) => {
@@ -1466,10 +1466,9 @@ fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Ve
 /// Builds the `subscribe report`/`wm -g` line from live state.
 ///
 /// bspwm: `src/subscribe.c` `print_report()`.
-pub fn build_report<A: Adapter>(ctx: &ExecCtx<A>) -> Report {
-    let focused_monitor = ctx.wm.focused_monitor;
-    let monitors = ctx
-        .wm
+pub fn build_report(wm: &Wm) -> Report {
+    let focused_monitor = wm.focused_monitor;
+    let monitors = wm
         .monitors
         .iter()
         .enumerate()
@@ -2108,12 +2107,7 @@ mod tests {
     fn wm_get_status_matches_built_report() {
         let (mut wm, mut registry, mut adapter) = fixture();
         let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "wm -g");
-        let ctx = ExecCtx {
-            wm: &mut wm,
-            registry: &mut registry,
-            adapter: &mut adapter,
-        };
-        let expected = build_report(&ctx).to_string();
+        let expected = build_report(&wm).to_string();
         match reply {
             Reply::Ok(s) => assert_eq!(s, expected),
             other => panic!("expected Ok, got {other:?}"),

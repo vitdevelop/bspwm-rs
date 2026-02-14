@@ -28,7 +28,7 @@ The control socket: it speaks bspwm's wire protocol so the stock `bspc` binary, 
 
 Everything is implemented and tested end to end: wire framing, the full `bspc` argument grammar for every domain, selector parsing and structural resolution, report/event/JSON formatting matching bspwm's exact byte output, an executor connecting all of it to `bsp-core`, a `FakeAdapter`, a real (if compositor-less) socket server, and `bspc-rs` as a working client. `crates/bsp-ipc/tests/integration.rs` exercises the whole path — wire decode → `command::parse` → `exec::execute` → wire encode — over a real Unix socket.
 
-What is *not* done: wiring `server::Listener`/`Connection` file descriptors into an actual `calloop` event loop, since `bsp-compositor` does not exist yet to own that loop — `server`'s types are plain, non-blocking and `poll`-ready for whenever it does. A few executor operations are also deliberately deferred rather than guessed at:
+`server::Listener`/`Connection` are also now wired into `bsp-compositor`'s real `calloop` event loop (`crates/bsp-compositor/src/ipc.rs`) and confirmed against a live, running compositor and a real client — see `docs/bsp-compositor.md`, Nested compositor progress. A few executor operations are still deliberately deferred rather than guessed at:
 
 - **`node --move`/`--resize`**: need floating-client geometry helpers bspwm keeps in `src/window.c`, which have no `bsp-core` port yet (scoped to the tiling tree, not floating-window geometry math).
 - **Cross-desktop/cross-monitor `node --swap`**: bspwm's cross-tree swap relies on a node keeping its identity across trees; `bsp-core`'s per-tree arena `NodeId` does not (`docs/bsp-core.md`, scope), and reproducing the swap via two transplants would need `insert_node`'s exact-slot-replacement semantics rather than its anchor-based splitting. Same-tree swap (the common case) works.
@@ -120,7 +120,7 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | Function | Signature | Behavior |
 | --- | --- | --- |
 | `execute` | `fn(&mut ExecCtx<A>, &Command) -> (Reply, Vec<Event>)` | Runs any `Command` but `Subscribe`/`Quit` (the server handles those directly) against `bsp-core`, mirroring `src/messages.c`'s `cmd_node()` … `cmd_config()` |
-| `build_report` | `fn(&ExecCtx<A>) -> Report` | Builds the current `subscribe report`/`wm -g` line from live state |
+| `build_report` | `fn(&Wm) -> Report` | Builds the current `subscribe report`/`wm -g` line from live state |
 
 ### `server`
 

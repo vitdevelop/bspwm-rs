@@ -14,6 +14,7 @@
 
 mod adapter;
 mod input;
+mod ipc;
 mod render;
 mod shell;
 mod state;

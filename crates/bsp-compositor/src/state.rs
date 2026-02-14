@@ -17,6 +17,7 @@ use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::keyboard::LedState;
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
+use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
 use smithay::wayland::buffer::BufferHandler;
@@ -48,6 +49,9 @@ pub struct State {
     pub display_handle: DisplayHandle,
     /// Set to `false` to stop the main loop (`bspc wm --restart`/emergency quit).
     pub running: bool,
+    /// The calloop event loop handle, for registering each newly accepted
+    /// IPC connection's file descriptor (`crate::ipc`).
+    pub handle: LoopHandle<'static, State>,
     /// Monotonic clock reference for input event timestamps.
     pub start_time: Instant,
 
@@ -77,6 +81,8 @@ pub struct State {
     /// `WindowId` ↔ Smithay `Window` map and class/instance lookup; also
     /// `bsp-ipc`'s `Adapter`.
     pub adapter: WindowAdapter,
+    /// Open `subscribe`d control-socket connections (`crate::ipc`).
+    pub subscribers: bsp_ipc::server::Subscribers,
 
     /// The backend (currently only the nested winit one exists).
     pub backend_data: WinitData,
@@ -87,6 +93,7 @@ impl State {
     /// listening on a Wayland socket.
     pub fn new(
         display_handle: DisplayHandle,
+        handle: LoopHandle<'static, State>,
         backend_data: WinitData,
         wm: bsp_core::wm::Wm,
     ) -> Self {
@@ -103,6 +110,7 @@ impl State {
         State {
             display_handle,
             running: true,
+            handle,
             start_time: Instant::now(),
             space: Space::default(),
             popups: PopupManager::default(),
@@ -116,6 +124,7 @@ impl State {
             wm,
             registry: bsp_ipc::registry::NodeRegistry::new(),
             adapter: WindowAdapter::new(),
+            subscribers: bsp_ipc::server::Subscribers::new(),
             backend_data,
         }
     }

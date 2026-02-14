@@ -147,11 +147,17 @@ pub fn run() {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
-    let mut state = State::new(display_handle.clone(), backend_data, wm);
+    let mut state = State::new(
+        display_handle.clone(),
+        event_loop.handle(),
+        backend_data,
+        wm,
+    );
     state
         .shm_state
         .update_formats(state.backend_data.backend.renderer().shm_formats());
     state.space.map_output(&output, (0, 0));
+    crate::ipc::init(&mut state);
 
     tracing::info!("nested compositor ready");
 
@@ -169,6 +175,7 @@ pub fn run() {
                 for di in 0..state.wm.monitors[0].desktops.len() {
                     state.wm.monitors[0].arrange(di, &settings);
                 }
+                crate::shell::sync_wayland_from_core(&mut state);
             }
             WinitEvent::Input(event) => {
                 crate::input::process_input_event(&mut state, event, &output)

@@ -155,13 +155,25 @@ fn map_new_toplevel(state: &mut State, surface: ToplevelSurface) {
 
     state.wm.monitors[mi].arrange(di, &settings);
 
-    let rect = state.wm.monitors[mi].desktops[di]
-        .tree
-        .node(node)
-        .client
-        .as_ref()
-        .unwrap()
-        .tiled_rectangle;
+    let rect = {
+        let client = state.wm.monitors[mi].desktops[di]
+            .tree
+            .node_mut(node)
+            .client
+            .as_mut()
+            .unwrap();
+        // bspwm seeds `floating_rectangle` from the window's own requested
+        // geometry at map time (`src/window.c`
+        // `initialize_floating_rectangle()`, an `xcb_get_geometry` call on
+        // the not-yet-tiled X11 window). No Wayland equivalent exists — an
+        // xdg-shell client has no on-screen geometry before its first
+        // `configure` — so this seeds it from the tiled slot just computed
+        // instead, the closest available stand-in, rather than leaving it
+        // at `Rect::default()` (0×0), which would collapse the window to
+        // nothing the moment it is set floating (`bspc node -t floating`).
+        client.floating_rectangle = client.tiled_rectangle;
+        client.tiled_rectangle
+    };
 
     surface.with_pending_state(|s| {
         s.size = Some(Size::from((rect.width.max(1), rect.height.max(1))));
@@ -241,5 +253,71 @@ pub fn on_commit(state: &mut State, surface: &WlSurface) {
     });
     if !initial_configure_sent {
         toplevel.send_configure();
+    }
+}
+
+/// Reconciles every mapped client's Wayland-visible position and size
+/// with `bsp-core`'s tree, which an executed `bsp-ipc` command (or a
+/// direct tree operation) may have changed without touching `Space` or
+/// the client's surface at all. Call after anything that might have
+/// re-arranged a desktop.
+///
+/// bspwm has no equivalent: `xcb_configure_window` there takes effect the
+/// moment `tree.c` calls it, in the same step as the tree update; here
+/// the two are necessarily separate because Wayland's `configure`/
+/// `ack_configure` round trip means only the client can actually resize
+/// its own surface.
+pub fn sync_wayland_from_core(state: &mut State) {
+    // Collected first, rather than acted on while borrowing `state.wm`,
+    // since applying each one needs `&mut state.space`/`&mut state.adapter`.
+    let mut updates = Vec::new();
+    for m in &state.wm.monitors {
+        for d in &m.desktops {
+            let mut n = d.tree.first_extrema(d.tree.root);
+            while let Some(id) = n {
+                let node = d.tree.node(id);
+                if let Some(client) = &node.client {
+                    updates.push((client.window, client.clone(), node.hidden));
+                }
+                n = d.tree.next_leaf(Some(id), d.tree.root);
+            }
+        }
+    }
+
+    for (window_id, client, hidden) in updates {
+        let Some(window) = state.adapter.window(window_id).cloned() else {
+            continue;
+        };
+        if hidden {
+            if state.space.element_location(&window).is_some() {
+                state.space.unmap_elem(&window);
+            }
+            continue;
+        }
+        sync_one_window(state, &window, &client);
+    }
+}
+
+fn sync_one_window(state: &mut State, window: &Window, client: &bsp_core::node::Client) {
+    let rect = match client.state {
+        bsp_core::node::ClientState::Floating => client.floating_rectangle,
+        _ => client.tiled_rectangle,
+    };
+
+    let current_loc = state.space.element_location(window);
+    let target_loc = (rect.x, rect.y).into();
+    if current_loc != Some(target_loc) {
+        state.space.map_element(window.clone(), target_loc, false);
+    }
+
+    if let Some(toplevel) = window.toplevel() {
+        let target = Size::from((rect.width.max(1), rect.height.max(1)));
+        let current = toplevel.with_pending_state(|s| s.size);
+        if current != Some(target) {
+            toplevel.with_pending_state(|s| s.size = Some(target));
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_configure();
+            }
+        }
     }
 }
