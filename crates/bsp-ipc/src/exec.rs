@@ -1315,8 +1315,8 @@ fn exec_rule<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[RuleAction]) -> Reply 
                     name: name.clone(),
                     consequence: consequence.clone(),
                     one_shot: *one_shot,
+                    effect_raw: effect_raw.clone(),
                 });
-                let _ = effect_raw;
             }
             RuleAction::Remove(removals) => {
                 for r in removals {
@@ -1356,9 +1356,11 @@ fn exec_rule<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[RuleAction]) -> Reply 
         let mut out = String::new();
         for r in &ctx.wm.rules {
             let arrow = if r.one_shot { "-" } else { "=" };
+            // bspwm: `src/rule.c` `list_rules()`,
+            // `"%s:%s:%s %c> %s\n"` — the effect string follows the arrow.
             out.push_str(&format!(
-                "{}:{}:{} {arrow}> \n",
-                r.class_name, r.instance_name, r.name
+                "{}:{}:{} {arrow}> {}\n",
+                r.class_name, r.instance_name, r.name, r.effect_raw
             ));
         }
         Reply::Ok(out)
@@ -2097,10 +2099,12 @@ mod tests {
         assert_eq!(wm.rules[0].consequence.state, Some(ClientState::Floating));
 
         let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "rule -l");
-        match reply {
-            Reply::Ok(s) => assert!(s.contains("Firefox:*:*")),
-            other => panic!("expected Ok, got {other:?}"),
-        }
+        // bspwm: `src/rule.c` `list_rules()`, `"%s:%s:%s %c> %s\n"` — the
+        // effect string must round-trip, not just the class:instance:name.
+        assert_eq!(
+            reply,
+            Reply::Ok("Firefox:*:* => state=floating\n".to_string())
+        );
     }
 
     #[test]

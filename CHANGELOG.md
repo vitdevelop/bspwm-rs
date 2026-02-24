@@ -4,6 +4,12 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-02-25 | bsp-compositor | Changed | `shell::map_new_toplevel`, `new_toplevel`, `on_commit` | Deferred from `new_toplevel` to a toplevel's first `commit`, so `app_id`/title are reliably known; now matches `bspc rule` entries (`bsp_core::rules::match_rules`) and applies the resolved consequence; fixes a second bug found via live two-window testing — insertion anchored at the tree root instead of the desktop's actual focus once 2+ windows existed |
+| 2026-02-25 | bsp-compositor | Changed | `state::State`, `State::new` | Adds `pending_toplevels: Vec<ToplevelSurface>`, holding toplevels awaiting their first commit before rule matching and mapping |
+| 2026-02-25 | bsp-core | Added | `rules::match_rules` | Full `apply_rules()`-equivalent matching-and-merging loop over every rule, including its one-shot-stops-the-loop quirk |
+| 2026-02-25 | bsp-core | Changed | `rules::RuleConsequence` | `manage`/`focus`/`border` are now `Option<bool>` (were plain `bool`, wrongly defaulting to `false`); adds `merge`/`should_manage`/`should_focus`/`should_border` |
+| 2026-02-25 | bsp-ipc | Changed | `exec::exec_rule` (`rule --list`) | Fixes a formatting bug: the listed effect text was always empty (`"class:instance:name => \n"`); now prints the rule's actual effect string, matching |
+| 2026-02-25 | bsp-core | Changed | `rules::Rule` | Adds `effect_raw: String`, carrying the verbatim `key=value` effect text so `rule --list` can print it back |
 | 2026-02-14 | bsp-compositor | Added | `ipc::init` | Binds `bsp-ipc`'s control socket and drives its `Listener`/`Connection`/`Subscribers` from the calloop event loop; every request runs through `bsp_ipc::exec::execute` — live-verified end to end with `bspc-rs` against a running `alacritty` client |
 | 2026-02-14 | bsp-compositor | Added | `shell::sync_wayland_from_core` | Reconciles every mapped client's `Space` position and `xdg_toplevel` size with `bsp-core`'s tree; called after every executed IPC command and after a nested-window resize |
 | 2026-02-14 | bsp-compositor | Changed | `shell::map_new_toplevel` | Seeds `floating_rectangle` from the tiled slot at map time; fixes a live-tested bug where `bspc node -t floating` collapsed a window to 0×0 (bspwm has no Wayland-equivalent geometry source at map time, `src/window.c` `initialize_floating_rectangle()`) |

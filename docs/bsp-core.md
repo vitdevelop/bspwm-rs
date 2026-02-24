@@ -105,6 +105,9 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Monitor::arrange` | `fn(&mut self, usize, &Settings)` | `src/tree.c` `arrange()`. |
 | `adapt_geometry` | `fn(&mut Tree, Option<NodeId>, Rect, Rect)` | `src/monitor.c` `adapt_geometry()`. |
 | `Rule::matches` | `fn(&self, &str, &str, &str) -> bool` | `src/rule.c` `apply_rules()`'s matching (exact string or `*`, not a glob). |
+| `match_rules` | `fn(&mut Vec<Rule>, &str, &str, &str) -> RuleConsequence` | `src/rule.c` `apply_rules()`'s full loop: merges every matching rule's consequence, removing (and stopping at) the first one-shot match. |
+| `RuleConsequence::merge` | `fn(&mut self, &RuleConsequence)` | Applies a further matched rule's fields on top, `Some`-over-`None`; mirrors `apply_rules()`'s loop merging every match onto one accumulator. |
+| `RuleConsequence::should_manage`/`should_focus`/`should_border` | `fn(&self) -> bool` | Resolves `manage`/`focus`/`border` with bspwm's `make_rule_consequence()` default of `true` when no rule mentioned the field. |
 | `Wm::new` | `fn(Settings) -> Wm` | No monitors, no rules. |
 | `Wm::add_monitor` | `fn(&mut self, Monitor) -> usize` | `src/monitor.c` `add_monitor()` (minus RandR/EWMH). |
 | `Wm::remove_monitor` | `fn(&mut self, usize) -> Monitor` | `src/monitor.c` `remove_monitor()` (minus EWMH; caller empties `desktops` first). |

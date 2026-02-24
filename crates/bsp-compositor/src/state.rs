@@ -24,7 +24,7 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::SelectionHandler;
-use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{delegate_compositor, delegate_output, delegate_seat, delegate_shm};
 
@@ -59,6 +59,11 @@ pub struct State {
     pub space: Space<Window>,
     /// Popup (e.g. menu, tooltip) tracking.
     pub popups: PopupManager,
+    /// Toplevels whose role was just created but have not yet reached
+    /// their first `commit` (`crate::shell::new_toplevel`/`on_commit`):
+    /// rule matching needs `app_id`/`title`, which are only reliably set
+    /// by then, so mapping itself waits until then too.
+    pub pending_toplevels: Vec<ToplevelSurface>,
 
     // Smithay protocol globals.
     pub compositor_state: CompositorState,
@@ -114,6 +119,7 @@ impl State {
             start_time: Instant::now(),
             space: Space::default(),
             popups: PopupManager::default(),
+            pending_toplevels: Vec::new(),
             compositor_state,
             shm_state,
             seat_state,

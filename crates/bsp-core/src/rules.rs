@@ -1,11 +1,14 @@
 //! `bspc rule` entries and matching a client's class/instance/title
 //! against them.
 //!
-//! bspwm: `src/types.h` `rule_t`, `src/rule.c`. Applying a matched rule's
-//! consequence to a real window (`_apply_class`, `_apply_hints`, the
-//! `external_rules_command` hook) is left for later steps: the core only
-//! needs the pure matching bspwm's `apply_rules()` does before handing off
-//! to those X11-specific appliers.
+//! bspwm: `src/types.h` `rule_t`, `src/rule.c`. [`match_rules`] reproduces
+//! `apply_rules()`'s matching-and-merging loop in full — still pure, since
+//! it only ever produces a [`RuleConsequence`], not a mutated window.
+//! Applying that consequence to a real window (inserting a tree node,
+//! configuring a `Window`) needs an adapter, so it belongs to
+//! `bsp-compositor`; `_apply_class`/`_apply_hints`/the
+//! `external_rules_command` hook (populating `class`/`instance`/`title`
+//! from the window itself before matching) belong there too.
 
 use crate::tree::Direction;
 use crate::{node::ClientState, node::Layer};
@@ -35,6 +38,11 @@ pub struct Rule {
     pub consequence: RuleConsequence,
     /// If `true`, this rule is removed after it matches once.
     pub one_shot: bool,
+    /// The `key=value ...` effect string this rule was added with, kept
+    /// verbatim for `rule --list` (bspwm: `rule_t.effect`, `src/rule.h`,
+    /// printed back unparsed by `list_rules()`). Opaque to `bsp-core`: it
+    /// is not reparsed here, only carried.
+    pub effect_raw: String,
 }
 
 impl Rule {
@@ -57,6 +65,35 @@ impl Rule {
     }
 }
 
+/// Matches `class`/`instance`/`title` against every rule in `rules`, in
+/// order, merging each match's consequence onto one accumulator.
+///
+/// bspwm: `src/rule.c` `apply_rules()`'s loop. It merges *every* matching
+/// rule's effect into one `rule_consequence_t`, but stops immediately
+/// after removing a one-shot match — even if a later rule would also
+/// match — reproduced here as-is (a real bspwm quirk, not "fixed",
+/// since this crate's job is to match bspwm's behavior).
+pub fn match_rules(
+    rules: &mut Vec<Rule>,
+    class: &str,
+    instance: &str,
+    title: &str,
+) -> RuleConsequence {
+    let mut consequence = RuleConsequence::default();
+    let mut i = 0;
+    while i < rules.len() {
+        if rules[i].matches(class, instance, title) {
+            consequence.merge(&rules[i].consequence);
+            if rules[i].one_shot {
+                rules.remove(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+    consequence
+}
+
 /// What a matched rule does to a window.
 ///
 /// bspwm: `src/types.h` `rule_consequence_t`. `monitor_desc`/
@@ -64,6 +101,18 @@ impl Rule {
 /// are left for `bsp-ipc`, which owns selector parsing;
 /// `manage`/`focus`/`border`/`center`/`follow` (all plain bools in bspwm)
 /// are included since they need no parsing.
+///
+/// `manage`/`focus`/`border` are `Option<bool>`, not plain `bool` like
+/// bspwm's C struct: `None` means "not mentioned by this rule", distinct
+/// from an explicit `false`. bspwm can get away with a plain `bool` because
+/// `make_rule_consequence()` (`src/rule.c`) pre-seeds a *fresh*, per-window
+/// accumulator with `manage = focus = border = true` before merging in any
+/// matched rule's `key=value` tokens, and `parse_key_value()` only ever
+/// writes a field a token actually names — so an unmentioned field keeps
+/// that `true` default. A `Rule`'s own stored `consequence`, here, has no
+/// such per-window accumulator to fall back on: it must be able to say "I
+/// don't touch this field" so [`RuleConsequence::merge`] can tell that
+/// apart from "I explicitly turn this off".
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuleConsequence {
     /// Force a split direction for the window's insertion.
@@ -89,12 +138,72 @@ pub struct RuleConsequence {
     pub center: bool,
     /// Focus the desktop the window is inserted into.
     pub follow: bool,
-    /// `false` rejects the window outright (bspwm: `manage`).
-    pub manage: bool,
-    /// Focus the window once it is managed.
-    pub focus: bool,
-    /// Draw a border around the window.
-    pub border: bool,
+    /// `Some(false)` rejects the window outright (bspwm: `manage`);
+    /// unmentioned (`None`) defaults to `true`, like every window that
+    /// matches no rule at all.
+    pub manage: Option<bool>,
+    /// Focus the window once it is managed; unmentioned defaults to
+    /// `true`.
+    pub focus: Option<bool>,
+    /// Draw a border around the window; unmentioned defaults to `true`.
+    pub border: Option<bool>,
+}
+
+impl RuleConsequence {
+    /// Merges `other` on top of `self`: every field `other` sets
+    /// overwrites `self`'s, and every field `other` leaves unset is kept
+    /// as-is. `center`/`follow` are plain `bool`s that only ever turn a
+    /// flag on (bspwm never has a rule turn them back off relative to an
+    /// earlier match), so `other`'s `true` wins but its `false` does not
+    /// clear a `true` already set.
+    ///
+    /// Mirrors applying successive matching rules' `key=value` tokens onto
+    /// one shared accumulator (bspwm: `src/rule.c` `apply_rules()`'s loop
+    /// over `rule_head`, each iteration calling `parse_keys_values()` on
+    /// the same `csq`).
+    pub fn merge(&mut self, other: &RuleConsequence) {
+        macro_rules! take_some {
+            ($field:ident) => {
+                if other.$field.is_some() {
+                    self.$field = other.$field;
+                }
+            };
+        }
+        take_some!(split_dir);
+        take_some!(split_ratio);
+        take_some!(layer);
+        take_some!(state);
+        take_some!(hidden);
+        take_some!(sticky);
+        take_some!(private);
+        take_some!(locked);
+        take_some!(marked);
+        take_some!(manage);
+        take_some!(focus);
+        take_some!(border);
+        self.center |= other.center;
+        self.follow |= other.follow;
+    }
+
+    /// Whether a window this consequence applies to should be managed
+    /// (inserted into the tree) at all. `true` unless a rule explicitly
+    /// set `manage=off` (bspwm: `make_rule_consequence()`'s `manage =
+    /// true` default, `src/rule.c`).
+    pub fn should_manage(&self) -> bool {
+        self.manage.unwrap_or(true)
+    }
+
+    /// Whether a window this consequence applies to should be focused
+    /// once managed. `true` unless a rule explicitly set `focus=off`.
+    pub fn should_focus(&self) -> bool {
+        self.focus.unwrap_or(true)
+    }
+
+    /// Whether a window this consequence applies to should be bordered.
+    /// `true` unless a rule explicitly set `border=off`.
+    pub fn should_border(&self) -> bool {
+        self.border.unwrap_or(true)
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +217,7 @@ mod tests {
             name: name.to_string(),
             consequence: RuleConsequence::default(),
             one_shot: false,
+            effect_raw: String::new(),
         }
     }
 
@@ -133,5 +243,130 @@ mod tests {
         let r = rule("Foo*", MATCH_ANY, MATCH_ANY);
         assert!(!r.matches("Foobar", "x", "y"));
         assert!(r.matches("Foo*", "x", "y"));
+    }
+
+    #[test]
+    fn unset_manage_focus_border_default_to_true() {
+        let c = RuleConsequence::default();
+        assert!(c.should_manage());
+        assert!(c.should_focus());
+        assert!(c.should_border());
+    }
+
+    #[test]
+    fn explicit_false_overrides_the_true_default() {
+        let mut c = RuleConsequence::default();
+        c.merge(&RuleConsequence {
+            manage: Some(false),
+            ..Default::default()
+        });
+        assert!(!c.should_manage());
+        // Unmentioned fields are untouched by the merge.
+        assert!(c.should_focus());
+        assert!(c.should_border());
+    }
+
+    #[test]
+    fn merge_lets_a_later_rule_overwrite_an_earlier_ones_field() {
+        let mut c = RuleConsequence {
+            state: Some(ClientState::Floating),
+            ..Default::default()
+        };
+        c.merge(&RuleConsequence {
+            state: Some(ClientState::Tiled),
+            follow: true,
+            ..Default::default()
+        });
+        assert_eq!(c.state, Some(ClientState::Tiled));
+        assert!(c.follow);
+    }
+
+    fn rule_with(class: &str, one_shot: bool, consequence: RuleConsequence) -> Rule {
+        Rule {
+            class_name: class.to_string(),
+            instance_name: MATCH_ANY.to_string(),
+            name: MATCH_ANY.to_string(),
+            consequence,
+            one_shot,
+            effect_raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn match_rules_merges_every_matching_rule_in_order() {
+        let mut rules = vec![
+            rule_with(
+                "Firefox",
+                false,
+                RuleConsequence {
+                    state: Some(ClientState::Floating),
+                    ..Default::default()
+                },
+            ),
+            rule_with(
+                "Firefox",
+                false,
+                RuleConsequence {
+                    sticky: Some(true),
+                    ..Default::default()
+                },
+            ),
+            rule_with(
+                "Chromium",
+                false,
+                RuleConsequence {
+                    sticky: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let c = match_rules(&mut rules, "Firefox", "x", "y");
+        assert_eq!(c.state, Some(ClientState::Floating));
+        assert_eq!(c.sticky, Some(true));
+        assert_eq!(rules.len(), 3, "no rule here is one-shot");
+    }
+
+    #[test]
+    fn match_rules_removes_a_one_shot_match_and_stops_there() {
+        // bspwm: `apply_rules()` breaks out of the loop right after
+        // removing a one-shot match, so a later rule that would also
+        // match never gets a chance to.
+        let mut rules = vec![
+            rule_with(
+                "Firefox",
+                true,
+                RuleConsequence {
+                    state: Some(ClientState::Floating),
+                    ..Default::default()
+                },
+            ),
+            rule_with(
+                MATCH_ANY,
+                false,
+                RuleConsequence {
+                    sticky: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let c = match_rules(&mut rules, "Firefox", "x", "y");
+        assert_eq!(c.state, Some(ClientState::Floating));
+        assert_eq!(c.sticky, None, "the wildcard rule never ran");
+        assert_eq!(rules.len(), 1, "the one-shot rule was removed");
+    }
+
+    #[test]
+    fn match_rules_ignores_non_matching_rules() {
+        let mut rules = vec![rule_with(
+            "Chromium",
+            false,
+            RuleConsequence {
+                state: Some(ClientState::Floating),
+                ..Default::default()
+            },
+        )];
+        let c = match_rules(&mut rules, "Firefox", "x", "y");
+        assert_eq!(c.state, None);
+        assert_eq!(rules.len(), 1);
     }
 }

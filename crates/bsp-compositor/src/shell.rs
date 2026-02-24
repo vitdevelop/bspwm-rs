@@ -21,6 +21,7 @@ use smithay::wayland::shell::xdg::{
 
 use bsp_core::id::DesktopId;
 use bsp_core::node::Client as CoreClient;
+use bsp_core::tree::Direction;
 
 use crate::state::State;
 
@@ -30,7 +31,17 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        map_new_toplevel(self, surface);
+        // Deferred to the surface's first `commit` (`on_commit`, below)
+        // rather than mapped here: rule matching needs `app_id`/`title`
+        // (`docs/design.md` Compatibility: they stand in for bspwm's
+        // ICCCM class/instance/name), and while `set_app_id`/`set_title`
+        // take effect as soon as the client sends them — independent of
+        // any commit — they are not guaranteed to have arrived yet at
+        // the moment the `xdg_toplevel` role itself is created. bspwm
+        // has no equivalent gap: `apply_rules()` reads `WM_CLASS` with a
+        // synchronous `xcb_icccm_get_wm_class_reply()` call before the
+        // window is ever mapped (`src/window.c` `manage_window()`).
+        self.pending_toplevels.push(surface);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -63,6 +74,11 @@ impl XdgShellHandler for State {
     fn ack_configure(&mut self, _surface: WlSurface, _configure: Configure) {}
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // A toplevel can be destroyed before it ever reaches its first
+        // commit (and so was never mapped at all) — drop it from the
+        // pending queue rather than leaking it there forever.
+        self.pending_toplevels
+            .retain(|t| t.wl_surface() != surface.wl_surface());
         unmap_toplevel(self, &surface);
     }
 
@@ -124,12 +140,26 @@ impl State {
     }
 }
 
-/// A newly created `xdg_toplevel`: insert it as a new client node in the
-/// focused monitor's focused desktop's tree, arrange, and configure the
-/// surface to the tree-computed size. Mirrors bspwm's `manage_window()`,
-/// minus rule evaluation (`docs/bsp-compositor.md` scope: no rule
-/// matching wired up yet — every window lands tiled, unconditionally).
-fn map_new_toplevel(state: &mut State, surface: ToplevelSurface) {
+/// A toplevel's first `commit`: reads `app_id`/title, matches `bspc rule`
+/// entries against them, and inserts a new client node into the focused
+/// monitor's focused desktop's tree — anchored at the desktop's current
+/// focus, split per any matched `split_dir`/`split_ratio` — arranges, and
+/// applies the rest of the matched consequence (layer, state, hidden,
+/// sticky, private, locked, marked, border, focus). Mirrors bspwm's
+/// `manage_window()`.
+///
+/// `monitor=`/`desktop=`/`node=`/`rectangle=`/`honor_size_hints=`
+/// targeting is not applied (`docs/bsp-ipc.md`'s IPC progress: not
+/// retained in structured form yet), so every window still lands on the
+/// monitor/desktop it would have without any rule. `manage=false` is not
+/// applied either: bspwm's `manage=false` maps the X11 window exactly
+/// where the client itself put it, with no WM involvement at all
+/// (`src/window.c` `manage_window()`'s `!csq->manage` branch calling only
+/// `window_show()`) — a raw client-controlled position xdg-shell has no
+/// equivalent for, so honoring it needs its own placement policy decision
+/// rather than an improvised default position (hard rule 7). Every window
+/// is managed unconditionally until that is decided.
+fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
     let Some(mi) = state.wm.focused_monitor else {
         tracing::warn!("no monitor to map a new window onto");
         return;
@@ -139,23 +169,78 @@ fn map_new_toplevel(state: &mut State, surface: ToplevelSurface) {
         return;
     };
 
-    let window = Window::new_wayland_window(surface.clone());
+    let (app_id, title) = with_states(toplevel.wl_surface(), |states| {
+        let data = states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+        (
+            data.app_id.clone().unwrap_or_default(),
+            data.title.clone().unwrap_or_default(),
+        )
+    });
+    // Native Wayland windows match `app_id` as both class and instance,
+    // and the surface title as name (`docs/design.md` Compatibility).
+    let consequence = bsp_core::rules::match_rules(&mut state.wm.rules, &app_id, &app_id, &title);
+
+    let window = Window::new_wayland_window(toplevel.clone());
+    window.on_commit();
     let window_id = state.adapter.insert(window.clone());
+    state.adapter.set_app_id(window_id, &app_id);
 
     let settings = state.wm.settings.clone();
     let desktop_id: DesktopId = state.wm.monitors[mi].desktops[di].id;
+    // bspwm anchors a new node at the desktop's currently focused node
+    // (`manage_window()`: `f = mon->desk->focus`), splitting its slot in
+    // two — not always the tree root, which only coincides with focus
+    // when the tree has at most one leaf.
+    let anchor = state.wm.monitors[mi].desktops[di].tree.focus;
+
     let node = {
         let tree = &mut state.wm.monitors[mi].desktops[di].tree;
-        let core_client = CoreClient::new(window_id, settings.border_width);
+        if let Some(anchor) = anchor {
+            // bspwm: `manage_window()` calls `presel_dir`/`presel_ratio`
+            // on the anchor before `insert_node`, so the split this
+            // window's insertion performs honors them.
+            if let Some(dir) = consequence.split_dir {
+                tree.presel_dir(anchor, dir, settings.split_ratio);
+            }
+            if let Some(ratio) = consequence.split_ratio {
+                // bspwm: `presel_ratio()`'s own default direction when no
+                // presel exists yet is unconditionally east (matched by
+                // `exec::exec_node`'s `NodeAction::PreselRatio` handler).
+                tree.presel_ratio(anchor, ratio, Direction::East);
+            }
+        }
+        let border_width = if consequence.should_border() {
+            settings.border_width
+        } else {
+            0
+        };
+        let core_client = CoreClient::new(window_id, border_width);
         let node = tree.new_client_node(&settings, core_client);
-        tree.insert_node(&settings, node, None);
+        tree.insert_node(&settings, node, anchor);
         node
     };
     state.registry.register(desktop_id, node);
 
-    state.wm.monitors[mi].arrange(di, &settings);
+    if let Some(layer) = consequence.layer {
+        state.wm.monitors[mi].desktops[di]
+            .tree
+            .set_layer(node, layer);
+    }
 
-    let rect = {
+    // A first `arrange()` here, before any state/vacancy change below,
+    // computes a real tiled slot for this node — needed as the stand-in
+    // `floating_rectangle` source just below. `state`/`hidden` are
+    // applied only afterward, since apply_layout skips a vacant node
+    // entirely and would otherwise leave its `tiled_rectangle` at
+    // `Rect::default()` (0×0), reintroducing the bug fixed by this same
+    // seeding step (`CHANGELOG.md`, `shell::map_new_toplevel` "Changed").
+    state.wm.monitors[mi].arrange(di, &settings);
+    {
         let client = state.wm.monitors[mi].desktops[di]
             .tree
             .node_mut(node)
@@ -172,26 +257,62 @@ fn map_new_toplevel(state: &mut State, surface: ToplevelSurface) {
         // at `Rect::default()` (0×0), which would collapse the window to
         // nothing the moment it is set floating (`bspc node -t floating`).
         client.floating_rectangle = client.tiled_rectangle;
-        client.tiled_rectangle
+    }
+
+    if let Some(cstate) = consequence.state {
+        state.wm.monitors[mi].desktops[di]
+            .tree
+            .set_state(node, cstate);
+    }
+    {
+        let tree = &mut state.wm.monitors[mi].desktops[di].tree;
+        tree.set_hidden(node, consequence.hidden.unwrap_or(false));
+        tree.set_sticky(node, consequence.sticky.unwrap_or(false));
+        tree.set_private(node, consequence.private.unwrap_or(false));
+        tree.set_locked(node, consequence.locked.unwrap_or(false));
+        tree.set_marked(node, consequence.marked.unwrap_or(false));
+    }
+    // A second `arrange()`: the first pass above may now be stale for
+    // tiled siblings if `state`/`hidden` just made this node vacant
+    // (bspwm: the single `arrange(m, d)` at the end of `manage_window()`,
+    // split into two passes here only because of the seeding step above).
+    state.wm.monitors[mi].arrange(di, &settings);
+
+    let (rect, tiled, hidden) = {
+        let node_ref = state.wm.monitors[mi].desktops[di].tree.node(node);
+        let client = node_ref.client.as_ref().unwrap();
+        let tiled = client.state.is_tiled();
+        let rect = if tiled {
+            client.tiled_rectangle
+        } else {
+            client.floating_rectangle
+        };
+        (rect, tiled, node_ref.hidden)
     };
 
-    surface.with_pending_state(|s| {
+    toplevel.with_pending_state(|s| {
         s.size = Some(Size::from((rect.width.max(1), rect.height.max(1))));
-        s.states.set(xdg_toplevel::State::TiledLeft);
-        s.states.set(xdg_toplevel::State::TiledRight);
-        s.states.set(xdg_toplevel::State::TiledTop);
-        s.states.set(xdg_toplevel::State::TiledBottom);
+        if tiled {
+            s.states.set(xdg_toplevel::State::TiledLeft);
+            s.states.set(xdg_toplevel::State::TiledRight);
+            s.states.set(xdg_toplevel::State::TiledTop);
+            s.states.set(xdg_toplevel::State::TiledBottom);
+        }
     });
+    toplevel.send_configure();
 
     state.space.map_element(window, (rect.x, rect.y), true);
 
-    // Focus follows a newly mapped window, as bspwm's own `manage_window()`
-    // does for a window not marked hidden/no-focus by a rule (no rules
-    // exist yet, so this is unconditional — scope, see above).
-    state.wm.monitors[mi].desktops[di].tree.focus = Some(node);
-    crate::input::focus_node(state, mi, di, node);
+    // bspwm: `manage_window()`'s `if (!csq->hidden && csq->focus)` branch
+    // (simplified: always operating on the currently focused monitor and
+    // desktop, since no monitor=/desktop= targeting exists yet, so the
+    // `d == mon->desk || csq->follow` distinction never applies).
+    if !hidden && consequence.should_focus() {
+        state.wm.monitors[mi].desktops[di].tree.focus = Some(node);
+        crate::input::focus_node(state, mi, di, node);
+    }
 
-    tracing::info!(window = %window_id, ?rect, "mapped a new window");
+    tracing::info!(window = %window_id, ?rect, class = %app_id, "mapped a new window");
 }
 
 /// A destroyed `xdg_toplevel`: remove its node from the tree, forget its
@@ -224,9 +345,11 @@ fn unmap_toplevel(state: &mut State, surface: &ToplevelSurface) {
 }
 
 /// Runs on every `wl_surface.commit`: hands the buffer to Smithay's
-/// tracking, and for a still-unconfigured toplevel already mapped by
-/// [`map_new_toplevel`], sends the initial `configure` (the size decided
-/// there) now that the client is ready to receive it.
+/// tracking, and either maps a still-pending toplevel now that its
+/// `app_id`/title are available ([`map_new_toplevel`]), or, for a window
+/// already mapped, sends the initial `configure` if it somehow hasn't
+/// gone out yet (a safety net — [`map_new_toplevel`] already sends it as
+/// part of the same first commit that triggers it).
 ///
 /// bspwm has no equivalent step — a real X11 `ConfigureWindow` takes
 /// effect immediately, it does not need an acknowledged round trip the
@@ -234,6 +357,16 @@ fn unmap_toplevel(state: &mut State, surface: &ToplevelSurface) {
 pub fn on_commit(state: &mut State, surface: &WlSurface) {
     smithay::backend::renderer::utils::on_commit_buffer_handler::<State>(surface);
     state.popups.commit(surface);
+
+    if let Some(pos) = state
+        .pending_toplevels
+        .iter()
+        .position(|t| t.wl_surface() == surface)
+    {
+        let toplevel = state.pending_toplevels.remove(pos);
+        map_new_toplevel(state, toplevel);
+        return;
+    }
 
     let Some(window) = state.window_for_surface(surface) else {
         return;

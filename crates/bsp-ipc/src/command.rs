@@ -1169,9 +1169,9 @@ fn apply_rule_effect_token(
         "marked" => consequence.marked = Some(parse_bool(value).ok_or_else(bad)?),
         "center" => consequence.center = parse_bool(value).ok_or_else(bad)?,
         "follow" => consequence.follow = parse_bool(value).ok_or_else(bad)?,
-        "manage" => consequence.manage = parse_bool(value).ok_or_else(bad)?,
-        "focus" => consequence.focus = parse_bool(value).ok_or_else(bad)?,
-        "border" => consequence.border = parse_bool(value).ok_or_else(bad)?,
+        "manage" => consequence.manage = Some(parse_bool(value).ok_or_else(bad)?),
+        "focus" => consequence.focus = Some(parse_bool(value).ok_or_else(bad)?),
+        "border" => consequence.border = Some(parse_bool(value).ok_or_else(bad)?),
         _ => {
             return Err(ParseError::new(
                 "rule",
