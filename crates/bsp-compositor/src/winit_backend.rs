@@ -76,6 +76,13 @@ pub fn run() {
             return;
         }
     };
+    // `ImportEgl::bind_wl_display` (`wl_drm` GPU buffer sharing) was
+    // tried here and reverted: on this project's NVIDIA development
+    // machine it does not fix `docs/bsp-compositor.md`'s known
+    // vertical-flip issue and instead makes a GPU-accelerated client
+    // (`alacritty`) fail to start at all (`Context` error, raw code
+    // 12828) — a worse outcome. See that doc's Known issues section
+    // before re-attempting this.
     let size = backend.window_size();
 
     let mode = Mode {
