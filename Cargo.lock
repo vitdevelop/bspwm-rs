@@ -157,6 +157,9 @@ dependencies = [
 [[package]]
 name = "bsp-hotkeys"
 version = "0.1.0"
+dependencies = [
+ "xkbcommon",
+]
 
 [[package]]
 name = "bsp-ipc"

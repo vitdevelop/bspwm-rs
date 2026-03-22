@@ -4,6 +4,10 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-03-22 | bsp-hotkeys | Added | `binding::parse_chain` | Parses an expanded chain string into `Chord`s (modifiers, keysym via `xkbcommon`, `buttonN`, release/replay/lock-chain); full port of sxhkd's `parse_chain()`/`parse_modifier()`/`parse_button()` |
+| 2026-03-22 | bsp-hotkeys | Changed | `expand`'s internal `get_token` | Moved to a new private `token` module, now shared with `binding` (`token::get_token`), gaining the `ign`-consumed-separators output `binding`'s chain-locking needs |
+| 2026-03-22 | bsp-hotkeys | Added | `expand::expand` | Expands every `{}`/range sequence in a raw (chain, command) pair, zipping both sides index for index; full port of sxhkd's `process_hotkey()`/`extract_chunks()`/`render_next()` |
+| 2026-03-22 | bsp-hotkeys | Added | `lexer::parse` | Groups an sxhkdrc file's lines into raw (chain, command) pairs; full port of sxhkd's `load_config()` |
 | 2026-02-25 | bsp-compositor | Changed | `shell::map_new_toplevel`, `new_toplevel`, `on_commit` | Deferred from `new_toplevel` to a toplevel's first `commit`, so `app_id`/title are reliably known; now matches `bspc rule` entries (`bsp_core::rules::match_rules`) and applies the resolved consequence; fixes a second bug found via live two-window testing — insertion anchored at the tree root instead of the desktop's actual focus once 2+ windows existed |
 | 2026-02-25 | bsp-compositor | Changed | `state::State`, `State::new` | Adds `pending_toplevels: Vec<ToplevelSurface>`, holding toplevels awaiting their first commit before rule matching and mapping |
 | 2026-02-25 | bsp-core | Added | `rules::match_rules` | Full `apply_rules()`-equivalent matching-and-merging loop over every rule, including its one-shot-stops-the-loop quirk |

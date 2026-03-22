@@ -7,3 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Keysym *name* lookup only (`xkb::keysym_from_name`) — no `Context`,
+# `Keymap` or `State` here; those need a live keyboard mapping, which is
+# `bsp-compositor`'s job (`docs/design.md` Architecture).
+xkbcommon = "0.8"
