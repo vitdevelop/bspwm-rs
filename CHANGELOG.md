@@ -4,6 +4,7 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-04-08 | bsp-hotkeys | Added | `dispatch::classify` | Classifies a command as an in-process `bspc` call (tokenized, quote-aware) or a shell command; this project's own "Binding execution" extension, not a ported bspwm behavior |
 | 2026-04-05 | bsp-hotkeys | Added | `matcher::Matcher::new`/`feed`/`abort_chain` | Chord-chain state machine, X11-free; full port of sxhkd's `find_hotkey()`/`match_chord()`/`abort_chain()` |
 | 2026-03-22 | bsp-hotkeys | Added | `binding::parse_chain` | Parses an expanded chain string into `Chord`s (modifiers, keysym via `xkbcommon`, `buttonN`, release/replay/lock-chain); full port of sxhkd's `parse_chain()`/`parse_modifier()`/`parse_button()` |
 | 2026-03-22 | bsp-hotkeys | Changed | `expand`'s internal `get_token` | Moved to a new private `token` module, now shared with `binding` (`token::get_token`), gaining the `ign`-consumed-separators output `binding`'s chain-locking needs |
