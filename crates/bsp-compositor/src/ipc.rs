@@ -157,24 +157,36 @@ fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
             PostAction::Remove
         }
         other => {
-            let (reply, events) = {
-                let mut ctx = ExecCtx {
-                    wm: &mut state.wm,
-                    registry: &mut state.registry,
-                    adapter: &mut state.adapter,
-                };
-                exec::execute(&mut ctx, &other)
-            };
-            crate::shell::sync_wayland_from_core(state);
-            for event in &events {
-                state.subscribers.broadcast_event(event);
-            }
-            let report = build_report(state);
-            state.subscribers.broadcast_report(&report);
+            let reply = execute_and_broadcast(state, &other);
             reply_and_close(slot, reply);
             PostAction::Remove
         }
     }
+}
+
+/// Runs any `Command` but `Subscribe`/`Quit` (the caller handles those)
+/// through `bsp_ipc::exec::execute`, reconciles the Wayland-visible
+/// state, and broadcasts the resulting events/report to every
+/// `subscribe`d connection — every side effect a socket request has,
+/// factored out so `crate::hotkeys`' in-process `bspc` dispatch path
+/// gets exactly the same behavior (`docs/bsp-hotkeys.md`'s "Binding
+/// execution" equivalence requirement).
+pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Reply {
+    let (reply, events) = {
+        let mut ctx = ExecCtx {
+            wm: &mut state.wm,
+            registry: &mut state.registry,
+            adapter: &mut state.adapter,
+        };
+        exec::execute(&mut ctx, command)
+    };
+    crate::shell::sync_wayland_from_core(state);
+    for event in &events {
+        state.subscribers.broadcast_event(event);
+    }
+    let report = build_report(state);
+    state.subscribers.broadcast_report(&report);
+    reply
 }
 
 fn reply_and_close(slot: &mut ConnSlot, reply: Reply) {

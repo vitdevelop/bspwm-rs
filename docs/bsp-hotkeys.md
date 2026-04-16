@@ -34,6 +34,7 @@ Decision: a binding that is one `bspc` call with only literal arguments runs in-
 | `token` (private) | The `get_token` splitter `expand` and `binding` both need, on different separators |
 | `matcher` | Chord-chain state machine fed by key/button events; reports `Pass`/`Continue`/`Fire { index }` |
 | `dispatch` | Classifies a command as an in-process `bspc` call or a shell command (`Dispatch::InlineBspc`/`Shell`) |
+| `config` | Loads a whole sxhkdrc file in one call (`config::load`), plus its path resolution (`config::resolve_path`) |
 
 ## Hotkeys progress
 
@@ -48,9 +49,14 @@ Decision: a binding that is one `bspc` call with only literal arguments runs in-
 
 Chord parsing resolves keysym *names* via `xkbcommon::xkb::keysym_from_name` (sxhkd keeps its own name table, `nks_dict`; this crate's one allowed dependency beyond the standard library is `xkbcommon`, precisely for this). `alt`/`super`/`hyper`/`meta`/`mode_switch` are kept as symbolic `Modifier` variants rather than resolved to a bitmask, since bspwm itself resolves them *dynamically* against the current keyboard mapping (`modfield_from_keysym()`) — there is no fixed bit to hardcode, and doing so needs a live keymap that belongs to `bsp-compositor`'s seat, not this crate. `matcher` is kept free of X11-specific side effects for the same reason: no passive key grabs (Wayland has none), no `alarm()`-driven chain timeout (a timer is `bsp-compositor`'s event loop's job), no `status_fifo` reporting, and no configurable "abort this chain" key yet.
 
-`dispatch::classify` is this project's own extension, not a ported bspwm behavior (sxhkd always spawns `sh -c`, no exceptions) — see "Binding execution" above for its rules. It only classifies and tokenizes; it stays free of `bsp-ipc` on purpose, so actually dispatching a `Dispatch::InlineBspc` (or honoring `hotkeys_inline_bspc`) is left to `bsp-compositor`.
+`dispatch::classify` is this project's own extension, not a ported bspwm behavior (sxhkd always spawns `sh -c`, no exceptions) — see "Binding execution" above for its rules. It only classifies and tokenizes; it stays free of `bsp-ipc` on purpose, so actually dispatching a `Dispatch::InlineBspc` (or honoring `hotkeys_inline_bspc`) is left to `bsp-compositor`. `config::load` ties `lexer`/`expand`/`binding`/`dispatch` together into one call over a whole file; `config::resolve_path` matches sxhkd's own `$XDG_CONFIG_HOME/sxhkd/sxhkdrc` (else `$HOME/.config/sxhkd/sxhkdrc`) lookup (`src/sxhkd.c` `main()`).
 
-Not started: pointer bindings, `SIGUSR1` config reload, and wiring any of it into `bsp-compositor` (`bspwmrc`/sxhkdrc are not read at startup yet, `docs/bsp-compositor.md`'s Nested compositor progress).
+**Wired into `bsp-compositor`** (`crate::hotkeys`, `docs/bsp-compositor.md` Nested compositor progress) and live-verified: sxhkdrc is read at startup, every keyboard event is matched, and a completed chain dispatches either inline or via a spawned shell, confirmed against a running compositor and a real client for all three paths — `Dispatch::Shell`, `Dispatch::InlineBspc`, and a chord using an explicit `shift` modifier. That live test caught two real bugs, both fixed:
+
+- `dispatch::classify`'s `InlineBspc` tokens include the literal leading word `bspc` (it is a tokenized command line); `bsp_ipc::command::parse` expects only the arguments after that, the same way the real `bspc` binary strips its own `argv[0]`. Fixed in `bsp-compositor`, not here — `dispatch::classify` itself is unchanged and correct, this was purely a call-site mismatch.
+- Matching a chord's keysym against Smithay's shift-*resolved* symbol (`KeysymHandle::modified_sym()`) made any chord with an explicit `shift` modifier unmatchable: holding Shift turns the incoming symbol from `a` into `A`, which nothing parsed from the sxhkdrc text `a` would ever equal. Fixed by matching on `KeysymHandle::raw_syms()`'s level-0 symbol instead (Smithay's equivalent of bspwm's `parse_event()` always reading column 0), letting the live modifier state and the fixed base symbol act as two independent conditions — exactly `match_chord()`'s own design. Neither of these was a `bsp-hotkeys` bug: this crate's own 64 unit tests, including several exercising `shift`-modified chords with real `xkbcommon` keysym resolution, all passed throughout — the mismatch only existed in how `bsp-compositor` fed it live keyboard state.
+
+Not started: pointer bindings, `SIGUSR1` config reload, and hot-reloading (`bspwmrc` is also not read at startup yet, `docs/bsp-compositor.md`'s Nested compositor progress).
 
 ## Public functions
 
@@ -63,3 +69,5 @@ Not started: pointer bindings, `SIGUSR1` config reload, and wiring any of it int
 | `Matcher::feed` | `fn(&mut self, &KeyEvent) -> Outcome` | Advances every chain's progress against one input event; reports `Pass`/`Continue`/`Fire { index }` |
 | `Matcher::abort_chain` | `fn(&mut self)` | Resets every chain to its head and leaves chained/locked mode; the caller drives this from a timeout timer |
 | `dispatch::classify` | `fn(&str) -> Dispatch` | Classifies a command as an in-process `bspc` call (tokenized) or a shell command |
+| `config::load` | `fn(&str) -> Vec<LoadedHotkey>` | Loads every hotkey in a whole sxhkdrc file's contents |
+| `config::resolve_path` | `fn(Option<&str>, Option<&str>) -> Option<PathBuf>` | Resolves the sxhkdrc path from `XDG_CONFIG_HOME`/`HOME` |

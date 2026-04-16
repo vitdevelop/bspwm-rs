@@ -4,6 +4,9 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-04-16 | bsp-compositor | Added | `hotkeys::init`, `filter`, `resolve_modifiers`, `run_inline`, `run_shell` | Reads sxhkdrc at startup and drives `bsp-hotkeys`' matcher from real keyboard events; live-verified end to end (both dispatch paths, a `shift`-modified chord) |
+| 2026-04-16 | bsp-compositor | Changed | `ipc::execute_and_broadcast` (extracted from `ipc::on_readable`) | Factored the control socket's execute-reconcile-broadcast sequence into a function `hotkeys::run_inline` also calls, so both paths behave identically |
+| 2026-04-16 | bsp-hotkeys | Added | `config::load`, `config::resolve_path` | Ties `lexer`/`expand`/`binding`/`dispatch` into one call over a whole sxhkdrc file; resolves its path matching sxhkd's own `$XDG_CONFIG_HOME`/`$HOME` lookup |
 | 2026-04-08 | bsp-hotkeys | Added | `dispatch::classify` | Classifies a command as an in-process `bspc` call (tokenized, quote-aware) or a shell command; this project's own "Binding execution" extension, not a ported bspwm behavior |
 | 2026-04-05 | bsp-hotkeys | Added | `matcher::Matcher::new`/`feed`/`abort_chain` | Chord-chain state machine, X11-free; full port of sxhkd's `find_hotkey()`/`match_chord()`/`abort_chain()` |
 | 2026-03-22 | bsp-hotkeys | Added | `binding::parse_chain` | Parses an expanded chain string into `Chord`s (modifiers, keysym via `xkbcommon`, `buttonN`, release/replay/lock-chain); full port of sxhkd's `parse_chain()`/`parse_modifier()`/`parse_button()` |

@@ -154,11 +154,14 @@ pub fn run() {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
+    let hotkeys = crate::hotkeys::init();
+
     let mut state = State::new(
         display_handle.clone(),
         event_loop.handle(),
         backend_data,
         wm,
+        hotkeys,
     );
     state
         .shm_state

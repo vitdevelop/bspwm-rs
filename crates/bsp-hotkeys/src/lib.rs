@@ -10,13 +10,15 @@
 //! crate beyond the standard library), and the chord-chain state
 //! machine ([`matcher`]) — plus [`dispatch`], this project's own
 //! extension classifying a command as an in-process `bspc` call or a
-//! spawned shell command (`docs/bsp-hotkeys.md`'s "Binding execution").
-//! Not started: pointer bindings, `bspwmrc`/sxhkdrc reload, and wiring
-//! any of it into `bsp-compositor`.
+//! spawned shell command (`docs/bsp-hotkeys.md`'s "Binding execution"),
+//! and [`config::load`] tying all of the above into one call over a
+//! whole sxhkdrc file's contents. Not started: pointer bindings,
+//! `bspwmrc`/sxhkdrc reload, and wiring any of it into `bsp-compositor`.
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
 pub mod binding;
+pub mod config;
 pub mod dispatch;
 pub mod expand;
 pub mod lexer;

@@ -89,6 +89,14 @@ pub struct State {
     /// Open `subscribe`d control-socket connections (`crate::ipc`).
     pub subscribers: bsp_ipc::server::Subscribers,
 
+    /// Every hotkey loaded from sxhkdrc (`crate::hotkeys::init`), in the
+    /// same order `hotkey_matcher` was built from — a `Fire { index }`
+    /// outcome indexes into this `Vec`.
+    pub hotkeys: Vec<bsp_hotkeys::config::LoadedHotkey>,
+    /// The chord-chain state machine driven by every keyboard event
+    /// (`crate::hotkeys::process_key`).
+    pub hotkey_matcher: bsp_hotkeys::matcher::Matcher,
+
     /// The backend (currently only the nested winit one exists).
     pub backend_data: WinitData,
 }
@@ -101,6 +109,7 @@ impl State {
         handle: LoopHandle<'static, State>,
         backend_data: WinitData,
         wm: bsp_core::wm::Wm,
+        hotkeys: Vec<bsp_hotkeys::config::LoadedHotkey>,
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
@@ -111,6 +120,9 @@ impl State {
         let pointer = seat.add_pointer();
         seat.add_keyboard(Default::default(), 200, 25)
             .expect("failed to initialize the keyboard");
+
+        let hotkey_matcher =
+            bsp_hotkeys::matcher::Matcher::new(hotkeys.iter().map(|h| h.chords.clone()).collect());
 
         State {
             display_handle,
@@ -131,6 +143,8 @@ impl State {
             registry: bsp_ipc::registry::NodeRegistry::new(),
             adapter: WindowAdapter::new(),
             subscribers: bsp_ipc::server::Subscribers::new(),
+            hotkeys,
+            hotkey_matcher,
             backend_data,
         }
     }

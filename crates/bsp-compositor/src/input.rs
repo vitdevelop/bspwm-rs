@@ -1,17 +1,16 @@
 //! Forwarding winit input events to the Wayland seat, and click-to-focus.
 //!
-//! `bsp-hotkeys` (sxhkdrc chords) is not wired in yet (`docs/design.md`
-//! roadmap, hotkeys): every key is forwarded to the focused client
-//! unconditionally. The emergency keys `docs/design.md`'s Reliability
+//! Every keyboard event is matched against `bsp-hotkeys`' chord matcher
+//! (`crate::hotkeys::filter`) before it would otherwise reach the
+//! focused client. The emergency keys `docs/design.md`'s Reliability
 //! section promises (Ctrl+Alt+F1–F12, Ctrl+Alt+Shift+Escape) are not
-//! implemented yet either — both need hotkeys's chord matcher to land
-//! safely rather than a one-off keysym check here.
+//! implemented yet — they need their own hardcoded, sxhkdrc-independent
+//! path, not just a `bsp-hotkeys` binding a broken config could omit.
 
 use smithay::backend::input::{
-    Axis, AxisSource, Event, InputBackend, InputEvent, KeyboardKeyEvent, PointerAxisEvent,
-    PointerButtonEvent, PointerMotionAbsoluteEvent,
+    Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
 };
-use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_pointer;
@@ -32,12 +31,18 @@ pub fn process_input_event<B: InputBackend>(
         InputEvent::Keyboard { event } => {
             let keycode = event.key_code();
             let key_state = event.state();
+            let pressed = key_state == KeyState::Pressed;
             let serial = SERIAL_COUNTER.next_serial();
             let time = Event::time_msec(&event);
             let keyboard = state.seat.get_keyboard().unwrap();
-            keyboard.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
-                FilterResult::Forward
-            });
+            keyboard.input::<(), _>(
+                state,
+                keycode,
+                key_state,
+                serial,
+                time,
+                |data, mods, sym| crate::hotkeys::filter(data, mods, sym, pressed),
+            );
         }
         InputEvent::PointerMotionAbsolute { event } => {
             on_pointer_motion_absolute(state, event, output)
