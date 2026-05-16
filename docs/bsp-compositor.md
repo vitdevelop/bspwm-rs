@@ -9,7 +9,7 @@ The only crate that uses Smithay: it turns Wayland and hardware activity into `b
 | `main` | Startup, `tracing` init |
 | `state` | `State` (every Smithay protocol global, `bsp-core::wm::Wm`, `bsp-ipc::registry::NodeRegistry`, the `WindowAdapter`, `bsp_ipc::server::Subscribers`); `CompositorHandler`/`ShmHandler`/`SeatHandler`/`OutputHandler`/`BufferHandler` impls |
 | `shell` | `XdgShellHandler`: on a toplevel's first `commit`, matches `bspc rule` entries against its `app_id`/title and maps it to a `bsp-core` client node accordingly (insert at the desktop's focus, apply the matched consequence, arrange, configure the size back); unmaps it on `toplevel_destroyed`; `sync_wayland_from_core` reconciles the `Space`/client surfaces with `bsp-core`'s tree after any command that may have re-arranged it |
-| `input` | Forwards winit pointer events to the Wayland seat and click-to-focus; keyboard events go through `hotkeys::filter` first |
+| `input` | Forwards winit pointer events to the Wayland seat and click-to-focus; keyboard events are checked against the hardcoded emergency quit key, then go through `hotkeys::filter` |
 | `hotkeys` | Reads sxhkdrc at startup (`bsp_hotkeys::config`) and drives `bsp-hotkeys`' matcher from every keyboard event, dispatching a completed chain inline or via a spawned shell |
 | `render` | Per-output damage-tracked rendering: client surfaces plus border strips |
 | `adapter` | `WindowId` ↔ Smithay `Window` map; implements `bsp_ipc::adapter::Adapter` (class/instance lookup, close/kill) |
@@ -57,7 +57,9 @@ That live test caught and fixed two real bugs, neither in `bsp-hotkeys` itself (
 - `Dispatch::InlineBspc`'s tokens start with the literal word `bspc`; `hotkeys::run_inline` was passing them to `bsp_ipc::command::parse` unstripped, which only expects the arguments *after* that (the real `bspc` binary strips its own `argv[0]` before putting a request on the wire). Fixed by skipping `tokens[0]`.
 - `hotkeys::filter` matched a chord's keysym against Smithay's shift-*resolved* symbol (`KeysymHandle::modified_sym()`), so a config line like `super + shift + a` could never match: holding Shift turns the incoming symbol into `A`, and nothing parsed from the literal chord text `a` would ever equal that. Fixed by matching on `KeysymHandle::raw_syms()`'s level-0 (unshifted) symbol instead, letting the live `ModifiersState` and that fixed base symbol act as two independent conditions — exactly how bspwm's own `parse_event()`/`match_chord()` split the same problem (`src/sxhkd.c`/`src/types.c`).
 
-Deliberately not wired up: `resolve_modifiers` (`hotkeys.rs`) only maps `ctrl`/`alt`/`shift`/`super`(`logo`)/`caps_lock` — Smithay's `ModifiersState` has no `hyper`/`meta`/`mode_switch`/`mod1`..`mod5` fields to read (those need raw keymap modifier-index queries this build doesn't do), so a chord naming one of those symbolic `bsp_hotkeys::binding::Modifier` variants (`docs/bsp-hotkeys.md`) simply never matches — not a crash, just a hotkey that silently never fires. Also not wired up: pointer bindings, `SIGUSR1`/live sxhkdrc reload, `bspc config hotkeys_inline_bspc` (the off switch forcing every binding through the shell), and the emergency keys noted above.
+Deliberately not wired up: `resolve_modifiers` (`hotkeys.rs`) only maps `ctrl`/`alt`/`shift`/`super`(`logo`)/`caps_lock` — Smithay's `ModifiersState` has no `hyper`/`meta`/`mode_switch`/`mod1`..`mod5` fields to read (those need raw keymap modifier-index queries this build doesn't do), so a chord naming one of those symbolic `bsp_hotkeys::binding::Modifier` variants (`docs/bsp-hotkeys.md`) simply never matches — not a crash, just a hotkey that silently never fires. Also not wired up: pointer bindings, `SIGUSR1`/live sxhkdrc reload, `bspc config hotkeys_inline_bspc` (the off switch forcing every binding through the shell), and `bspwmrc`.
+
+**The `Ctrl+Alt+Shift+Escape` emergency quit key is implemented and live-verified** (`input::is_emergency_quit`, `docs/design.md`'s Reliability section: it must work "independent of sxhkdrc"). Checked directly in `process_input_event`'s keyboard filter closure, before `hotkeys::filter` ever runs — a broken, missing, or maliciously-crafted sxhkdrc has no way to intercept or disable it, since it never goes through `bsp-hotkeys`' matcher at all. Confirmed live: sending the combo via a synthetic `uinput` keyboard against a running compositor (with no sxhkdrc loaded at all) made the process exit cleanly (`exited with code 0`) with no errors logged. `Ctrl+Alt+F1`–`F12` (TTY switch) is not implemented — it is a real DRM/libseat session concept the nested winit backend has no session to switch within, deferred to the hardware backend.
 
 ## Known issues
 
@@ -87,13 +89,16 @@ Decision: drawing code never names a concrete renderer, so OpenGL ES, Vulkan and
 | Function | Signature | Behavior |
 | --- | --- | --- |
 | `winit_backend::run` | `fn()` | Opens the nested window, creates the Wayland socket, binds the control socket, runs the main loop until closed |
-| `State::new` | `fn(DisplayHandle, LoopHandle<State>, WinitData, bsp_core::wm::Wm) -> State` | Creates every protocol global and the one seat |
+| `State::new` | `fn(DisplayHandle, LoopHandle<State>, WinitData, bsp_core::wm::Wm, Vec<LoadedHotkey>) -> State` | Creates every protocol global, the one seat, and the chord matcher |
 | `State::window_for_surface` | `fn(&self, &WlSurface) -> Option<Window>` | The mapped window showing a surface, if any |
 | `insert_client` | `fn(&DisplayHandle, UnixStream)` | Registers a new Wayland client connection |
-| `input::process_input_event` | `fn<B>(&mut State, InputEvent<B>, &Output)` | Forwards one winit input event to the seat |
+| `input::process_input_event` | `fn<B>(&mut State, InputEvent<B>, &Output)` | Forwards one winit input event to the seat, after the emergency quit key and `bsp-hotkeys` have had a chance to intercept a keyboard event |
 | `input::focus_node` | `fn(&mut State, usize, usize, NodeId)` | Sets the seat's keyboard focus to a `bsp-core` node's client surface |
 | `render::render_frame` | `fn(...) -> Result<RenderOutputResult, ...>` | Renders one damage-tracked frame: client surfaces plus border strips |
 | `WindowAdapter::insert`/`remove`/`window`/`id_of`/`set_app_id` | `fn(&mut self/&self, ...) -> ...` | The `WindowId` ↔ `Window` map and class/instance bookkeeping |
 | `WindowAdapter`'s `Adapter` impl | `window_class`/`close_window`/`kill_window` | `bsp-ipc::exec`'s window-system interface, backed by real `xdg_toplevel::send_close` |
 | `shell::sync_wayland_from_core` | `fn(&mut State)` | Reconciles every mapped client's `Space` position and `xdg_toplevel` size with `bsp-core`'s tree; called after every executed IPC command and after a nested-window resize |
 | `ipc::init` | `fn(&mut State)` | Binds the control socket and registers it (and every accepted connection) with the event loop |
+| `ipc::execute_and_broadcast` | `fn(&mut State, &Command) -> Reply` | Runs a `Command` through `bsp_ipc::exec::execute`, reconciles Wayland state, and broadcasts to `subscribe`d connections; shared by the control socket and `hotkeys::run_inline` |
+| `hotkeys::init` | `fn() -> Vec<LoadedHotkey>` | Reads and parses sxhkdrc, or returns an empty `Vec` if it can't be found |
+| `hotkeys::filter` | `fn(&mut State, &ModifiersState, KeysymHandle, bool) -> FilterResult<()>` | Feeds one keyboard event to the chord matcher and dispatches a completed chain; installed as `KeyboardHandle::input`'s filter |

@@ -1,16 +1,19 @@
 //! Forwarding winit input events to the Wayland seat, and click-to-focus.
 //!
-//! Every keyboard event is matched against `bsp-hotkeys`' chord matcher
+//! Every keyboard event is checked against the hardcoded emergency quit
+//! key first, then matched against `bsp-hotkeys`' chord matcher
 //! (`crate::hotkeys::filter`) before it would otherwise reach the
-//! focused client. The emergency keys `docs/design.md`'s Reliability
-//! section promises (Ctrl+Alt+F1–F12, Ctrl+Alt+Shift+Escape) are not
-//! implemented yet — they need their own hardcoded, sxhkdrc-independent
-//! path, not just a `bsp-hotkeys` binding a broken config could omit.
+//! focused client. Ctrl+Alt+F1–F12 (TTY switch, `docs/design.md`'s
+//! Reliability section) is not implemented: switching a text console is
+//! a real DRM/libseat session concept the nested winit backend has
+//! nothing to switch *to* — it is deferred to the hardware backend, where a real
+//! session exists to drive it.
 
 use smithay::backend::input::{
     Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
     PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
 };
+use smithay::input::keyboard::{KeysymHandle, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_pointer;
@@ -41,7 +44,13 @@ pub fn process_input_event<B: InputBackend>(
                 key_state,
                 serial,
                 time,
-                |data, mods, sym| crate::hotkeys::filter(data, mods, sym, pressed),
+                |data, mods, sym| {
+                    if is_emergency_quit(mods, &sym, pressed) {
+                        data.running = false;
+                        return smithay::input::keyboard::FilterResult::Intercept(());
+                    }
+                    crate::hotkeys::filter(data, mods, sym, pressed)
+                },
             );
         }
         InputEvent::PointerMotionAbsolute { event } => {
@@ -51,6 +60,31 @@ pub fn process_input_event<B: InputBackend>(
         InputEvent::PointerAxis { event } => on_pointer_axis(state, event),
         _ => {}
     }
+}
+
+/// `Ctrl+Alt+Shift+Escape`: quits `bspwm-rs` unconditionally.
+///
+/// `docs/design.md`'s Reliability section: a broken or missing hotkey
+/// config must never lock the user in, so this is checked directly
+/// against the seat's live modifier state and the key's base keysym —
+/// entirely independent of `bsp-hotkeys`/sxhkdrc, before its matcher
+/// ever sees the event (a compositor with no separate display server
+/// to fall back to needs its own escape hatch; bspwm, running under
+/// X11, has no equivalent need).
+///
+/// Matches on `raw_syms()` (the level-0, unshifted symbol) rather than
+/// `modified_sym()` for the same reason `crate::hotkeys::filter` does:
+/// held modifiers are compared separately, not folded into the symbol
+/// itself.
+fn is_emergency_quit(mods: &ModifiersState, keysym: &KeysymHandle<'_>, pressed: bool) -> bool {
+    pressed
+        && mods.ctrl
+        && mods.alt
+        && mods.shift
+        && keysym.raw_syms().first().copied()
+            == Some(xkbcommon::xkb::Keysym::new(
+                xkbcommon::xkb::keysyms::KEY_Escape,
+            ))
 }
 
 fn on_pointer_motion_absolute<B: InputBackend>(
