@@ -168,6 +168,11 @@ pub fn run() {
         .update_formats(state.backend_data.backend.renderer().shm_formats());
     state.space.map_output(&output, (0, 0));
     crate::ipc::init(&mut state);
+    // bspwm: `run_config()` is called right after the control socket
+    // starts listening (`src/bspwm.c` `main()`) and before the main
+    // loop begins, since `bspwmrc` typically issues `bspc` commands
+    // against it as it runs.
+    crate::bspwmrc::run();
 
     tracing::info!("nested compositor ready");
 

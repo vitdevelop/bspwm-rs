@@ -3,10 +3,10 @@
 //! The nested compositor (`docs/design.md` roadmap): a nested (winit) compositor with
 //! xdg-shell, tiling through `bsp-core`, focus and borders — plus a
 //! first slice of hotkeys: sxhkdrc is read at startup and every keyboard
-//! event is matched against it (`crate::hotkeys`). Real hardware
-//! (DRM/KMS), input devices beyond the nested backend's, `bspwmrc`,
-//! XWayland and every protocol past xdg-shell are later steps — see
-//! `docs/bsp-compositor.md`.
+//! event is matched against it (`crate::hotkeys`), and `bspwmrc` is run
+//! at startup (`crate::bspwmrc`). Real hardware (DRM/KMS), input devices
+//! beyond the nested backend's, XWayland and every protocol past
+//! xdg-shell are later steps — see `docs/bsp-compositor.md`.
 //!
 //! This is the only crate allowed `unsafe` (`docs/design.md` hard rule 2:
 //! every block needs a `// SAFETY:` comment); `undocumented_unsafe_blocks`
@@ -15,6 +15,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod adapter;
+mod bspwmrc;
 mod hotkeys;
 mod input;
 mod ipc;

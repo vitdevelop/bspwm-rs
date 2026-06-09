@@ -4,6 +4,7 @@ Every function added, changed or removed, newest first. The matching `docs/<crat
 
 | Date | Crate | Change | Function | Summary |
 | --- | --- | --- | --- | --- |
+| 2026-06-09 | bsp-compositor | Added | `bspwmrc::run` | Runs `bspwmrc` at startup, `execl`'d directly with run level `"0"`, same path and calling convention as bspwm itself; live-verified (test script receiving its `$1`, and the missing-file case logging cleanly with no error) |
 | 2026-05-16 | bsp-compositor | Added | `input::is_emergency_quit` | `Ctrl+Alt+Shift+Escape` quits unconditionally, checked before `bsp-hotkeys`' matcher ever sees the event so a broken/missing sxhkdrc can't disable it; live-verified (process exits cleanly with no sxhkdrc loaded) |
 | 2026-04-16 | bsp-compositor | Added | `hotkeys::init`, `filter`, `resolve_modifiers`, `run_inline`, `run_shell` | Reads sxhkdrc at startup and drives `bsp-hotkeys`' matcher from real keyboard events; live-verified end to end (both dispatch paths, a `shift`-modified chord) |
 | 2026-04-16 | bsp-compositor | Changed | `ipc::execute_and_broadcast` (extracted from `ipc::on_readable`) | Factored the control socket's execute-reconcile-broadcast sequence into a function `hotkeys::run_inline` also calls, so both paths behave identically |
