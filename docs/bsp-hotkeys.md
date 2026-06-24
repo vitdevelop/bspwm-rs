@@ -56,7 +56,9 @@ Chord parsing resolves keysym *names* via `xkbcommon::xkb::keysym_from_name` (sx
 - `dispatch::classify`'s `InlineBspc` tokens include the literal leading word `bspc` (it is a tokenized command line); `bsp_ipc::command::parse` expects only the arguments after that, the same way the real `bspc` binary strips its own `argv[0]`. Fixed in `bsp-compositor`, not here — `dispatch::classify` itself is unchanged and correct, this was purely a call-site mismatch.
 - Matching a chord's keysym against Smithay's shift-*resolved* symbol (`KeysymHandle::modified_sym()`) made any chord with an explicit `shift` modifier unmatchable: holding Shift turns the incoming symbol from `a` into `A`, which nothing parsed from the sxhkdrc text `a` would ever equal. Fixed by matching on `KeysymHandle::raw_syms()`'s level-0 symbol instead (Smithay's equivalent of bspwm's `parse_event()` always reading column 0), letting the live modifier state and the fixed base symbol act as two independent conditions — exactly `match_chord()`'s own design. Neither of these was a `bsp-hotkeys` bug: this crate's own 64 unit tests, including several exercising `shift`-modified chords with real `xkbcommon` keysym resolution, all passed throughout — the mismatch only existed in how `bsp-compositor` fed it live keyboard state.
 
-Not started: pointer bindings, `SIGUSR1` config reload, and hot-reloading (`bspwmrc` is also not read at startup yet, `docs/bsp-compositor.md`'s Nested compositor progress).
+**`SIGUSR1` config reload is wired in and live-verified** (`hotkeys::reload`, `docs/bsp-compositor.md` Hotkeys progress): re-reading sxhkdrc from scratch and rebuilding the matcher, confirmed by swapping sxhkdrc mid-run and checking the old binding stopped firing while the new one worked. `bspwmrc` is also read and run at startup now (`crate::bspwmrc`, same doc).
+
+Not started: pointer bindings, and `bspc config hotkeys_inline_bspc` (the off switch forcing every binding through the shell — where this setting should live is an open question, `docs/bsp-compositor.md`).
 
 ## Public functions
 

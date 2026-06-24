@@ -50,6 +50,30 @@ pub fn init() -> Vec<LoadedHotkey> {
     hotkeys
 }
 
+/// Re-reads sxhkdrc from scratch and replaces `state.hotkeys`/
+/// `state.hotkey_matcher` outright — not merged with the old set.
+///
+/// bspwm's sxhkd: `SIGUSR1` (`src/sxhkd.c` `hold()` sets `reload`,
+/// consumed by the main loop's `reload_cmd()`: `cleanup()` (frees every
+/// existing hotkey) then `load_config()` again). Rebuilding a fresh
+/// `Matcher` here has the same "old hotkeys are gone" effect and also
+/// resets `chained`/`locked` mode, which sxhkd's own `cleanup()` leaves
+/// dangling if a chain happened to be mid-progress at reload time — a
+/// safe improvement, not a deviation worth its own `docs/design.md`
+/// row (internal state, not observable protocol behavior).
+pub fn reload(state: &mut State) {
+    state.hotkeys = init();
+    state.hotkey_matcher = build_matcher(&state.hotkeys);
+}
+
+/// Builds a fresh [`bsp_hotkeys::matcher::Matcher`] over `hotkeys`'
+/// chains, in order — shared by `State::new` and [`reload`] so both
+/// build it the same way.
+#[must_use]
+pub fn build_matcher(hotkeys: &[LoadedHotkey]) -> bsp_hotkeys::matcher::Matcher {
+    bsp_hotkeys::matcher::Matcher::new(hotkeys.iter().map(|h| h.chords.clone()).collect())
+}
+
 /// A `KeyboardHandle::input` filter: feeds `bsp-hotkeys`' matcher and
 /// either intercepts the event (a chain advanced, completed, or the
 /// matcher is otherwise handling it) or forwards it to the focused

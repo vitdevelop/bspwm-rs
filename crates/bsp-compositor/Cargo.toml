@@ -20,6 +20,14 @@ smithay = { version = "0.7", default-features = false, features = [
     "renderer_gl",
     "renderer_pixman",
 ] }
+# Not used directly — this only turns on calloop's own "signals" feature
+# (SIGUSR1 sxhkdrc reload, `docs/bsp-hotkeys.md`) for the version
+# `smithay::reexports::calloop` already resolves to; every calloop type
+# this crate uses still goes through that reexport, never this crate
+# directly.
+calloop = { version = "0.14", default-features = false, features = [
+    "signals",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xkbcommon = "0.8"

@@ -121,8 +121,7 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25)
             .expect("failed to initialize the keyboard");
 
-        let hotkey_matcher =
-            bsp_hotkeys::matcher::Matcher::new(hotkeys.iter().map(|h| h.chords.clone()).collect());
+        let hotkey_matcher = crate::hotkeys::build_matcher(&hotkeys);
 
         State {
             display_handle,

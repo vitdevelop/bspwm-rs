@@ -14,6 +14,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::ImportMemWl;
 use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
@@ -173,6 +174,20 @@ pub fn run() {
     // loop begins, since `bspwmrc` typically issues `bspc` commands
     // against it as it runs.
     crate::bspwmrc::run();
+
+    // bspwm's sxhkd: `SIGUSR1` reloads sxhkdrc (`src/sxhkd.c` `hold()`/
+    // `reload_cmd()`, `docs/bsp-hotkeys.md`'s "Binding execution").
+    match Signals::new(&[Signal::SIGUSR1]) {
+        Ok(signals) => {
+            if let Err(err) = event_loop.handle().insert_source(signals, |_, _, state| {
+                tracing::info!("SIGUSR1: reloading sxhkdrc");
+                crate::hotkeys::reload(state);
+            }) {
+                tracing::warn!("failed to register the SIGUSR1 handler: {err}");
+            }
+        }
+        Err(err) => tracing::warn!("failed to set up SIGUSR1 handling: {err}"),
+    }
 
     tracing::info!("nested compositor ready");
 
