@@ -42,6 +42,14 @@ pub fn resolve_path(xdg_config_home: Option<&str>, home: Option<&str>) -> Option
 pub struct LoadedHotkey {
     /// The chord chain a `Matcher` should track for this hotkey.
     pub chords: Vec<Chord>,
+    /// The expanded command text, verbatim — kept alongside `dispatch`
+    /// (not just implied by it) so a caller honoring `bspc config
+    /// hotkeys_inline_bspc false` (`docs/bsp-hotkeys.md`'s "Binding
+    /// execution" off switch) can always fall back to running the
+    /// *exact* original text through a shell, even for a
+    /// [`Dispatch::InlineBspc`] binding — re-joining its already-split
+    /// tokens back into a command line could lose original quoting.
+    pub command: String,
     /// Where (and, for [`Dispatch::InlineBspc`], how) to run its
     /// command.
     pub dispatch: Dispatch,
@@ -70,6 +78,7 @@ pub fn load(contents: &str) -> Vec<LoadedHotkey> {
                 hotkeys.push(LoadedHotkey {
                     chords,
                     dispatch: dispatch::classify(&expanded.command),
+                    command: expanded.command,
                 });
             }
         }
@@ -108,6 +117,7 @@ mod tests {
         let hotkeys = load("super + Return\n\talacritty\n");
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].chords[0].modifiers, vec![Modifier::Super]);
+        assert_eq!(hotkeys[0].command, "alacritty");
         assert_eq!(
             hotkeys[0].dispatch,
             Dispatch::Shell("alacritty".to_string())
@@ -126,6 +136,21 @@ mod tests {
                 "-f".to_string(),
                 "west".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn command_is_kept_verbatim_even_for_an_inline_bspc_binding() {
+        // `command` must not be reconstructable-only from `dispatch`'s
+        // already-split tokens — a caller falling back to a shell for
+        // an `InlineBspc` binding needs the *original* text.
+        let hotkeys = load(
+            r#"super + w
+	bspc rule -a "Firefox:*:*" state=floating"#,
+        );
+        assert_eq!(
+            hotkeys[0].command,
+            r#"bspc rule -a "Firefox:*:*" state=floating"#
         );
     }
 

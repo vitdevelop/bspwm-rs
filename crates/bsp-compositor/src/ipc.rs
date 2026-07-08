@@ -157,11 +157,53 @@ fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
             PostAction::Remove
         }
         other => {
-            let reply = execute_and_broadcast(state, &other);
+            let reply = match try_hotkeys_inline_bspc(state, &other) {
+                Some(reply) => reply,
+                None => execute_and_broadcast(state, &other),
+            };
             reply_and_close(slot, reply);
             PostAction::Remove
         }
     }
+}
+
+/// `bspc config hotkeys_inline_bspc` (`docs/bsp-hotkeys.md`'s "Binding
+/// execution" off switch): a compositor-only setting
+/// (`crate::state::State::hotkeys_inline_bspc`'s doc comment explains
+/// why it isn't part of `bsp_core::wm::Wm::settings`), so `bsp_ipc::exec`
+/// has never heard of it and would otherwise reply with its "Unknown
+/// setting" fallback. Intercepted here, before a command would otherwise
+/// reach `execute_and_broadcast`, and reused as-is by
+/// `crate::hotkeys::run_inline` so a hotkey bound to this exact command
+/// behaves identically to the socket path (the same "Binding execution"
+/// equivalence requirement [`execute_and_broadcast`] documents).
+///
+/// `Some` when `command` was this setting (handled, whether get or set);
+/// `None` for anything else, meaning the caller should fall through to
+/// its usual handling.
+pub(crate) fn try_hotkeys_inline_bspc(state: &mut State, command: &Command) -> Option<Reply> {
+    let Command::Config(c) = command else {
+        return None;
+    };
+    if c.name != "hotkeys_inline_bspc" {
+        return None;
+    }
+    Some(match &c.value {
+        None => Reply::Ok(format!("{}\n", bool_str(state.hotkeys_inline_bspc))),
+        Some(value) => match bsp_ipc::value::parse_bool(value) {
+            Some(b) => {
+                state.hotkeys_inline_bspc = b;
+                Reply::Ok(String::new())
+            }
+            None => Reply::Fail(format!(
+                "config: hotkeys_inline_bspc: Invalid value: '{value}'.\n"
+            )),
+        },
+    })
+}
+
+fn bool_str(b: bool) -> String {
+    (if b { "true" } else { "false" }).to_string()
 }
 
 /// Runs any `Command` but `Subscribe`/`Quit` (the caller handles those)
@@ -171,6 +213,17 @@ fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
 /// factored out so `crate::hotkeys`' in-process `bspc` dispatch path
 /// gets exactly the same behavior (`docs/bsp-hotkeys.md`'s "Binding
 /// execution" equivalence requirement).
+///
+/// `bspc wm -r` (`WmAction::Restart`) is also handled here rather than
+/// in `bsp_ipc::exec`: `exec_wm` already produces the right `Reply` for
+/// it (`Reply::Ok`, no `Event`s), but a restart is a compositor-only
+/// side effect `bsp-ipc` has no way to perform itself. `docs/design.md`
+/// Compatibility: restarting a Wayland compositor kills every client,
+/// so unlike bspwm's own `wm -r` (which re-execs the whole process),
+/// this is a live reload — re-running `bspwmrc` and re-reading sxhkdrc
+/// (`crate::bspwmrc::run`, `crate::hotkeys::reload`, the same as
+/// `SIGUSR1` does for the latter) — without disturbing any mapped
+/// client or `bsp-core` state.
 pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Reply {
     let (reply, events) = {
         let mut ctx = ExecCtx {
@@ -186,7 +239,17 @@ pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Rep
     }
     let report = build_report(state);
     state.subscribers.broadcast_report(&report);
+
+    if matches!(reply, Reply::Ok(_)) && requests_restart(command) {
+        crate::bspwmrc::run();
+        crate::hotkeys::reload(state);
+    }
+
     reply
+}
+
+fn requests_restart(command: &Command) -> bool {
+    matches!(command, Command::Wm(actions) if actions.contains(&bsp_ipc::command::WmAction::Restart))
 }
 
 fn reply_and_close(slot: &mut ConnSlot, reply: Reply) {

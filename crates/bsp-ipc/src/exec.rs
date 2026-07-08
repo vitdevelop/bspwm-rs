@@ -1374,7 +1374,6 @@ fn exec_rule<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[RuleAction]) -> Reply 
 fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Vec<Event>) {
     let mut events = Vec::new();
     let mut fail: Option<String> = None;
-    let mut restart = false;
 
     'actions: for action in actions {
         match action {
@@ -1451,13 +1450,19 @@ fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Ve
                 // has no wrong effect to produce.
             }
             WmAction::Restart => {
-                restart = true;
+                // Performing the actual restart (a compositor-only side
+                // effect this crate has no way to do) is the caller's
+                // job — `bsp_ipc` has no process/Wayland handle to act
+                // on. `bsp-compositor`'s `ipc::execute_and_broadcast`
+                // inspects the original `Command` itself for this,
+                // rather than anything returned from here, since this
+                // action never fails and produces no `Event`s to carry
+                // it through.
                 break 'actions;
             }
         }
     }
 
-    let _ = restart;
     let reply = match fail {
         Some(msg) => Reply::Fail(msg),
         None => Reply::Ok(String::new()),
@@ -2116,6 +2121,19 @@ mod tests {
             Reply::Ok(s) => assert_eq!(s, expected),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wm_restart_succeeds_with_no_events() {
+        // `bsp_ipc` itself never restarts anything — that's
+        // `bsp-compositor`'s job, inspecting the original `Command`
+        // (`docs/bsp-compositor.md` Hotkeys progress) — this only checks
+        // that the action itself is accepted and produces no `Event`s to
+        // broadcast.
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "wm -r");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert!(events.is_empty());
     }
 
     #[test]

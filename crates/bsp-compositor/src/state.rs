@@ -96,6 +96,15 @@ pub struct State {
     /// The chord-chain state machine driven by every keyboard event
     /// (`crate::hotkeys::process_key`).
     pub hotkey_matcher: bsp_hotkeys::matcher::Matcher,
+    /// `bspc config hotkeys_inline_bspc` (`docs/bsp-hotkeys.md` "Binding
+    /// execution"): `true` runs a [`bsp_hotkeys::dispatch::Dispatch::InlineBspc`]
+    /// binding straight through `bsp-ipc`'s executor in-process; `false`
+    /// forces every binding through a shell instead. Lives here rather
+    /// than in `bsp_core::wm::Wm`'s `Settings` because it affects nothing
+    /// in the tree engine — `bsp-core`'s own settings module doc comment
+    /// reserves exactly this kind of compositor-only setting for
+    /// `bsp-compositor`.
+    pub hotkeys_inline_bspc: bool,
 
     /// The backend (currently only the nested winit one exists).
     pub backend_data: WinitData,
@@ -144,6 +153,7 @@ impl State {
             subscribers: bsp_ipc::server::Subscribers::new(),
             hotkeys,
             hotkey_matcher,
+            hotkeys_inline_bspc: true,
             backend_data,
         }
     }

@@ -161,6 +161,16 @@ fn run(state: &mut State, index: usize) {
     let Some(hotkey) = state.hotkeys.get(index) else {
         return;
     };
+    // `bspc config hotkeys_inline_bspc false` (`docs/bsp-hotkeys.md`'s
+    // "Binding execution" off switch): forces every binding through a
+    // shell, even one `dispatch::classify` judged eligible for the
+    // in-process fast path — `hotkey.command` (kept verbatim alongside
+    // `dispatch` for exactly this) is what gets run instead of
+    // re-joining `InlineBspc`'s already-split tokens.
+    if !state.hotkeys_inline_bspc {
+        run_shell(&hotkey.command);
+        return;
+    }
     match hotkey.dispatch.clone() {
         Dispatch::InlineBspc(tokens) => run_inline(state, &tokens),
         Dispatch::Shell(command) => run_shell(&command),
@@ -192,7 +202,10 @@ fn run_inline(state: &mut State, tokens: &[String]) {
             tracing::warn!("a hotkey bound to `subscribe` has nothing to subscribe; ignored");
         }
         Ok(command) => {
-            let _ = crate::ipc::execute_and_broadcast(state, &command);
+            let _ = match crate::ipc::try_hotkeys_inline_bspc(state, &command) {
+                Some(reply) => reply,
+                None => crate::ipc::execute_and_broadcast(state, &command),
+            };
         }
         Err(err) => {
             tracing::warn!(command = ?tokens, "hotkey's inline bspc call failed to parse: {}", err.message);

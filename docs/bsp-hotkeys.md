@@ -22,7 +22,7 @@ Decision: a binding that is one `bspc` call with only literal arguments runs in-
 
 - Why: skips spawning `sh` and `bspc` on every press of frequent keys, and applies commands in key-press order with no process races.
 - Equivalence: the in-process path must produce the same state change, events and `subscribe` output as the socket path; a test runs each binding both ways and compares. Not implemented yet — needs a real `bsp-compositor` integration to compare against, not just this crate's classification.
-- Off switch: `bspc config hotkeys_inline_bspc false` forces every binding through the shell. Default is `true`. Not implemented yet: `dispatch::classify` itself has no such switch (it has no access to `bsp-core::Settings`) — honoring it is `bsp-compositor`'s job, checking the setting before acting on a `Dispatch::InlineBspc` result.
+- Off switch: `bspc config hotkeys_inline_bspc false` forces every binding through the shell. Default is `true`. Implemented and live-verified in `bsp-compositor` (`docs/bsp-compositor.md` Hotkeys progress) — `dispatch::classify` itself has no such switch (it has no access to `bsp-core::Settings`) and stays unaware of it by design; honoring it is `bsp-compositor`'s job, checking the setting before acting on a `Dispatch::InlineBspc` result. `LoadedHotkey::command` (`config::load`'s output type) keeps the binding's expanded command text verbatim alongside `dispatch` for exactly this: a caller forcing the shell path for an otherwise-`InlineBspc` binding needs the *original* text, not a re-join of `dispatch`'s already-split tokens (lossy for a token that itself contained a literal quote character).
 
 ## Modules
 
@@ -58,7 +58,9 @@ Chord parsing resolves keysym *names* via `xkbcommon::xkb::keysym_from_name` (sx
 
 **`SIGUSR1` config reload is wired in and live-verified** (`hotkeys::reload`, `docs/bsp-compositor.md` Hotkeys progress): re-reading sxhkdrc from scratch and rebuilding the matcher, confirmed by swapping sxhkdrc mid-run and checking the old binding stopped firing while the new one worked. `bspwmrc` is also read and run at startup now (`crate::bspwmrc`, same doc).
 
-Not started: pointer bindings, and `bspc config hotkeys_inline_bspc` (the off switch forcing every binding through the shell — where this setting should live is an open question, `docs/bsp-compositor.md`).
+**`bspc config hotkeys_inline_bspc` is wired in and live-verified** (`ipc::try_hotkeys_inline_bspc`, `docs/bsp-compositor.md` Hotkeys progress): a compositor-local `bool` on `State`, since `bsp-core::Settings`' own module doc comment reserves this kind of compositor-only, non-tree-engine setting for `bsp-compositor` (`docs/bsp-core.md`). Confirmed live over the socket (default `true`, set/get round-trips, an invalid value rejected) and via real key presses in both states: with the flag `true`, a hotkey bound to `bspc config border_width 7` changed `border_width` in-process, no shell spawned; with the flag set `false`, the identical key press left `border_width` unchanged, since forcing the binding through `sh -c "bspc config border_width 7"` fails silently (no real `bspc` binary on `PATH` in this environment) — the expected, distinguishing behavior of the off switch.
+
+Not started: pointer bindings.
 
 ## Public functions
 
