@@ -158,6 +158,26 @@ fn arrange<A: Adapter>(ctx: &mut ExecCtx<A>, c: Coordinates) {
     ctx.wm.monitors[c.monitor].arrange(c.desktop, &settings);
 }
 
+/// `crate::value::ResizeHandle` (the wire format) to
+/// `bsp_core::tree::ResizeHandle` (the tree operation) — the two are
+/// the same 8-way shape by construction, kept as separate types since
+/// `bsp-core` cannot depend on `bsp-ipc` (`docs/design.md` Architecture:
+/// dependencies point one way).
+fn to_core_resize_handle(h: crate::value::ResizeHandle) -> bsp_core::tree::ResizeHandle {
+    use crate::value::ResizeHandle as W;
+    use bsp_core::tree::ResizeHandle as C;
+    match h {
+        W::Left => C::Left,
+        W::Top => C::Top,
+        W::Right => C::Right,
+        W::Bottom => C::Bottom,
+        W::TopLeft => C::TopLeft,
+        W::TopRight => C::TopRight,
+        W::BottomRight => C::BottomRight,
+        W::BottomLeft => C::BottomLeft,
+    }
+}
+
 // ======================= node =======================
 
 fn exec_node<A: Adapter>(
@@ -351,12 +371,68 @@ fn exec_node<A: Adapter>(
                     detail: PreselDetail::Ratio(*ratio),
                 });
             }
-            NodeAction::Move(_, _) | NodeAction::Resize(_, _, _) => {
-                fail = Some(
-                    "node: --move/--resize are not implemented yet (need bsp-core floating-client geometry helpers).\n"
-                        .to_string(),
-                );
-                break 'actions;
+            NodeAction::Move(dx, dy) => {
+                let Some(n) = trg.node else {
+                    fail = Some(String::new());
+                    break 'actions;
+                };
+                if !tree_mut(ctx.wm, trg).move_floating(n, *dx, *dy) {
+                    fail = Some(String::new());
+                    break 'actions;
+                }
+                // bspwm: `src/window.c` `move_client()` only reports
+                // `node_geometry` from this call site (not-grabbing,
+                // i.e. every `bspc` command); `move_floating` only ever
+                // succeeds for a non-tiled node, so this always fires
+                // together with it.
+                let geometry = tree(ctx.wm, trg)
+                    .node(n)
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .floating_rectangle;
+                events.push(Event::NodeGeometry {
+                    monitor: monitor_wire_id(ctx.wm, trg.monitor),
+                    desktop: desktop_id(ctx.wm, trg).0,
+                    node: wid(ctx, trg),
+                    geometry,
+                });
+                changed = true;
+            }
+            NodeAction::Resize(handle, dx, dy) => {
+                let Some(n) = trg.node else {
+                    fail = Some(String::new());
+                    break 'actions;
+                };
+                let h = to_core_resize_handle(*handle);
+                if !tree_mut(ctx.wm, trg).resize_node(n, h, *dx, *dy, true) {
+                    fail = Some(String::new());
+                    break 'actions;
+                }
+                // bspwm: `src/window.c` `resize_client()` only reports
+                // `node_geometry` for a purely `STATE_FLOATING` node —
+                // a tiled resize re-arranges instead (no direct
+                // geometry event of its own), and a pseudo-tiled one's
+                // `floating_rectangle` is only a size *preference*
+                // `apply_layout` reads back, not its real on-screen
+                // rectangle yet.
+                if tree(ctx.wm, trg).node(n).client.as_ref().unwrap().state
+                    == bsp_core::node::ClientState::Floating
+                {
+                    let geometry = tree(ctx.wm, trg)
+                        .node(n)
+                        .client
+                        .as_ref()
+                        .unwrap()
+                        .floating_rectangle;
+                    events.push(Event::NodeGeometry {
+                        monitor: monitor_wire_id(ctx.wm, trg.monitor),
+                        desktop: desktop_id(ctx.wm, trg).0,
+                        node: wid(ctx, trg),
+                        geometry,
+                    });
+                }
+                changed = true;
             }
             NodeAction::SetSplitType(arg) => {
                 let Some(n) = trg.node else {
@@ -1942,6 +2018,103 @@ mod tests {
                 .state,
             ClientState::Floating
         );
+    }
+
+    #[test]
+    fn node_move_fails_on_a_tiled_node() {
+        // bspwm: `move_client()` only moves a tiled node while an
+        // interactive pointer drag is being tracked, which a `bspc
+        // node --move` request never is (`docs/bsp-core.md`
+        // `Tree::move_floating`).
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "node -v 10 10");
+        assert_eq!(reply, Reply::Fail(String::new()));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn node_move_translates_a_floating_node_and_reports_geometry() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        run(&mut wm, &mut registry, &mut adapter, "node -t floating");
+        let left = wm.monitors[0].desktops[0].tree.focus.unwrap();
+        let before = wm.monitors[0].desktops[0]
+            .tree
+            .node(left)
+            .client
+            .as_ref()
+            .unwrap()
+            .floating_rectangle;
+
+        let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "node -v 10 -5");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        let after = wm.monitors[0].desktops[0]
+            .tree
+            .node(left)
+            .client
+            .as_ref()
+            .unwrap()
+            .floating_rectangle;
+        assert_eq!(after.x, before.x + 10);
+        assert_eq!(after.y, before.y - 5);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::NodeGeometry { geometry, .. } if *geometry == after
+        )));
+    }
+
+    #[test]
+    fn node_resize_tiled_adjusts_the_shared_fence() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let root = wm.monitors[0].desktops[0].tree.root.unwrap();
+        let ratio_before = wm.monitors[0].desktops[0].tree.node(root).split_ratio;
+
+        // `left` is focused; its right edge is the fence shared with
+        // `right` (`fixture()` splits the monitor rect side by side,
+        // the wider dimension, per `insert_node`'s longest-side rule).
+        let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "node -z right 40 0");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        let ratio_after = wm.monitors[0].desktops[0].tree.node(root).split_ratio;
+        assert!(ratio_after > ratio_before);
+        // A tiled resize re-arranges instead of reporting its own
+        // `node_geometry` event (bspwm: `resize_client()` only does
+        // that for `STATE_FLOATING`).
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::NodeGeometry { .. })));
+    }
+
+    #[test]
+    fn node_resize_floating_grows_from_the_dragged_corner() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        run(&mut wm, &mut registry, &mut adapter, "node -t floating");
+        let left = wm.monitors[0].desktops[0].tree.focus.unwrap();
+        let before = wm.monitors[0].desktops[0]
+            .tree
+            .node(left)
+            .client
+            .as_ref()
+            .unwrap()
+            .floating_rectangle;
+
+        let (reply, events) = run(
+            &mut wm,
+            &mut registry,
+            &mut adapter,
+            "node -z bottom_right 20 20",
+        );
+        assert_eq!(reply, Reply::Ok(String::new()));
+        let after = wm.monitors[0].desktops[0]
+            .tree
+            .node(left)
+            .client
+            .as_ref()
+            .unwrap()
+            .floating_rectangle;
+        assert_eq!(after.width, before.width + 20);
+        assert_eq!(after.height, before.height + 20);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::NodeGeometry { .. })));
     }
 
     #[test]

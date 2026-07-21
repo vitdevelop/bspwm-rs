@@ -89,6 +89,9 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Tree::equalize_tree` (**equalize**) | `fn(&mut self, Option<NodeId>, &Settings)` | `src/tree.c` `equalize_tree()`. |
 | `Tree::balance_tree` (**balance**) | `fn(&mut self, Option<NodeId>) -> i32` | `src/tree.c` `balance_tree()`. |
 | `Tree::adjust_ratios` | `fn(&mut self, Option<NodeId>, Rect)` | `src/tree.c` `adjust_ratios()`. |
+| `Tree::find_fence` | `fn(&self, NodeId, Direction) -> Option<NodeId>` | `src/tree.c` `find_fence()`. |
+| `Tree::move_floating` (**move**) | `fn(&mut self, NodeId, i32, i32) -> bool` | `src/window.c` `move_client()` (floating-rectangle translation only; see doc comment). |
+| `Tree::resize_node` (**resize**) | `fn(&mut self, NodeId, ResizeHandle, i32, i32, bool) -> bool` | `src/window.c` `resize_client()`. |
 | `Tree::swap_nodes` (**swap**) | `fn(&mut self, NodeId, NodeId) -> bool` | `src/tree.c` `swap_nodes()`, single-tree (see scope). |
 | `Tree::transplant_to`/`transplant_within` (**transplant**) | `fn(&mut self, &Settings, NodeId, ..) -> NodeId`/`bool` | `src/tree.c` `transfer_node()` (minus focus/history/EWMH/`single_monocle`). |
 | `Tree::circulate_leaves` | `fn(&mut self, &Settings, Option<NodeId>, CirculateDir)` | `src/tree.c` `circulate_leaves()` (minus refocus). |

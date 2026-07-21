@@ -69,6 +69,54 @@ pub enum Direction {
     East,
 }
 
+/// Which edge(s) of a node's rectangle a drag handle anchors, matching
+/// the 8 combinations bspwm's own `get_handle()` ever produces (a
+/// single edge or a single corner) — modeled directly as an enum rather
+/// than as a `HANDLE_LEFT | HANDLE_TOP`-style bitmask, since nothing
+/// here needs any of the other combinations bspwm's `resize_handle_t`
+/// could technically represent but never does. Mirrors
+/// `bsp_ipc::value::ResizeHandle`'s own shape (the wire format `bspc
+/// node --resize` already parses), which is this type's only caller.
+///
+/// bspwm: `src/types.h` `resize_handle_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeHandle {
+    /// The left edge.
+    Left,
+    /// The top edge.
+    Top,
+    /// The right edge.
+    Right,
+    /// The bottom edge.
+    Bottom,
+    /// The top-left corner.
+    TopLeft,
+    /// The top-right corner.
+    TopRight,
+    /// The bottom-right corner.
+    BottomRight,
+    /// The bottom-left corner.
+    BottomLeft,
+}
+
+impl ResizeHandle {
+    fn left(self) -> bool {
+        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
+    }
+
+    fn top(self) -> bool {
+        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
+    }
+
+    fn right(self) -> bool {
+        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
+    }
+
+    fn bottom(self) -> bool {
+        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
+    }
+}
+
 /// The axis `flip_tree` mirrors across.
 ///
 /// bspwm: `src/types.h` `flip_t`.
@@ -1387,6 +1435,216 @@ impl Tree {
         self.adjust_ratios(second, second_rect);
     }
 
+    // ---- Move and resize --------------------------------------------
+
+    /// Finds the nearest ancestor of `id` whose split forms the edge a
+    /// drag toward `dir` would grab: the first ancestor `p` whose split
+    /// axis matches `dir` and whose own rectangle extends past `id`'s on
+    /// that side. Every ancestor is compared against `id`'s own
+    /// rectangle throughout the walk up (not a running one updated at
+    /// each step) — bspwm keeps this exact comparison, so a `dir` that
+    /// never actually bounds `id` (e.g. `id` is already flush against
+    /// the desktop's own edge on that side) correctly finds no fence at
+    /// all, rather than the nearest split regardless of which side it's
+    /// on.
+    ///
+    /// bspwm: `src/tree.c` `find_fence()`.
+    #[must_use]
+    pub fn find_fence(&self, id: NodeId, dir: Direction) -> Option<NodeId> {
+        let rect = self.node(id).rect;
+        let mut p = self.node(id).parent();
+        while let Some(pid) = p {
+            let pn = self.node(pid);
+            let bounds = match dir {
+                Direction::North => pn.split_type == SplitType::Horizontal && pn.rect.y < rect.y,
+                Direction::West => pn.split_type == SplitType::Vertical && pn.rect.x < rect.x,
+                Direction::South => {
+                    pn.split_type == SplitType::Horizontal && pn.rect.bottom() > rect.bottom()
+                }
+                Direction::East => {
+                    pn.split_type == SplitType::Vertical && pn.rect.right() > rect.right()
+                }
+            };
+            if bounds {
+                return Some(pid);
+            }
+            p = pn.parent();
+        }
+        None
+    }
+
+    /// Translates `id`'s `floating_rectangle` by `(dx, dy)`. Fails
+    /// (`false`) for a `Tiled`/`PseudoTiled` node: bspwm's own
+    /// `move_client()` only takes that node down this path while a
+    /// pointer drag is actively being tracked (its `grabbing` global),
+    /// which a `bspc node --move` request never is — `src/messages.c`
+    /// `cmd_node()` calls `move_client()` directly, bypassing
+    /// `grab_pointer()`/`track_pointer()` (and so `grabbing`) entirely.
+    /// This build has no live-pointer-drag caller yet (`docs/design.md`
+    /// roadmap), so the condition simplifies to "always fails for a
+    /// tiled node" without losing any real, reachable behavior.
+    /// `Fullscreen` has no dedicated guard in bspwm either — a real, if
+    /// surprising, quirk kept here rather than silently "fixed": its
+    /// `floating_rectangle` moves invisibly, only becoming apparent once
+    /// the node later stops being fullscreen.
+    ///
+    /// Does not transfer `id` to a different monitor if the translated
+    /// rectangle would now sit under one (bspwm: `move_client()`'s
+    /// `monitor_from_client`/`transfer_node` tail) — that needs a
+    /// `Wm`-level, cross-tree operation this `Tree`-scoped function has
+    /// no way to perform; deferred alongside `docs/bsp-ipc.md`'s
+    /// existing cross-desktop/monitor `node --swap` gap.
+    ///
+    /// bspwm: `src/window.c` `move_client()`.
+    #[must_use]
+    pub fn move_floating(&mut self, id: NodeId, dx: i32, dy: i32) -> bool {
+        let Some(client) = self.node(id).client.as_ref() else {
+            return false;
+        };
+        if client.state.is_tiled() {
+            return false;
+        }
+        let client = self.node_mut(id).client.as_mut().unwrap();
+        client.floating_rectangle.x += dx;
+        client.floating_rectangle.y += dy;
+        true
+    }
+
+    /// Resizes `id` by dragging `handle`. `relative` (always `true` for
+    /// `bspc node --resize`, `src/messages.c` `cmd_node()`'s own
+    /// `resize_client(&trg, rh, dx, dy, true)` call) treats `dx`/`dy` as
+    /// pixel deltas; `!relative` (bspwm: only ever used from a live
+    /// pointer drag honoring ICCCM size hints, `src/pointer.c`
+    /// `track_pointer()` — this build tracks no such hints yet,
+    /// `crate::node`'s module doc comment) treats them as an absolute
+    /// position along the dragged edge(s) instead.
+    ///
+    /// `Fullscreen` never resizes. `Tiled` adjusts one or two ancestor
+    /// "fence" nodes' `split_ratio` (`find_fence`, `adjust_ratios`)
+    /// instead of `id`'s own rectangle — the caller must still
+    /// re-arrange the desktop afterward for this to take visible effect
+    /// (`apply_layout` recomputes `id`'s `rect` from its ancestors'
+    /// ratios; this only touches the tree). Every other state
+    /// (`Floating`, `PseudoTiled`) adjusts `floating_rectangle` directly
+    /// from the node's *current on-screen* rectangle (`tiled_rectangle`
+    /// for `PseudoTiled`, matching bspwm's own `get_rectangle()`, not
+    /// its possibly-larger stored preference), clamped to a 1×1 minimum
+    /// — for `PseudoTiled` this only changes the *preferred* size
+    /// `apply_layout` reads back, so the caller must still re-arrange
+    /// for that state too, same as `Tiled`.
+    ///
+    /// bspwm: `src/window.c` `resize_client()`.
+    #[must_use]
+    pub fn resize_node(
+        &mut self,
+        id: NodeId,
+        handle: ResizeHandle,
+        dx: i32,
+        dy: i32,
+        relative: bool,
+    ) -> bool {
+        let Some(client) = self.node(id).client.clone() else {
+            return false;
+        };
+        if client.state == ClientState::Fullscreen {
+            return false;
+        }
+
+        if client.state == ClientState::Tiled {
+            let vertical_fence = if handle.left() {
+                self.find_fence(id, Direction::West)
+            } else if handle.right() {
+                self.find_fence(id, Direction::East)
+            } else {
+                None
+            };
+            let horizontal_fence = if handle.top() {
+                self.find_fence(id, Direction::North)
+            } else if handle.bottom() {
+                self.find_fence(id, Direction::South)
+            } else {
+                None
+            };
+            if vertical_fence.is_none() && horizontal_fence.is_none() {
+                return false;
+            }
+            if let Some(f) = vertical_fence {
+                let rect = self.node(f).rect;
+                let sr = if relative {
+                    self.node(f).split_ratio + dx as f64 / rect.width as f64
+                } else {
+                    (dx - rect.x) as f64 / rect.width as f64
+                };
+                self.node_mut(f).split_ratio = sr.clamp(0.0, 1.0);
+                self.adjust_ratios(Some(f), rect);
+            }
+            if let Some(f) = horizontal_fence {
+                let rect = self.node(f).rect;
+                let sr = if relative {
+                    self.node(f).split_ratio + dy as f64 / rect.height as f64
+                } else {
+                    (dy - rect.y) as f64 / rect.height as f64
+                };
+                self.node_mut(f).split_ratio = sr.clamp(0.0, 1.0);
+                self.adjust_ratios(Some(f), rect);
+            }
+            return true;
+        }
+
+        let rect = if client.state == ClientState::Floating {
+            client.floating_rectangle
+        } else {
+            client.tiled_rectangle
+        };
+        let mut width = rect.width;
+        let mut height = rect.height;
+        if relative {
+            width += dx
+                * if handle.left() {
+                    -1
+                } else if handle.right() {
+                    1
+                } else {
+                    0
+                };
+            height += dy
+                * if handle.top() {
+                    -1
+                } else if handle.bottom() {
+                    1
+                } else {
+                    0
+                };
+        } else {
+            if handle.left() {
+                width = rect.x + rect.width - dx;
+            } else if handle.right() {
+                width = dx - rect.x;
+            }
+            if handle.top() {
+                height = rect.y + rect.height - dy;
+            } else if handle.bottom() {
+                height = dy - rect.y;
+            }
+        }
+        width = width.max(1);
+        height = height.max(1);
+        let mut x = rect.x;
+        let mut y = rect.y;
+        if handle.left() {
+            x += rect.width - width;
+        }
+        if handle.top() {
+            y += rect.height - height;
+        }
+        self.node_mut(id)
+            .client
+            .as_mut()
+            .unwrap()
+            .floating_rectangle = Rect::new(x, y, width, height);
+        true
+    }
+
     // ---- Swap and transplant ------------------------------------------
 
     /// Swaps the positions of `n1` and `n2` in the tree: each takes over
@@ -2095,6 +2353,115 @@ mod tests {
         t.adjust_ratios(Some(root), Rect::new(-100, 0, 300, 100));
 
         assert!((t.node(root).split_ratio - (200.0 / 300.0)).abs() < 1e-9);
+    }
+
+    // ---- find_fence / resize_node / move_floating ------------------------
+
+    /// A two-leaf vertical split (`a` | `b`) laid out over `0,0 400x200`,
+    /// ready for `find_fence`/`resize_node` tests.
+    fn vertical_split_fixture() -> (Tree, NodeId, NodeId) {
+        let s = settings();
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        let b = insert_client(&mut t, &s, Some(a), 2);
+        let root = t.root.unwrap();
+        t.node_mut(root).split_type = SplitType::Vertical;
+        t.node_mut(root).split_ratio = 0.5;
+        let mrect = Rect::new(0, 0, 400, 200);
+        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect);
+        (t, a, b)
+    }
+
+    #[test]
+    fn find_fence_finds_the_shared_ancestor_on_the_bounding_side_only() {
+        let (t, a, b) = vertical_split_fixture();
+        let root = t.root.unwrap();
+        // `a` is the left leaf: its east side (and `b`'s west side) is
+        // the shared fence; neither leaf is bounded on the other two
+        // sides (they're flush against the desktop edge there).
+        assert_eq!(t.find_fence(a, Direction::East), Some(root));
+        assert_eq!(t.find_fence(b, Direction::West), Some(root));
+        assert_eq!(t.find_fence(a, Direction::West), None);
+        assert_eq!(t.find_fence(b, Direction::East), None);
+        assert_eq!(t.find_fence(a, Direction::North), None);
+        assert_eq!(t.find_fence(a, Direction::South), None);
+    }
+
+    #[test]
+    fn resize_node_tiled_adjusts_the_fence_split_ratio() {
+        let (mut t, _a, b) = vertical_split_fixture();
+        let root = t.root.unwrap();
+        // Dragging `b`'s left (west) edge 40px to the left grows `b` and
+        // shrinks `a`, moving the fence from x=200 (ratio 0.5) to x=160.
+        assert!(t.resize_node(b, ResizeHandle::Left, -40, 0, true));
+        assert!((t.node(root).split_ratio - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_node_tiled_fails_when_the_handle_names_no_fence() {
+        let (mut t, a, _b) = vertical_split_fixture();
+        // `a` is the leftmost leaf: nothing bounds its own left edge.
+        assert!(!t.resize_node(a, ResizeHandle::Left, -40, 0, true));
+    }
+
+    #[test]
+    fn resize_node_floating_grows_from_the_dragged_corner_and_clamps_to_one_pixel() {
+        let s = settings();
+        let mut t = Tree::new();
+        let n = insert_client(&mut t, &s, None, 1);
+        {
+            let c = t.node_mut(n).client.as_mut().unwrap();
+            c.state = ClientState::Floating;
+            c.floating_rectangle = Rect::new(0, 0, 100, 100);
+        }
+
+        assert!(t.resize_node(n, ResizeHandle::BottomRight, 20, 20, true));
+        assert_eq!(
+            t.node(n).client.as_ref().unwrap().floating_rectangle,
+            Rect::new(0, 0, 120, 120)
+        );
+
+        // Dragging the right edge far enough left to cross the left
+        // edge clamps to a 1px-wide rectangle rather than going
+        // negative.
+        assert!(t.resize_node(n, ResizeHandle::Right, -1000, 0, true));
+        let r = t.node(n).client.as_ref().unwrap().floating_rectangle;
+        assert_eq!(r.width, 1);
+    }
+
+    #[test]
+    fn resize_node_fullscreen_never_resizes() {
+        let s = settings();
+        let mut t = Tree::new();
+        let n = insert_client(&mut t, &s, None, 1);
+        t.node_mut(n).client.as_mut().unwrap().state = ClientState::Fullscreen;
+        assert!(!t.resize_node(n, ResizeHandle::BottomRight, 20, 20, true));
+    }
+
+    #[test]
+    fn move_floating_translates_the_floating_rectangle() {
+        let s = settings();
+        let mut t = Tree::new();
+        let n = insert_client(&mut t, &s, None, 1);
+        {
+            let c = t.node_mut(n).client.as_mut().unwrap();
+            c.state = ClientState::Floating;
+            c.floating_rectangle = Rect::new(10, 10, 50, 50);
+        }
+        assert!(t.move_floating(n, 5, -5));
+        assert_eq!(
+            t.node(n).client.as_ref().unwrap().floating_rectangle,
+            Rect::new(15, 5, 50, 50)
+        );
+    }
+
+    #[test]
+    fn move_floating_fails_for_a_tiled_node() {
+        // bspwm: `move_client()` only moves a tiled node while a pointer
+        // drag is actively being tracked — never reachable from `bspc
+        // node --move`.
+        let (mut t, a, _b) = vertical_split_fixture();
+        assert!(!t.move_floating(a, 5, 5));
     }
 
     // ---- swap_nodes -----------------------------------------------------
