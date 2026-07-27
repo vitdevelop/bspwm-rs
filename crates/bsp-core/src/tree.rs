@@ -99,6 +99,31 @@ pub enum ResizeHandle {
     BottomLeft,
 }
 
+/// What a pointer button (held with `pointer_modifier`) does when
+/// pressed on a node and dragged — bspwm's `bspc config pointer_action1`/
+/// `pointer_action2`/`pointer_action3`, one per `BUTTONS[]` slot
+/// (`docs/bsp-compositor.md`'s Hotkeys progress: this is a
+/// compositor-local setting, not a `Settings` field, same reasoning as
+/// `hotkeys_inline_bspc`).
+///
+/// bspwm: `src/types.h` `pointer_action_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerAction {
+    /// No action.
+    None,
+    /// Focuses (or, if already focused, raises) the node under the
+    /// pointer; never a drag.
+    Focus,
+    /// Moves the node, following the pointer.
+    Move,
+    /// Resizes the node from whichever single edge the pointer's
+    /// initial position was nearest (`get_handle`).
+    ResizeSide,
+    /// Resizes the node from whichever corner the pointer's initial
+    /// position was nearest.
+    ResizeCorner,
+}
+
 impl ResizeHandle {
     fn left(self) -> bool {
         matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
@@ -1473,6 +1498,67 @@ impl Tree {
         None
     }
 
+    /// `id`'s current on-screen rectangle regardless of state:
+    /// `floating_rectangle` for `Floating`, `tiled_rectangle` for
+    /// everything else (`Tiled`/`PseudoTiled`/`Fullscreen`).
+    ///
+    /// bspwm: `src/tree.c` `get_rectangle()`'s client branch (`IS_FLOATING`).
+    fn client_rect(&self, id: NodeId) -> Option<Rect> {
+        let client = self.node(id).client.as_ref()?;
+        Some(if client.state == ClientState::Floating {
+            client.floating_rectangle
+        } else {
+            client.tiled_rectangle
+        })
+    }
+
+    /// Which edge or corner of `id`'s current rectangle a click at
+    /// `pos` (in the same coordinate space as node rectangles) is
+    /// closest to, for `action`. `ResizeSide` splits the rectangle
+    /// along both diagonals and picks whichever of the four triangles
+    /// `pos` falls in; `ResizeCorner` (and, matching bspwm, every other
+    /// `action` too — the result is simply unused for `Move`/`Focus`/
+    /// `None`) picks whichever quadrant of the midpoint `pos` falls in.
+    /// Falls back to `BottomRight` if `id` names no client (bspwm:
+    /// `get_handle()`'s own `rh = HANDLE_BOTTOM_RIGHT` default, though
+    /// that path is never actually reachable there either).
+    ///
+    /// bspwm: `src/pointer.c` `get_handle()`.
+    #[must_use]
+    pub fn get_handle(&self, id: NodeId, pos: (i32, i32), action: PointerAction) -> ResizeHandle {
+        let Some(rect) = self.client_rect(id) else {
+            return ResizeHandle::BottomRight;
+        };
+        if action == PointerAction::ResizeSide {
+            let w = f64::from(rect.width);
+            let h = f64::from(rect.height);
+            let ratio = w / h;
+            let x = f64::from(pos.0 - rect.x);
+            let y = f64::from(pos.1 - rect.y);
+            let diag_a = ratio * y;
+            let diag_b = w - diag_a;
+            return if x < diag_a {
+                if x < diag_b {
+                    ResizeHandle::Left
+                } else {
+                    ResizeHandle::Bottom
+                }
+            } else if x < diag_b {
+                ResizeHandle::Top
+            } else {
+                ResizeHandle::Right
+            };
+        }
+        let mid_x = rect.x + rect.width / 2;
+        let mid_y = rect.y + rect.height / 2;
+        match (pos.0 > mid_x, pos.1 > mid_y) {
+            (true, true) => ResizeHandle::BottomRight,
+            (true, false) => ResizeHandle::TopRight,
+            (false, true) => ResizeHandle::BottomLeft,
+            (false, false) => ResizeHandle::TopLeft,
+        }
+    }
+
     /// Translates `id`'s `floating_rectangle` by `(dx, dy)`. Fails
     /// (`false`) for a `Tiled`/`PseudoTiled` node: bspwm's own
     /// `move_client()` only takes that node down this path while a
@@ -1591,11 +1677,7 @@ impl Tree {
             return true;
         }
 
-        let rect = if client.state == ClientState::Floating {
-            client.floating_rectangle
-        } else {
-            client.tiled_rectangle
-        };
+        let rect = self.client_rect(id).unwrap();
         let mut width = rect.width;
         let mut height = rect.height;
         if relative {
@@ -2462,6 +2544,64 @@ mod tests {
         // node --move`.
         let (mut t, a, _b) = vertical_split_fixture();
         assert!(!t.move_floating(a, 5, 5));
+    }
+
+    #[test]
+    fn get_handle_resize_corner_picks_the_nearest_quadrant() {
+        let s = settings();
+        let mut t = Tree::new();
+        let n = insert_client(&mut t, &s, None, 1);
+        {
+            let c = t.node_mut(n).client.as_mut().unwrap();
+            c.state = ClientState::Floating;
+            c.floating_rectangle = Rect::new(0, 0, 100, 100);
+        }
+        assert_eq!(
+            t.get_handle(n, (80, 20), PointerAction::ResizeCorner),
+            ResizeHandle::TopRight
+        );
+        assert_eq!(
+            t.get_handle(n, (20, 80), PointerAction::ResizeCorner),
+            ResizeHandle::BottomLeft
+        );
+        assert_eq!(
+            t.get_handle(n, (20, 20), PointerAction::ResizeCorner),
+            ResizeHandle::TopLeft
+        );
+        assert_eq!(
+            t.get_handle(n, (80, 80), PointerAction::ResizeCorner),
+            ResizeHandle::BottomRight
+        );
+    }
+
+    #[test]
+    fn get_handle_resize_side_picks_the_nearest_edge() {
+        let s = settings();
+        let mut t = Tree::new();
+        let n = insert_client(&mut t, &s, None, 1);
+        {
+            let c = t.node_mut(n).client.as_mut().unwrap();
+            c.state = ClientState::Floating;
+            c.floating_rectangle = Rect::new(0, 0, 100, 100);
+        }
+        // A square window: each edge "owns" the triangle nearest it,
+        // split by both diagonals.
+        assert_eq!(
+            t.get_handle(n, (50, 5), PointerAction::ResizeSide),
+            ResizeHandle::Top
+        );
+        assert_eq!(
+            t.get_handle(n, (50, 95), PointerAction::ResizeSide),
+            ResizeHandle::Bottom
+        );
+        assert_eq!(
+            t.get_handle(n, (5, 50), PointerAction::ResizeSide),
+            ResizeHandle::Left
+        );
+        assert_eq!(
+            t.get_handle(n, (95, 50), PointerAction::ResizeSide),
+            ResizeHandle::Right
+        );
     }
 
     // ---- swap_nodes -----------------------------------------------------

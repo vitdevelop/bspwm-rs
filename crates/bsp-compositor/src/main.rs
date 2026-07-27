@@ -19,6 +19,7 @@ mod bspwmrc;
 mod hotkeys;
 mod input;
 mod ipc;
+mod pointer_action;
 mod render;
 mod shell;
 mod state;

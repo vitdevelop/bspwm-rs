@@ -60,7 +60,7 @@ Chord parsing resolves keysym *names* via `xkbcommon::xkb::keysym_from_name` (sx
 
 **`bspc config hotkeys_inline_bspc` is wired in and live-verified** (`ipc::try_hotkeys_inline_bspc`, `docs/bsp-compositor.md` Hotkeys progress): a compositor-local `bool` on `State`, since `bsp-core::Settings`' own module doc comment reserves this kind of compositor-only, non-tree-engine setting for `bsp-compositor` (`docs/bsp-core.md`). Confirmed live over the socket (default `true`, set/get round-trips, an invalid value rejected) and via real key presses in both states: with the flag `true`, a hotkey bound to `bspc config border_width 7` changed `border_width` in-process, no shell spawned; with the flag set `false`, the identical key press left `border_width` unchanged, since forcing the binding through `sh -c "bspc config border_width 7"` fails silently (no real `bspc` binary on `PATH` in this environment) — the expected, distinguishing behavior of the off switch.
 
-Not started: pointer bindings.
+**Pointer bindings (`bspc config pointer_modifier`/`pointer_action1..3`/`click_to_focus`) are wired in and live-verified** — entirely in `bsp-compositor` (`crate::pointer_action`, `docs/bsp-compositor.md` Hotkeys progress), not this crate: bspwm's `pointer_action` system is X11 passive-grab-driven, not an sxhkdrc concept, so it doesn't touch `bsp-hotkeys`' chord grammar or matcher at all. `binding::Key::Button`/`binding::parse_button` remain genuinely unwired — an sxhkdrc line binding a command to a bare pointer button press (sxhkd's own, separate button-chord feature) still does nothing.
 
 ## Public functions
 

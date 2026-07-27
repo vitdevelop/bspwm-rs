@@ -118,10 +118,17 @@ fn on_pointer_button<B: InputBackend>(state: &mut State, event: impl PointerButt
     let serial = SERIAL_COUNTER.next_serial();
     let button = event.button_code();
     let button_state = wl_pointer::ButtonState::from(event.state());
+    let time = event.time_msec();
 
-    if button_state == wl_pointer::ButtonState::Pressed {
-        let location = state.pointer.current_location();
-        focus_under_pointer(state, location, serial);
+    // `crate::pointer_action::on_button_press` covers both click-to-focus
+    // and `pointer_modifier`-held drag bindings, and decides whether
+    // this press should still reach the client afterward — see its own
+    // doc comment for why a press matching neither is always forwarded
+    // untouched, same as bspwm's un-grabbed default.
+    if button_state == wl_pointer::ButtonState::Pressed
+        && !crate::pointer_action::on_button_press(state, button, serial, time)
+    {
+        return;
     }
 
     let pointer = state.pointer.clone();
@@ -131,7 +138,7 @@ fn on_pointer_button<B: InputBackend>(state: &mut State, event: impl PointerButt
             button,
             state: button_state.try_into().unwrap(),
             serial,
-            time: event.time_msec(),
+            time,
         },
     );
     pointer.frame(state);
@@ -175,25 +182,29 @@ fn on_pointer_axis<B: InputBackend>(state: &mut State, event: impl PointerAxisEv
     pointer.frame(state);
 }
 
-/// Click-to-focus: finds the window under `location` and, if it names a
-/// `bsp-core` client, focuses it (`bsp-core::tree::Tree::focus`, the
-/// monitor's focused desktop, and the seat's keyboard focus, all three —
-/// bspwm: `src/tree.c` `focus_node()`).
-fn focus_under_pointer(
-    state: &mut State,
+/// The window currently showing under `location`, resolved down to a
+/// `bsp-core` client, if any — `state.space.element_under` plus the
+/// adapter's `Window` ↔ `WindowId` map plus a tree scan, factored out
+/// so `crate::pointer_action` can resolve "what's under the pointer"
+/// the same way click-to-focus does.
+pub(crate) fn window_under(
+    state: &State,
     location: smithay::utils::Point<f64, smithay::utils::Logical>,
-    serial: smithay::utils::Serial,
-) {
-    let Some((window, _)) = state
-        .space
-        .element_under(location)
-        .map(|(w, p)| (w.clone(), p))
-    else {
-        return;
-    };
-    let Some(window_id) = state.adapter.id_of(&window) else {
-        return;
-    };
+) -> Option<bsp_core::id::WindowId> {
+    let (window, _) = state.space.element_under(location)?;
+    state.adapter.id_of(window)
+}
+
+/// Scans every monitor/desktop's tree for the leaf showing `window_id`,
+/// returning its `(monitor index, desktop index, NodeId)`. `bsp-core`
+/// has no reverse `WindowId -> NodeId` index of its own (`docs/design.md`
+/// Architecture: that mapping is the adapter's job, `bsp-ipc::registry`
+/// only tracks the *wire* id), so this is a linear scan — fine at the
+/// scale a single compositor's monitors/desktops/windows reach.
+pub(crate) fn locate_window(
+    state: &State,
+    window_id: bsp_core::id::WindowId,
+) -> Option<(usize, usize, NodeId)> {
     for mi in 0..state.wm.monitors.len() {
         for di in 0..state.wm.monitors[mi].desktops.len() {
             let tree = &state.wm.monitors[mi].desktops[di].tree;
@@ -205,17 +216,43 @@ fn focus_under_pointer(
                     .as_ref()
                     .is_some_and(|c| c.window == window_id)
                 {
-                    state.wm.monitors[mi].desktops[di].tree.focus = Some(id);
-                    state.wm.focused_monitor = Some(mi);
-                    state.wm.monitors[mi].focused = Some(di);
-                    let keyboard = state.seat.get_keyboard().unwrap();
-                    keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
-                    return;
+                    return Some((mi, di, id));
                 }
                 n = tree.next_leaf(Some(id), tree.root);
             }
         }
     }
+    None
+}
+
+/// Sets both halves of "node is focused": `bsp-core`'s tree/monitor
+/// focus, and the Wayland seat's keyboard focus on its client surface.
+/// Shared by click-to-focus and `crate::pointer_action`'s `Focus`
+/// pointer action, which both end up doing exactly this (bspwm: both
+/// paths call `focus_node()`, `src/tree.c`).
+pub(crate) fn set_focus(
+    state: &mut State,
+    mi: usize,
+    di: usize,
+    node: NodeId,
+    serial: smithay::utils::Serial,
+) {
+    state.wm.monitors[mi].desktops[di].tree.focus = Some(node);
+    state.wm.focused_monitor = Some(mi);
+    state.wm.monitors[mi].focused = Some(di);
+    let Some(client) = state.wm.monitors[mi].desktops[di]
+        .tree
+        .node(node)
+        .client
+        .clone()
+    else {
+        return;
+    };
+    let Some(window) = state.adapter.window(client.window).cloned() else {
+        return;
+    };
+    let keyboard = state.seat.get_keyboard().unwrap();
+    keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
 }
 
 /// Sets the seat's keyboard focus to `node`'s client surface (`bsp-core`'s

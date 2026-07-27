@@ -157,10 +157,9 @@ fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
             PostAction::Remove
         }
         other => {
-            let reply = match try_hotkeys_inline_bspc(state, &other) {
-                Some(reply) => reply,
-                None => execute_and_broadcast(state, &other),
-            };
+            let reply = try_hotkeys_inline_bspc(state, &other)
+                .or_else(|| crate::pointer_action::try_config(state, &other))
+                .unwrap_or_else(|| execute_and_broadcast(state, &other));
             reply_and_close(slot, reply);
             PostAction::Remove
         }

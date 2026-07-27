@@ -105,6 +105,11 @@ pub struct State {
     /// reserves exactly this kind of compositor-only setting for
     /// `bsp-compositor`.
     pub hotkeys_inline_bspc: bool,
+    /// `bspc config pointer_modifier`/`pointer_action1..3`/
+    /// `click_to_focus`/`pointer_motion_interval`/`swallow_first_click`
+    /// (`crate::pointer_action`) — compositor-local for the same
+    /// reason as `hotkeys_inline_bspc` above.
+    pub pointer_settings: crate::pointer_action::PointerSettings,
 
     /// The backend (currently only the nested winit one exists).
     pub backend_data: WinitData,
@@ -154,6 +159,7 @@ impl State {
             hotkeys,
             hotkey_matcher,
             hotkeys_inline_bspc: true,
+            pointer_settings: crate::pointer_action::PointerSettings::default(),
             backend_data,
         }
     }

@@ -202,10 +202,9 @@ fn run_inline(state: &mut State, tokens: &[String]) {
             tracing::warn!("a hotkey bound to `subscribe` has nothing to subscribe; ignored");
         }
         Ok(command) => {
-            let _ = match crate::ipc::try_hotkeys_inline_bspc(state, &command) {
-                Some(reply) => reply,
-                None => crate::ipc::execute_and_broadcast(state, &command),
-            };
+            let _ = crate::ipc::try_hotkeys_inline_bspc(state, &command)
+                .or_else(|| crate::pointer_action::try_config(state, &command))
+                .unwrap_or_else(|| crate::ipc::execute_and_broadcast(state, &command));
         }
         Err(err) => {
             tracing::warn!(command = ?tokens, "hotkey's inline bspc call failed to parse: {}", err.message);

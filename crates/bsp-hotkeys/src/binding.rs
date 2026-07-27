@@ -59,10 +59,15 @@ pub enum Modifier {
 }
 
 impl Modifier {
-    /// Parses one modifier name, or `None` if `name` isn't one.
+    /// Parses one modifier name, or `None` if `name` isn't one. Public
+    /// so `bsp-compositor` can reuse the same vocabulary for `bspc
+    /// config pointer_modifier` (`crate::pointer_action`, a deliberate
+    /// deviation from bspwm's own `mod1`..`mod5`/`shift`/`control`/
+    /// `lock`-only `parse_modifier_mask()`, `docs/bsp-hotkeys.md`).
     ///
     /// bspwm: `src/parse.c` `parse_modifier()`.
-    fn parse(name: &str) -> Option<Modifier> {
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Modifier> {
         Some(match name {
             "shift" => Modifier::Shift,
             "control" | "ctrl" => Modifier::Control,

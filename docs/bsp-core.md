@@ -90,6 +90,7 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Tree::balance_tree` (**balance**) | `fn(&mut self, Option<NodeId>) -> i32` | `src/tree.c` `balance_tree()`. |
 | `Tree::adjust_ratios` | `fn(&mut self, Option<NodeId>, Rect)` | `src/tree.c` `adjust_ratios()`. |
 | `Tree::find_fence` | `fn(&self, NodeId, Direction) -> Option<NodeId>` | `src/tree.c` `find_fence()`. |
+| `Tree::get_handle` | `fn(&self, NodeId, (i32, i32), PointerAction) -> ResizeHandle` | `src/pointer.c` `get_handle()`. |
 | `Tree::move_floating` (**move**) | `fn(&mut self, NodeId, i32, i32) -> bool` | `src/window.c` `move_client()` (floating-rectangle translation only; see doc comment). |
 | `Tree::resize_node` (**resize**) | `fn(&mut self, NodeId, ResizeHandle, i32, i32, bool) -> bool` | `src/window.c` `resize_client()`. |
 | `Tree::swap_nodes` (**swap**) | `fn(&mut self, NodeId, NodeId) -> bool` | `src/tree.c` `swap_nodes()`, single-tree (see scope). |
