@@ -164,6 +164,15 @@ pub fn run() {
         wm,
         hotkeys,
     );
+    // `State::new` builds `hotkey_matcher` from the raw, just-loaded
+    // chords — `Modifier::Hyper`/`Meta` unresolved, since resolving them
+    // needs `KeyboardHandle::with_xkb_state`, which needs a `&mut State`
+    // that doesn't exist yet while `State::new` is still constructing
+    // one. This second pass, now that `state` exists, is what actually
+    // resolves them
+    // (`crate::hotkeys::canonicalize_virtual_modifiers`'s own doc
+    // comment).
+    crate::hotkeys::canonicalize_virtual_modifiers(&mut state);
     state
         .shm_state
         .update_formats(state.backend_data.backend.renderer().shm_formats());

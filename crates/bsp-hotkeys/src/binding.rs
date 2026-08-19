@@ -86,6 +86,40 @@ impl Modifier {
             _ => return None,
         })
     }
+
+    /// Collapses `alt`/`super`/`mode_switch` onto the real X11 modifier
+    /// bit they name on essentially every keymap in practical use, so a
+    /// chord's parsed modifiers and a live held set can be compared even
+    /// when one side used the friendly name and the other the raw
+    /// `mod1`..`mod5` one.
+    ///
+    /// bspwm/sxhkd have no such distinction to begin with: `alt` and
+    /// `super` resolve *dynamically* to whichever real modifier bit
+    /// `Alt_L`/`Super_L` are currently bound to (sxhkd `src/parse.c`
+    /// `parse_modifier()`'s `modfield_from_keysym(Alt_L)`/
+    /// `modfield_from_keysym(Super_L)`), and `mode_switch` is hardcoded
+    /// outright to `XCB_MOD_MASK_5` (same function, no keysym lookup at
+    /// all) — on the X11 side, `alt + x` and `mod1 + x` are not two
+    /// related chords, they are the *same* chord, one bit compared
+    /// against another bit. This crate keeps `Modifier` symbolic instead
+    /// of resolving straight to a bitmask (this module's doc comment),
+    /// so without this canonical form that X11 bit-identity would be
+    /// lost and `alt + x`/`mod1 + x` would silently stop being
+    /// interchangeable. `bsp-compositor::hotkeys::resolve_modifiers`
+    /// resolves `Mod1`..`Mod5` directly from the live keymap (the same
+    /// real bits Smithay's own `ModifiersState` already resolves `alt`/
+    /// `super`/`mode_switch`-adjacent fields from), so canonicalizing
+    /// here — rather than trying to keep `Alt`/`Super`/`ModeSwitch`
+    /// resolved too — is what lets a chord written either way match.
+    #[must_use]
+    pub fn canonical(self) -> Modifier {
+        match self {
+            Modifier::Alt => Modifier::Mod1,
+            Modifier::Super => Modifier::Mod4,
+            Modifier::ModeSwitch => Modifier::Mod5,
+            other => other,
+        }
+    }
 }
 
 /// What a chord fires on: a key, or (`docs/bsp-hotkeys.md`'s "Pointer
@@ -241,6 +275,32 @@ mod tests {
     fn modifiers_accumulate() {
         let chords = parse_chain("super + shift + w").unwrap();
         assert_eq!(chords[0].modifiers, vec![Modifier::Super, Modifier::Shift]);
+    }
+
+    #[test]
+    fn canonical_collapses_the_friendly_names_onto_their_real_bit() {
+        assert_eq!(Modifier::Alt.canonical(), Modifier::Mod1);
+        assert_eq!(Modifier::Super.canonical(), Modifier::Mod4);
+        assert_eq!(Modifier::ModeSwitch.canonical(), Modifier::Mod5);
+    }
+
+    #[test]
+    fn canonical_leaves_every_other_modifier_unchanged() {
+        for m in [
+            Modifier::Shift,
+            Modifier::Control,
+            Modifier::Lock,
+            Modifier::Hyper,
+            Modifier::Meta,
+            Modifier::Mod1,
+            Modifier::Mod2,
+            Modifier::Mod3,
+            Modifier::Mod4,
+            Modifier::Mod5,
+            Modifier::Any,
+        ] {
+            assert_eq!(m.canonical(), m);
+        }
     }
 
     #[test]

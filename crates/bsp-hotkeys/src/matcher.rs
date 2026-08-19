@@ -213,12 +213,18 @@ fn chord_matches(chord: &Chord, event: &KeyEvent) -> bool {
 /// just becomes one more required (and practically unmatchable, since
 /// nothing ever "holds" the wildcard) modifier — a real, if obscure,
 /// bspwm quirk, reproduced rather than smoothed over.
+///
+/// Both sides are run through [`Modifier::canonical`] first, so a chord
+/// written `mod1 + x` matches a held set resolved as `alt` (or vice
+/// versa) — see that function's doc comment for why that is necessary
+/// for correctness, not just convenience.
 fn modifiers_match(chord_modifiers: &[Modifier], held: &HashSet<Modifier>) -> bool {
     if chord_modifiers.len() == 1 && chord_modifiers[0] == Modifier::Any {
         return true;
     }
-    let chord_set: HashSet<Modifier> = chord_modifiers.iter().copied().collect();
-    chord_set == *held
+    let chord_set: HashSet<Modifier> = chord_modifiers.iter().map(|m| m.canonical()).collect();
+    let held_set: HashSet<Modifier> = held.iter().map(|m| m.canonical()).collect();
+    chord_set == held_set
 }
 
 #[cfg(test)]
@@ -261,6 +267,34 @@ mod tests {
         let chains = vec![parse_chain("any + w").unwrap()];
         let mut m = Matcher::new(chains);
         let event = press("super + w", &[Modifier::Super, Modifier::Shift]);
+        assert_eq!(m.feed(&event), Outcome::Fire { index: 0 });
+    }
+
+    #[test]
+    fn a_chord_written_mod1_matches_a_held_set_resolved_as_alt() {
+        // `bsp-compositor::hotkeys::resolve_modifiers` resolves the live
+        // keymap into `Mod1`/`Mod4`/`Mod5` directly (not `Alt`/`Super`/
+        // `ModeSwitch`); `Modifier::canonical` is what makes a chord
+        // still written the friendly way match that held set.
+        let chains = vec![parse_chain("mod1 + w").unwrap()];
+        let mut m = Matcher::new(chains);
+        let event = press("mod1 + w", &[Modifier::Alt]);
+        assert_eq!(m.feed(&event), Outcome::Fire { index: 0 });
+    }
+
+    #[test]
+    fn a_chord_written_alt_matches_a_held_set_resolved_as_mod1() {
+        let chains = vec![parse_chain("alt + w").unwrap()];
+        let mut m = Matcher::new(chains);
+        let event = press("alt + w", &[Modifier::Mod1]);
+        assert_eq!(m.feed(&event), Outcome::Fire { index: 0 });
+    }
+
+    #[test]
+    fn a_chord_written_mode_switch_matches_a_held_set_resolved_as_mod5() {
+        let chains = vec![parse_chain("mode_switch + w").unwrap()];
+        let mut m = Matcher::new(chains);
+        let event = press("mode_switch + w", &[Modifier::Mod5]);
         assert_eq!(m.feed(&event), Outcome::Fire { index: 0 });
     }
 

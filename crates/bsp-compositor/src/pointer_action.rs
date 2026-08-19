@@ -18,16 +18,18 @@
 //! registered a grab for it either.
 //!
 //! `pointer_modifier` is stored as this crate's own `bsp_hotkeys::
-//! binding::Modifier` (default `Super`) rather than bspwm's literal
-//! `mod1`..`mod5`/`shift`/`control`/`lock` X11 modifier-bit vocabulary
-//! (`src/parse.c` `parse_modifier_mask()`): those raw X11 bit names
-//! have no reliable Wayland equivalent (there is no dynamic
-//! keysym-to-modifier-bit resolution here, the same reason `bsp-hotkeys`
-//! keeps its own chord modifiers symbolic, `docs/bsp-hotkeys.md`), and
-//! `Modifier::Super` already matches `pointer_modifier`'s real-world
-//! default meaning (X11's `mod4`, conventionally the Super/Windows key)
-//! far more reliably than replicating raw bit numbers would. A
-//! deliberate, documented deviation, not a guess.
+//! binding::Modifier` (default `Super`, canonicalized to `Mod4` before
+//! every comparison — `Modifier::canonical`, `bsp-hotkeys`) rather than
+//! bspwm's literal `mod1`..`mod5`/`shift`/`control`/`lock`-only
+//! vocabulary (`src/parse.c` `parse_modifier_mask()`): every one of
+//! those raw X11 bit names is fully supported too (`cleaned_modifiers`
+//! resolves `Mod1`..`Mod5` from the live keymap, full modifier coverage,
+//! `docs/design.md`'s hotkeys row), this crate's vocabulary is simply a
+//! deliberate superset — it also accepts `hyper`/`meta`/`mode_switch`,
+//! which `parse_modifier_mask()` itself does not, the same wider
+//! grammar `bsp-hotkeys` already parses for sxhkdrc chords
+//! (`docs/bsp-hotkeys.md`). A deliberate, documented deviation, not a
+//! guess.
 //!
 //! Not implemented: `focus_follows_pointer`, `pointer_follows_focus`,
 //! `pointer_follows_monitor` (hover-based automatic focus/warping — a
@@ -314,8 +316,24 @@ fn format_click_to_focus(c: ClickToFocus) -> String {
 /// bspwm: `src/helpers.h` `cleaned_mask(m)`, `m & ~(num_lock |
 /// scroll_lock | caps_lock)` — stripped before *every* comparison
 /// against `pointer_modifier` or a plain (no-modifier) click, so an
-/// incidental Caps Lock never breaks either match.
-fn cleaned_modifiers(mods: &smithay::input::keyboard::ModifiersState) -> HashSet<Modifier> {
+/// incidental Caps Lock never breaks either match. `num_lock` is
+/// likewise excluded here by simply never being queried at all (unlike
+/// `crate::hotkeys::resolve_modifiers`, which needs it for `Mod2`
+/// coverage).
+///
+/// Full modifier coverage (`docs/design.md`'s hotkeys row): resolves
+/// `Mod1`/`Mod3`/`Mod4`/`Mod5` from `ModifiersState`'s own fields for
+/// the same reason `crate::hotkeys::resolve_modifiers` does — see that
+/// function's doc comment, including why `Hyper`/`Meta` are
+/// deliberately *not* queried and inserted here the same way (a real
+/// bug, live-tested and reverted: on essentially every stock keymap
+/// they alias the very same bit `alt`/`mod1` already does, so this
+/// function only ever emits the eight real bits and leaves resolving a
+/// configured `pointer_modifier hyper`/`meta` to
+/// [`canonicalize_modifier`], `on_button_press`'s equivalent of
+/// `crate::hotkeys::canonicalize_virtual_modifiers`).
+fn cleaned_modifiers(state: &mut State) -> HashSet<Modifier> {
+    let mods = state.seat.get_keyboard().unwrap().modifier_state();
     let mut set = HashSet::new();
     if mods.shift {
         set.insert(Modifier::Shift);
@@ -324,12 +342,50 @@ fn cleaned_modifiers(mods: &smithay::input::keyboard::ModifiersState) -> HashSet
         set.insert(Modifier::Control);
     }
     if mods.alt {
-        set.insert(Modifier::Alt);
+        set.insert(Modifier::Mod1);
+    }
+    if mods.iso_level5_shift {
+        set.insert(Modifier::Mod3);
     }
     if mods.logo {
-        set.insert(Modifier::Super);
+        set.insert(Modifier::Mod4);
+    }
+    if mods.iso_level3_shift {
+        set.insert(Modifier::Mod5);
     }
     set
+}
+
+/// Resolves `pointer_modifier`'s configured [`Modifier`] to whatever a
+/// live [`cleaned_modifiers`] held set could actually contain: the
+/// fixed `Alt`/`Super`/`ModeSwitch` aliases through
+/// [`Modifier::canonical`], and `Hyper`/`Meta` through a live keymap
+/// query — `crate::hotkeys::real_bit_for`, shared with
+/// `crate::hotkeys::canonicalize_virtual_modifiers`, whose doc comment
+/// explains why this can't just be a fixed alias like the other three.
+/// Unlike that function, this one re-resolves on every press rather
+/// than once at load time: `pointer_settings.modifier` is a single
+/// value, not a whole chord list to rewrite in place, and re-querying
+/// it costs one more `mod_get_index` lookup on top of the
+/// `with_xkb_state` call `cleaned_modifiers` already makes for every
+/// press regardless — not a new cost category.
+///
+/// `None` if `modifier` is `Hyper`/`Meta` and the live keymap doesn't
+/// define that virtual modifier at all: it then can never be held,
+/// exactly like any other unmatched chord.
+fn canonicalize_modifier(state: &mut State, modifier: Modifier) -> Option<Modifier> {
+    match modifier {
+        Modifier::Hyper | Modifier::Meta => {
+            let name = if modifier == Modifier::Hyper {
+                "Hyper"
+            } else {
+                "Meta"
+            };
+            let keyboard = state.seat.get_keyboard()?;
+            keyboard.with_xkb_state(state, |ctx| crate::hotkeys::real_bit_for(ctx.xkb(), name))
+        }
+        other => Some(other.canonical()),
+    }
 }
 
 /// Handles one pointer button *press*, before the caller's normal
@@ -360,10 +416,10 @@ pub fn on_button_press(state: &mut State, button: u32, serial: Serial, time: u32
     let Some(index) = button_index(button) else {
         return true;
     };
-    let mods = state.seat.get_keyboard().unwrap().modifier_state();
-    let held = cleaned_modifiers(&mods);
+    let held = cleaned_modifiers(state);
+    let configured = canonicalize_modifier(state, state.pointer_settings.modifier);
 
-    if held.len() == 1 && held.contains(&state.pointer_settings.modifier) {
+    if held.len() == 1 && configured.is_some_and(|m| held.contains(&m)) {
         let action = state.pointer_settings.actions[(index - 1) as usize];
         if action != PointerAction::None {
             begin_action(state, action, button, serial, time);
