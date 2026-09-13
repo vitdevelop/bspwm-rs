@@ -23,9 +23,9 @@ use bsp_core::id::DesktopId;
 use bsp_core::node::Client as CoreClient;
 use bsp_core::tree::Direction;
 
-use crate::state::State;
+use crate::state::{Backend, State};
 
-impl XdgShellHandler for State {
+impl<Bd: Backend + 'static> XdgShellHandler for State<Bd> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
@@ -80,6 +80,7 @@ impl XdgShellHandler for State {
         self.pending_toplevels
             .retain(|t| t.wl_surface() != surface.wl_surface());
         unmap_toplevel(self, &surface);
+        self.backend_data.queue_redraw();
     }
 
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
@@ -93,19 +94,16 @@ impl XdgShellHandler for State {
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .app_id
-                .clone()
+                .and_then(|data| data.lock().ok().map(|d| d.app_id.clone()))
+                .flatten()
         })
         .unwrap_or_default();
         self.adapter.set_app_id(id, &app_id);
     }
 }
-smithay::delegate_xdg_shell!(State);
+smithay::delegate_xdg_shell!(@<Bd: Backend + 'static> State<Bd>);
 
-impl State {
+impl<Bd: Backend + 'static> State<Bd> {
     /// The mapped `Window` showing `surface`, if any.
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
@@ -159,7 +157,7 @@ impl State {
 /// equivalent for, so honoring it needs its own placement policy decision
 /// rather than an improvised default position (hard rule 7). Every window
 /// is managed unconditionally until that is decided.
-fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
+fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: ToplevelSurface) {
     let Some(mi) = state.wm.focused_monitor else {
         tracing::warn!("no monitor to map a new window onto");
         return;
@@ -170,16 +168,12 @@ fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
     };
 
     let (app_id, title) = with_states(toplevel.wl_surface(), |states| {
-        let data = states
+        states
             .data_map
             .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap();
-        (
-            data.app_id.clone().unwrap_or_default(),
-            data.title.clone().unwrap_or_default(),
-        )
+            .and_then(|data| data.lock().ok())
+            .map(|d| (d.app_id.clone().unwrap_or_default(), d.title.clone().unwrap_or_default()))
+            .unwrap_or_default()
     });
     // Native Wayland windows match `app_id` as both class and instance,
     // and the surface title as name (`docs/design.md` Compatibility).
@@ -240,13 +234,12 @@ fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
     // `Rect::default()` (0×0), reintroducing the bug fixed by this same
     // seeding step (`CHANGELOG.md`, `shell::map_new_toplevel` "Changed").
     state.wm.monitors[mi].arrange(di, &settings);
+    if let Some(client) = state.wm.monitors[mi].desktops[di]
+        .tree
+        .node_mut(node)
+        .client
+        .as_mut()
     {
-        let client = state.wm.monitors[mi].desktops[di]
-            .tree
-            .node_mut(node)
-            .client
-            .as_mut()
-            .unwrap();
         // bspwm seeds `floating_rectangle` from the window's own requested
         // geometry at map time (`src/window.c`
         // `initialize_floating_rectangle()`, an `xcb_get_geometry` call on
@@ -278,16 +271,19 @@ fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
     // split into two passes here only because of the seeding step above).
     state.wm.monitors[mi].arrange(di, &settings);
 
-    let (rect, tiled, hidden) = {
+    let Some((rect, tiled, hidden)) = ({
         let node_ref = state.wm.monitors[mi].desktops[di].tree.node(node);
-        let client = node_ref.client.as_ref().unwrap();
-        let tiled = client.state.is_tiled();
-        let rect = if tiled {
-            client.tiled_rectangle
-        } else {
-            client.floating_rectangle
-        };
-        (rect, tiled, node_ref.hidden)
+        node_ref.client.as_ref().map(|client| {
+            let tiled = client.state.is_tiled();
+            let rect = if tiled {
+                client.tiled_rectangle
+            } else {
+                client.floating_rectangle
+            };
+            (rect, tiled, node_ref.hidden)
+        })
+    }) else {
+        return;
     };
 
     toplevel.with_pending_state(|s| {
@@ -319,7 +315,7 @@ fn map_new_toplevel(state: &mut State, toplevel: ToplevelSurface) {
 /// registry/adapter mapping, and re-arrange.
 ///
 /// bspwm: `src/tree.c` `remove_node()`, called from `unmanage_window()`.
-fn unmap_toplevel(state: &mut State, surface: &ToplevelSurface) {
+fn unmap_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &ToplevelSurface) {
     let Some(window) = state.window_for_surface(surface.wl_surface()) else {
         return;
     };
@@ -354,8 +350,8 @@ fn unmap_toplevel(state: &mut State, surface: &ToplevelSurface) {
 /// bspwm has no equivalent step — a real X11 `ConfigureWindow` takes
 /// effect immediately, it does not need an acknowledged round trip the
 /// way `xdg_surface.configure`/`ack_configure` does.
-pub fn on_commit(state: &mut State, surface: &WlSurface) {
-    smithay::backend::renderer::utils::on_commit_buffer_handler::<State>(surface);
+pub fn on_commit<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &WlSurface) {
+    smithay::backend::renderer::utils::on_commit_buffer_handler::<State<Bd>>(surface);
     state.popups.commit(surface);
 
     if let Some(pos) = state
@@ -379,10 +375,9 @@ pub fn on_commit(state: &mut State, surface: &WlSurface) {
         states
             .data_map
             .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .initial_configure_sent
+            .and_then(|data| data.lock().ok().map(|d| d.initial_configure_sent))
+            // Unreadable: assume sent, so no configure is pushed twice.
+            .unwrap_or(true)
     });
     if !initial_configure_sent {
         toplevel.send_configure();
@@ -400,7 +395,7 @@ pub fn on_commit(state: &mut State, surface: &WlSurface) {
 /// the two are necessarily separate because Wayland's `configure`/
 /// `ack_configure` round trip means only the client can actually resize
 /// its own surface.
-pub fn sync_wayland_from_core(state: &mut State) {
+pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
     // Collected first, rather than acted on while borrowing `state.wm`,
     // since applying each one needs `&mut state.space`/`&mut state.adapter`.
     let mut updates = Vec::new();
@@ -431,7 +426,11 @@ pub fn sync_wayland_from_core(state: &mut State) {
     }
 }
 
-fn sync_one_window(state: &mut State, window: &Window, client: &bsp_core::node::Client) {
+fn sync_one_window<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    window: &Window,
+    client: &bsp_core::node::Client,
+) {
     let rect = match client.state {
         bsp_core::node::ClientState::Floating => client.floating_rectangle,
         _ => client.tiled_rectangle,

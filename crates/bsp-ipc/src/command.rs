@@ -105,6 +105,31 @@ pub enum Command {
     Quit(Option<i32>),
     /// `config [-m SEL|-d SEL|-n SEL] <setting> [<value>]`.
     Config(ConfigCommand),
+    /// `output [<name> [COMMANDS]]` — bspwm-rs's own extension (not
+    /// bspwm), replacing `xrandr` (`docs/design.md`'s "Configuration
+    /// beyond bspwm"). Real hardware: a no-op `Adapter`
+    /// default answers this grammar today; `docs/bsp-compositor.md`
+    /// tracks when the DRM backend implements it for real.
+    Output {
+        /// The output name (a DRM connector name on real hardware), or
+        /// `None` to list every known output.
+        name: Option<String>,
+        /// Actions applied in order; empty with `name: Some(_)` means
+        /// "report that output's current settings".
+        actions: Vec<OutputAction>,
+    },
+    /// `input [<device> [COMMANDS]]` — bspwm-rs's own extension (not
+    /// bspwm), replacing `setxkbmap`/`xset r rate`/`xinput`
+    /// (`docs/design.md`'s "Configuration beyond bspwm"). Same step-5
+    /// status as `Output` above.
+    Input {
+        /// `"keyboard"` or a specific pointer/device name, or `None` to
+        /// list every known input device.
+        device: Option<String>,
+        /// Actions applied in order; empty with `device: Some(_)` means
+        /// "report that device's current settings".
+        actions: Vec<InputAction>,
+    },
 }
 
 // ---- node ----------------------------------------------------------------
@@ -788,6 +813,174 @@ pub fn parse_monitor(args: &[String]) -> Result<Command, ParseError> {
     }
 
     Ok(Command::Monitor { selector, actions })
+}
+
+// ---- output --------------------------------------------------------------
+
+/// One `bspc output` command. Not a bspwm command — see `Command::Output`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputAction {
+    /// `-m`, `--mode WIDTHxHEIGHT@HZ` (a whole or decimal refresh rate,
+    /// e.g. `1920x1080@60` or `1920x1080@59.94`).
+    SetMode(OutputMode),
+    /// `-s`, `--scale FACTOR`.
+    SetScale(f64),
+    /// `-p`, `--position X Y`.
+    SetPosition(i32, i32),
+}
+
+/// A display mode: pixel size and refresh rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputMode {
+    /// Width in pixels.
+    pub width: i32,
+    /// Height in pixels.
+    pub height: i32,
+    /// Refresh rate in millihertz — matches `wl_output.mode`'s own unit,
+    /// since a real DRM output's mode ultimately becomes one of those.
+    pub refresh_mhz: i32,
+}
+
+fn parse_output_mode(s: &str) -> Option<OutputMode> {
+    let (wh, hz) = s.split_once('@')?;
+    let (w, h) = wh.split_once('x')?;
+    let width: i32 = w.parse().ok()?;
+    let height: i32 = h.parse().ok()?;
+    let hz: f64 = hz.parse().ok()?;
+    if width <= 0 || height <= 0 || hz <= 0.0 {
+        return None;
+    }
+    Some(OutputMode {
+        width,
+        height,
+        refresh_mhz: (hz * 1000.0).round() as i32,
+    })
+}
+
+/// Parses `output [<name> [COMMANDS]]`: `<name>` alone with no further
+/// arguments reports that output's current settings; no arguments at
+/// all lists every known output. Flag letters (`-m`/`-s`/`-p`) are this
+/// project's own choice, matching the rest of this crate's dash-flag
+/// style — `docs/design.md`'s own `bspc output` example is illustrative
+/// prose, not a literal CLI spec.
+pub fn parse_output(args: &[String]) -> Result<Command, ParseError> {
+    let mut i = 0;
+    let name = if !args.is_empty() && !args[0].starts_with('-') {
+        i = 1;
+        Some(args[0].clone())
+    } else {
+        None
+    };
+
+    let mut actions = Vec::new();
+    while i < args.len() {
+        let flag = args[i].as_str();
+        i += 1;
+        let action = match flag {
+            "-m" | "--mode" => {
+                let raw = take_str(args, &mut i, "output", flag)?;
+                let mode = parse_output_mode(&raw)
+                    .ok_or_else(|| ParseError::invalid_argument("output", flag, &raw))?;
+                OutputAction::SetMode(mode)
+            }
+            "-s" | "--scale" => {
+                let raw = take_str(args, &mut i, "output", flag)?;
+                let scale: f64 = raw
+                    .parse()
+                    .ok()
+                    .filter(|s| *s > 0.0)
+                    .ok_or_else(|| ParseError::invalid_argument("output", flag, &raw))?;
+                OutputAction::SetScale(scale)
+            }
+            "-p" | "--position" => {
+                if i + 1 >= args.len() {
+                    return Err(ParseError::not_enough_arguments("output", flag));
+                }
+                let x: i32 = args[i]
+                    .parse()
+                    .map_err(|_| ParseError::invalid_argument("output", flag, &args[i]))?;
+                let y: i32 = args[i + 1]
+                    .parse()
+                    .map_err(|_| ParseError::invalid_argument("output", flag, &args[i + 1]))?;
+                i += 2;
+                OutputAction::SetPosition(x, y)
+            }
+            other => return Err(ParseError::unknown_command("output", other)),
+        };
+        actions.push(action);
+    }
+
+    if name.is_none() && !actions.is_empty() {
+        // No output named: `-m`/`-s`/`-p` would apply to nothing.
+        return Err(ParseError::missing_arguments("output"));
+    }
+
+    Ok(Command::Output { name, actions })
+}
+
+// ---- input ---------------------------------------------------------------
+
+/// One `bspc input` command. Not a bspwm command — see `Command::Input`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputAction {
+    /// `-r`, `--rate HZ DELAY_MS` (`xset r rate` replacement).
+    SetRepeat {
+        /// Repeats per second.
+        rate: i32,
+        /// Milliseconds before the first repeat.
+        delay: i32,
+    },
+    /// `-a`, `--accel FACTOR` (`xinput` pointer-acceleration replacement).
+    SetAccel(f64),
+}
+
+/// Parses `input [<device> [COMMANDS]]`: `<device>` (`"keyboard"` or a
+/// specific device name) alone reports its current settings; no
+/// arguments at all lists every known input device.
+pub fn parse_input(args: &[String]) -> Result<Command, ParseError> {
+    let mut i = 0;
+    let device = if !args.is_empty() && !args[0].starts_with('-') {
+        i = 1;
+        Some(args[0].clone())
+    } else {
+        None
+    };
+
+    let mut actions = Vec::new();
+    while i < args.len() {
+        let flag = args[i].as_str();
+        i += 1;
+        let action = match flag {
+            "-r" | "--rate" => {
+                if i + 1 >= args.len() {
+                    return Err(ParseError::not_enough_arguments("input", flag));
+                }
+                let rate: i32 = args[i]
+                    .parse()
+                    .map_err(|_| ParseError::invalid_argument("input", flag, &args[i]))?;
+                let delay: i32 = args[i + 1]
+                    .parse()
+                    .map_err(|_| ParseError::invalid_argument("input", flag, &args[i + 1]))?;
+                i += 2;
+                InputAction::SetRepeat { rate, delay }
+            }
+            "-a" | "--accel" => {
+                let raw = take_str(args, &mut i, "input", flag)?;
+                let factor: f64 = raw
+                    .parse()
+                    .map_err(|_| ParseError::invalid_argument("input", flag, &raw))?;
+                InputAction::SetAccel(factor)
+            }
+            other => return Err(ParseError::unknown_command("input", other)),
+        };
+        actions.push(action);
+    }
+
+    if device.is_none() && !actions.is_empty() {
+        return Err(ParseError::missing_arguments("input"));
+    }
+
+    Ok(Command::Input { device, actions })
 }
 
 fn take_rest(
@@ -1475,6 +1668,8 @@ pub fn parse(args: &[String]) -> Result<Command, ParseError> {
         "subscribe" => parse_subscribe(rest),
         "quit" => parse_quit(rest),
         "config" => parse_config(rest),
+        "output" => parse_output(rest),
+        "input" => parse_input(rest),
         other => Err(ParseError::unknown_domain(other)),
     }
 }
@@ -1606,6 +1801,119 @@ mod tests {
             }
             other => panic!("expected Monitor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn output_bare_lists_with_no_name_and_no_actions() {
+        let cmd = parse(&args("output")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Output {
+                name: None,
+                actions: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn output_name_alone_reports_that_outputs_settings() {
+        let cmd = parse(&args("output eDP-1")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Output {
+                name: Some("eDP-1".to_string()),
+                actions: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn output_mode_scale_position_chain() {
+        let cmd = parse(&args("output eDP-1 -m 1920x1080@60 -s 1.25 -p 0 0")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Output {
+                name: Some("eDP-1".to_string()),
+                actions: vec![
+                    OutputAction::SetMode(OutputMode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_mhz: 60_000,
+                    }),
+                    OutputAction::SetScale(1.25),
+                    OutputAction::SetPosition(0, 0),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn output_mode_accepts_a_decimal_refresh_rate() {
+        let cmd = parse(&args("output eDP-1 -m 1920x1080@59.94")).unwrap();
+        match cmd {
+            Command::Output { actions, .. } => {
+                assert_eq!(
+                    actions,
+                    vec![OutputAction::SetMode(OutputMode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_mhz: 59_940,
+                    })]
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_flags_with_no_name_is_an_error() {
+        assert!(parse(&args("output -s 1.25")).is_err());
+    }
+
+    #[test]
+    fn output_invalid_mode_is_rejected() {
+        assert!(parse(&args("output eDP-1 -m garbage")).is_err());
+    }
+
+    #[test]
+    fn input_bare_lists_with_no_device_and_no_actions() {
+        let cmd = parse(&args("input")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Input {
+                device: None,
+                actions: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn input_rate_and_accel_chain() {
+        let cmd = parse(&args("input keyboard -r 25 200")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Input {
+                device: Some("keyboard".to_string()),
+                actions: vec![InputAction::SetRepeat {
+                    rate: 25,
+                    delay: 200
+                }],
+            }
+        );
+
+        let cmd = parse(&args("input mouse -a 1.5")).unwrap();
+        assert_eq!(
+            cmd,
+            Command::Input {
+                device: Some("mouse".to_string()),
+                actions: vec![InputAction::SetAccel(1.5)],
+            }
+        );
+    }
+
+    #[test]
+    fn input_flags_with_no_device_is_an_error() {
+        assert!(parse(&args("input -a 1.5")).is_err());
     }
 
     #[test]

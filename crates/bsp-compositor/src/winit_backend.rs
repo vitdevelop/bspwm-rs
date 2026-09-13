@@ -26,7 +26,7 @@ use bsp_core::monitor::Monitor as CoreMonitor;
 use bsp_core::settings::Settings;
 use bsp_core::wm::Wm;
 
-use crate::state::{insert_client, State};
+use crate::state::{insert_client, Backend, State};
 
 /// This build's output name (bspwm: a monitor's name is normally its DRM
 /// connector name; the nested backend has no connector, so it uses a
@@ -38,6 +38,19 @@ pub const OUTPUT_NAME: &str = "winit";
 pub struct WinitData {
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
+}
+
+impl Backend for WinitData {
+    fn seat_name(&self) -> String {
+        OUTPUT_NAME.to_string()
+    }
+
+    // The nested backend has no real hardware buffers/LEDs/early-import
+    // path to speak of — every hook here is a deliberate no-op, matching
+    // its behavior before `Backend` existed at all.
+    fn reset_buffers(&mut self, _output: &Output) {}
+    fn early_import(&mut self, _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface) {}
+    fn update_led_state(&mut self, _led_state: smithay::input::keyboard::LedState) {}
 }
 
 /// Builds the initial `bsp-core::wm::Wm`: one monitor sized to the winit
@@ -65,9 +78,20 @@ fn initial_wm(size: (i32, i32)) -> Wm {
 
 /// Runs the nested compositor until the winit window is closed.
 pub fn run() {
-    let mut event_loop: EventLoop<State> =
-        EventLoop::try_new().expect("failed to create the event loop");
-    let display: Display<State> = Display::new().expect("failed to create the Wayland display");
+    let mut event_loop: EventLoop<State<WinitData>> = match EventLoop::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(err) => {
+            tracing::error!("failed to create the event loop: {err}");
+            return;
+        }
+    };
+    let display: Display<State<WinitData>> = match Display::new() {
+        Ok(display) => display,
+        Err(err) => {
+            tracing::error!("failed to create the Wayland display: {err}");
+            return;
+        }
+    };
     let mut display_handle = display.handle();
 
     let (backend, mut winit) = match winit::init::<GlesRenderer>() {
@@ -99,7 +123,7 @@ pub fn run() {
             model: "nested".into(),
         },
     );
-    output.create_global::<State>(&display_handle);
+    output.create_global::<State<WinitData>>(&display_handle);
     output.change_current_state(
         Some(mode),
         Some(Transform::Normal),
@@ -115,20 +139,28 @@ pub fn run() {
         backend,
     };
 
-    let socket_source = smithay::wayland::socket::ListeningSocketSource::new_auto()
-        .expect("failed to create the Wayland listening socket");
+    let socket_source = match smithay::wayland::socket::ListeningSocketSource::new_auto() {
+        Ok(source) => source,
+        Err(err) => {
+            tracing::error!("failed to create the Wayland listening socket: {err}");
+            return;
+        }
+    };
     let socket_name = socket_source.socket_name().to_string_lossy().into_owned();
-    event_loop
+    if let Err(err) = event_loop
         .handle()
-        .insert_source(socket_source, |stream, _, state: &mut State| {
+        .insert_source(socket_source, |stream, _, state: &mut State<WinitData>| {
             insert_client(&state.display_handle, stream);
         })
-        .expect("failed to register the Wayland socket with the event loop");
+    {
+        tracing::error!("failed to register the Wayland socket with the event loop: {err}");
+        return;
+    }
     // SAFETY: `display` is moved into the `Generic` source below and is
     // not touched again outside `dispatch_clients`, which Smithay
     // requires for this call; this mirrors Smithay's own anvil example
     // (`anvil/src/state.rs` `AnvilState::init`) exactly.
-    event_loop
+    if let Err(err) = event_loop
         .handle()
         .insert_source(
             smithay::reexports::calloop::generic::Generic::new(
@@ -136,7 +168,7 @@ pub fn run() {
                 smithay::reexports::calloop::Interest::READ,
                 smithay::reexports::calloop::Mode::Level,
             ),
-            |_, display, state: &mut State| {
+            |_, display, state: &mut State<WinitData>| {
                 // SAFETY: see the comment on the `insert_source` call above.
                 unsafe {
                     display.get_mut().dispatch_clients(state)?;
@@ -144,7 +176,10 @@ pub fn run() {
                 Ok(smithay::reexports::calloop::PostAction::Continue)
             },
         )
-        .expect("failed to register the Wayland display with the event loop");
+    {
+        tracing::error!("failed to register the Wayland display with the event loop: {err}");
+        return;
+    }
 
     tracing::info!(socket = socket_name, "listening on Wayland socket");
     // SAFETY: `WAYLAND_DISPLAY` is process environment, set once here
@@ -183,6 +218,8 @@ pub fn run() {
     // loop begins, since `bspwmrc` typically issues `bspc` commands
     // against it as it runs.
     crate::bspwmrc::run();
+
+    crate::state::init_quit_signals(&mut state);
 
     // bspwm's sxhkd: `SIGUSR1` reloads sxhkdrc (`src/sxhkd.c` `hold()`/
     // `reload_cmd()`, `docs/bsp-hotkeys.md`'s "Binding execution").
@@ -242,7 +279,8 @@ pub fn run() {
             .map_err(
                 |err: smithay::backend::renderer::damage::Error<_>| match err {
                     smithay::backend::renderer::damage::Error::Rendering(err) => err.into(),
-                    _ => unreachable!(),
+                    // `OutputNoMode`: the output has no mode yet — retry next frame.
+                    other => smithay::backend::SwapBuffersError::TemporaryFailure(Box::new(other)),
                 },
             )
         });

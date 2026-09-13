@@ -58,7 +58,7 @@ use bsp_core::tree::{PointerAction, ResizeHandle};
 use bsp_hotkeys::binding::Modifier;
 use bsp_ipc::report::{Event, PointerPhase};
 
-use crate::state::State;
+use crate::state::{Backend, State};
 
 /// `click_to_focus`'s three shapes.
 ///
@@ -76,7 +76,7 @@ pub enum ClickToFocus {
 
 /// `bspc config pointer_modifier`/`pointer_action1..3`/`click_to_focus`/
 /// `pointer_motion_interval`/`swallow_first_click` — compositor-local,
-/// like `State::hotkeys_inline_bspc`: `bsp-core::Settings`' own module
+/// like `State<Bd>::hotkeys_inline_bspc`: `bsp-core::Settings`' own module
 /// doc comment reserves settings like these for `bsp-compositor`.
 ///
 /// bspwm: `src/settings.c`/`src/settings.h`'s matching globals.
@@ -133,7 +133,7 @@ fn button_index(code: u32) -> Option<u8> {
 /// `bspc config pointer_modifier`/`pointer_action1..3`/`click_to_focus`/
 /// `pointer_motion_interval`/`swallow_first_click` — a family of
 /// compositor-only settings `bsp_ipc::exec` has never heard of
-/// (`State::pointer_settings`'s doc comment), intercepted here before a
+/// (`State<Bd>::pointer_settings`'s doc comment), intercepted here before a
 /// `Command::Config` naming one of them would otherwise reach
 /// `bsp_ipc::exec::execute` and fall into its generic "Unknown setting"
 /// reply. Mirrors `ipc::try_hotkeys_inline_bspc`'s own interception
@@ -142,8 +142,8 @@ fn button_index(code: u32) -> Option<u8> {
 ///
 /// `Some` when `command` named one of these settings (handled, get or
 /// set); `None` for anything else.
-pub fn try_config(
-    state: &mut State,
+pub fn try_config<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     command: &bsp_ipc::command::Command,
 ) -> Option<bsp_ipc::wire::Reply> {
     use bsp_ipc::wire::Reply;
@@ -332,8 +332,10 @@ fn format_click_to_focus(c: ClickToFocus) -> String {
 /// configured `pointer_modifier hyper`/`meta` to
 /// [`canonicalize_modifier`], `on_button_press`'s equivalent of
 /// `crate::hotkeys::canonicalize_virtual_modifiers`).
-fn cleaned_modifiers(state: &mut State) -> HashSet<Modifier> {
-    let mods = state.seat.get_keyboard().unwrap().modifier_state();
+fn cleaned_modifiers<Bd: Backend + 'static>(state: &mut State<Bd>) -> HashSet<Modifier> {
+    let Some(mods) = state.seat.get_keyboard().map(|k| k.modifier_state()) else {
+        return HashSet::new();
+    };
     let mut set = HashSet::new();
     if mods.shift {
         set.insert(Modifier::Shift);
@@ -373,7 +375,10 @@ fn cleaned_modifiers(state: &mut State) -> HashSet<Modifier> {
 /// `None` if `modifier` is `Hyper`/`Meta` and the live keymap doesn't
 /// define that virtual modifier at all: it then can never be held,
 /// exactly like any other unmatched chord.
-fn canonicalize_modifier(state: &mut State, modifier: Modifier) -> Option<Modifier> {
+fn canonicalize_modifier<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    modifier: Modifier,
+) -> Option<Modifier> {
     match modifier {
         Modifier::Hyper | Modifier::Meta => {
             let name = if modifier == Modifier::Hyper {
@@ -409,7 +414,12 @@ fn canonicalize_modifier(state: &mut State, modifier: Modifier) -> Option<Modifi
 /// registration means a second button press during an active grab
 /// never reaches `button_press()` in the first place, `src/pointer.c`
 /// `grab_pointer()`'s `XCB_EVENT_MASK_BUTTON_RELEASE|MOTION`-only mask).
-pub fn on_button_press(state: &mut State, button: u32, serial: Serial, time: u32) -> bool {
+pub fn on_button_press<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    button: u32,
+    serial: Serial,
+    time: u32,
+) -> bool {
     if state.pointer.is_grabbed() {
         return true;
     }
@@ -451,7 +461,7 @@ pub fn on_button_press(state: &mut State, button: u32, serial: Serial, time: u32
 /// `swallow_first_click` (bspwm: `grab_pointer(ACTION_FOCUS)`'s own
 /// return value serves exactly this role for `button_press()`'s
 /// `replay = !grab_pointer(ACTION_FOCUS) || !swallow_first_click`).
-fn click_to_focus(state: &mut State, serial: Serial) -> bool {
+fn click_to_focus<Bd: Backend + 'static>(state: &mut State<Bd>, serial: Serial) -> bool {
     let location = state.pointer.current_location();
     let Some((mi, di, node)) = crate::input::window_under(state, location)
         .and_then(|id| crate::input::locate_window(state, id))
@@ -473,7 +483,13 @@ fn click_to_focus(state: &mut State, serial: Serial) -> bool {
 /// instead of the default pointer behavior, until release.
 ///
 /// bspwm: `src/pointer.c` `grab_pointer()`.
-fn begin_action(state: &mut State, action: PointerAction, button: u32, serial: Serial, time: u32) {
+fn begin_action<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    action: PointerAction,
+    button: u32,
+    serial: Serial,
+    time: u32,
+) {
     let location = state.pointer.current_location();
     let Some((mi, di, node)) = crate::input::window_under(state, location)
         .and_then(|id| crate::input::locate_window(state, id))
@@ -490,13 +506,11 @@ fn begin_action(state: &mut State, action: PointerAction, button: u32, serial: S
         return;
     }
 
-    let client_state = state.wm.monitors[mi].desktops[di]
-        .tree
-        .node(node)
-        .client
-        .as_ref()
-        .unwrap()
-        .state;
+    let Some(client) = state.wm.monitors[mi].desktops[di].tree.node(node).client.as_ref() else {
+        return;
+    };
+    let client_state = client.state;
+    let window_id = client.window;
     // bspwm: `grab_pointer()`'s own `STATE_FULLSCREEN` check — swallows
     // the press (handled above, by never touching `replay`) without
     // starting a drag.
@@ -504,13 +518,6 @@ fn begin_action(state: &mut State, action: PointerAction, button: u32, serial: S
         return;
     }
 
-    let window_id = state.wm.monitors[mi].desktops[di]
-        .tree
-        .node(node)
-        .client
-        .as_ref()
-        .unwrap()
-        .window;
     let handle = state.wm.monitors[mi].desktops[di].tree.get_handle(
         node,
         (location.x as i32, location.y as i32),
@@ -542,7 +549,7 @@ fn begin_action(state: &mut State, action: PointerAction, button: u32, serial: S
 /// carries (`bsp_ipc::report`) — `bsp-ipc::registry::NodeRegistry`
 /// keyed by `bsp-core`'s own ids, same lookup `bsp_ipc::exec`'s
 /// internal helpers do.
-fn wire_ids(state: &State, mi: usize, di: usize, node: NodeId) -> (u32, u32, u32) {
+fn wire_ids<Bd: Backend + 'static>(state: &State<Bd>, mi: usize, di: usize, node: NodeId) -> (u32, u32, u32) {
     let desktop_id = state.wm.monitors[mi].desktops[di].id;
     (
         state.wm.monitors[mi].id.0,
@@ -555,8 +562,8 @@ fn wire_ids(state: &State, mi: usize, di: usize, node: NodeId) -> (u32, u32, u32
 /// SBSC_MASK_POINTER_ACTION, "pointer_action ... %s %s\n", ...)` calls
 /// — only for `Move`/`ResizeSide`/`ResizeCorner` (no `Focus` branch
 /// exists there either).
-fn broadcast_pointer_action(
-    state: &mut State,
+fn broadcast_pointer_action<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     mi: usize,
     di: usize,
     node: NodeId,
@@ -584,8 +591,8 @@ fn broadcast_pointer_action(
 /// (`begin_action`) that every subsequent motion/button event is
 /// routed through instead of the default pointer behavior, until the
 /// button that started it (and every other button) is released.
-struct DragGrab {
-    start_data: GrabStartData<State>,
+struct DragGrab<Bd: Backend + 'static> {
+    start_data: GrabStartData<State<Bd>>,
     monitor: usize,
     desktop: usize,
     node: NodeId,
@@ -600,8 +607,8 @@ struct DragGrab {
     last_time: u32,
 }
 
-impl DragGrab {
-    fn do_move(&mut self, data: &mut State, location: Point<f64, Logical>, dx: i32, dy: i32) {
+impl<Bd: Backend + 'static> DragGrab<Bd> {
+    fn do_move(&mut self, data: &mut State<Bd>, location: Point<f64, Logical>, dx: i32, dy: i32) {
         let Some(client) = data.wm.monitors[self.monitor].desktops[self.desktop]
             .tree
             .node(self.node)
@@ -629,7 +636,7 @@ impl DragGrab {
     /// also carries the X11 side effect of moving the real windows;
     /// this port doesn't), so re-arranging and re-syncing afterward is
     /// this caller's job, unlike bspwm's own `move_client`.
-    fn do_tiled_move(&mut self, data: &mut State, location: Point<f64, Logical>) {
+    fn do_tiled_move(&mut self, data: &mut State<Bd>, location: Point<f64, Logical>) {
         let Some(target_window_id) = crate::input::window_under(data, location) else {
             return;
         };
@@ -662,7 +669,7 @@ impl DragGrab {
         }
     }
 
-    fn do_resize(&mut self, data: &mut State, dx: i32, dy: i32) {
+    fn do_resize(&mut self, data: &mut State<Bd>, dx: i32, dy: i32) {
         let resized = data.wm.monitors[self.monitor].desktops[self.desktop]
             .tree
             .resize_node(self.node, self.handle, dx, dy, true);
@@ -674,13 +681,13 @@ impl DragGrab {
     }
 }
 
-impl PointerGrab<State> for DragGrab {
+impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
     fn motion(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         _focus: Option<(
-            <State as smithay::input::SeatHandler>::PointerFocus,
+            <State<Bd> as smithay::input::SeatHandler>::PointerFocus,
             Point<f64, Logical>,
         )>,
         event: &MotionEvent,
@@ -712,10 +719,10 @@ impl PointerGrab<State> for DragGrab {
 
     fn relative_motion(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         _focus: Option<(
-            <State as smithay::input::SeatHandler>::PointerFocus,
+            <State<Bd> as smithay::input::SeatHandler>::PointerFocus,
             Point<f64, Logical>,
         )>,
         event: &RelativeMotionEvent,
@@ -725,8 +732,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn button(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &ButtonEvent,
     ) {
         // bspwm's own X11 grab only listens for `BUTTON_RELEASE`/
@@ -775,21 +782,21 @@ impl PointerGrab<State> for DragGrab {
 
     fn axis(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         details: AxisFrame,
     ) {
         handle.axis(data, details);
     }
 
-    fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
+    fn frame(&mut self, data: &mut State<Bd>, handle: &mut PointerInnerHandle<'_, State<Bd>>) {
         handle.frame(data);
     }
 
     fn gesture_swipe_begin(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeBeginEvent,
     ) {
         handle.gesture_swipe_begin(data, event);
@@ -797,8 +804,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_swipe_update(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeUpdateEvent,
     ) {
         handle.gesture_swipe_update(data, event);
@@ -806,8 +813,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_swipe_end(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeEndEvent,
     ) {
         handle.gesture_swipe_end(data, event);
@@ -815,8 +822,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_pinch_begin(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchBeginEvent,
     ) {
         handle.gesture_pinch_begin(data, event);
@@ -824,8 +831,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_pinch_update(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchUpdateEvent,
     ) {
         handle.gesture_pinch_update(data, event);
@@ -833,8 +840,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_pinch_end(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchEndEvent,
     ) {
         handle.gesture_pinch_end(data, event);
@@ -842,8 +849,8 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_hold_begin(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureHoldBeginEvent,
     ) {
         handle.gesture_hold_begin(data, event);
@@ -851,16 +858,16 @@ impl PointerGrab<State> for DragGrab {
 
     fn gesture_hold_end(
         &mut self,
-        data: &mut State,
-        handle: &mut PointerInnerHandle<'_, State>,
+        data: &mut State<Bd>,
+        handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureHoldEndEvent,
     ) {
         handle.gesture_hold_end(data, event);
     }
 
-    fn start_data(&self) -> &GrabStartData<State> {
+    fn start_data(&self) -> &GrabStartData<State<Bd>> {
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut State) {}
+    fn unset(&mut self, _data: &mut State<Bd>) {}
 }

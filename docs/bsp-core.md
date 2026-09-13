@@ -25,7 +25,8 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 
 - **`NodeId` is per-`Tree`, not global.** bspwm's `node_t*` keeps its identity when a node moves to a different desktop's tree (`transfer_node`, `swap_nodes`). Here, a `NodeId` is only meaningful within the arena that issued it (`docs/design.md`: "`bsp-core` uses its own `WindowId(u32)`"), so moving a node to a different `Tree` — `Tree::transplant_to` — clones its subtree into the destination arena under a fresh id and frees the original. `WindowId`, which is what the adapter and `bspc` actually key on, is unaffected.
 - **`swap_nodes` is single-tree only.** bspwm's cross-desktop `swap_nodes` relies on the pointer-identity behavior above; a cross-tree swap here is two `transplant_to` calls (move `n1` to `n2`'s old anchor and vice versa) rather than a dedicated method, since with per-tree ids there is no shorter path.
-- **Monitor/desktop ordering.** bspwm keeps monitors and desktops sorted by on-screen position (`reorder_monitor`, `rect_cmp`) and desktops in a doubly linked list with position-preserving swaps. `Monitor::desktops` is a plain `Vec` in insertion order; the position-based ordering that matters for hotplug and `bspc monitor -f next` is the hardware backend (real hardware) territory, where there is an actual output layout to sort by.
+- **Desktop ordering.** `Monitor::desktops` is a plain `Vec` in insertion (or explicit `bspc monitor -o` reorder) order — bspwm's own desktop list has no automatic position-based sort either; only monitors do.
+- **Monitor ordering** (the hardware backend, `docs/design.md` roadmap) is implemented: `Rect::compare` (`geometry.rs`) ports bspwm's `src/geometry.c` `rect_cmp()`, and `Wm::add_monitor`/`Wm::reorder_monitor` (`wm.rs`) port `src/monitor.c` `add_monitor()`/`reorder_monitor()` — a monitor lands in on-screen-position order among its neighbors when added, and walks back into position when its rectangle changes (`bsp-ipc`'s `MonitorAction::SetRectangle` calls `reorder_monitor` after applying the new rectangle, matching `update_root()`'s own call site). `add_monitor` reaches the same end state as bspwm's own list-splice insertion through a different mechanism (append, then bubble into place via `reorder_monitor`'s swaps) so it reuses `swap_monitors`' already-correct focus-index bookkeeping instead of duplicating it; the only observable difference is for two monitors sharing the *exact* same rectangle (`Rect::compare` returns `Equal`), where bspwm's insertion reverses arrival order and this does not — not expected to matter for real, distinct monitors. What still needs the hardware backend's real hardware: nothing calls `add_monitor`/`reorder_monitor` on a real hotplug event yet, since there is no udev/DRM output list to hotplug from (`docs/bsp-compositor.md`).
 
 ## Public functions
 
@@ -35,6 +36,7 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Rect::area` | `fn(&self) -> i64` | `src/geometry.c` `area()`. |
 | `Rect::right` | `fn(&self) -> i32` | x + width. |
 | `Rect::bottom` | `fn(&self) -> i32` | y + height. |
+| `Rect::compare` | `fn(&self, other: &Rect) -> std::cmp::Ordering` | `src/geometry.c` `rect_cmp()`. |
 | `Rect::contains_rect` | `fn(&self, other: &Rect) -> bool` | `src/geometry.c` `contains()`. |
 | `Rect::contains_point` | `fn(&self, px: i32, py: i32) -> bool` | `src/geometry.c` `is_inside()`. |
 | `WindowId::fmt` (`Display`) | `fn(&self, f) -> fmt::Result` | bspwm's `0x%08X` id format. |
@@ -113,10 +115,11 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `RuleConsequence::merge` | `fn(&mut self, &RuleConsequence)` | Applies a further matched rule's fields on top, `Some`-over-`None`; mirrors `apply_rules()`'s loop merging every match onto one accumulator. |
 | `RuleConsequence::should_manage`/`should_focus`/`should_border` | `fn(&self) -> bool` | Resolves `manage`/`focus`/`border` with bspwm's `make_rule_consequence()` default of `true` when no rule mentioned the field. |
 | `Wm::new` | `fn(Settings) -> Wm` | No monitors, no rules. |
-| `Wm::add_monitor` | `fn(&mut self, Monitor) -> usize` | `src/monitor.c` `add_monitor()` (minus RandR/EWMH). |
+| `Wm::add_monitor` | `fn(&mut self, Monitor) -> usize` | `src/monitor.c` `add_monitor()` (minus RandR/EWMH); appends then walks it into on-screen-position order via `reorder_monitor`. |
 | `Wm::remove_monitor` | `fn(&mut self, usize) -> Monitor` | `src/monitor.c` `remove_monitor()` (minus EWMH; caller empties `desktops` first). |
 | `Wm::focus_monitor` | `fn(&mut self, usize) -> bool` | `src/monitor.c` `focus_node()`'s monitor-focusing half. |
 | `Wm::swap_monitors` | `fn(&mut self, usize, usize)` | `src/monitor.c` `swap_monitors()`. |
+| `Wm::reorder_monitor` | `fn(&mut self, usize) -> usize` | `src/monitor.c` `reorder_monitor()`; returns the monitor's index after reordering. |
 | `Wm::focused_monitor`/`focused_monitor_mut` | `fn(&self/&mut self) -> Option<&/&mut Monitor>` | The focused monitor, if any. |
 | `Wm::monitor_index` | `fn(&self, MonitorId) -> Option<usize>` | Finds a monitor's slot by id. |
 

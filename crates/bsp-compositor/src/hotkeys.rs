@@ -18,7 +18,7 @@ use bsp_hotkeys::config::LoadedHotkey;
 use bsp_hotkeys::dispatch::Dispatch;
 use bsp_hotkeys::matcher::{KeyEvent, Outcome};
 
-use crate::state::State;
+use crate::state::{Backend, State};
 
 /// Reads and parses sxhkdrc (`$XDG_CONFIG_HOME/sxhkd/sxhkdrc`, or
 /// `$HOME/.config/sxhkd/sxhkdrc`), returning every hotkey it names, in
@@ -61,7 +61,7 @@ pub fn init() -> Vec<LoadedHotkey> {
 /// dangling if a chain happened to be mid-progress at reload time — a
 /// safe improvement, not a deviation worth its own `docs/design.md`
 /// row (internal state, not observable protocol behavior).
-pub fn reload(state: &mut State) {
+pub fn reload<Bd: Backend + 'static>(state: &mut State<Bd>) {
     state.hotkeys = init();
     canonicalize_virtual_modifiers(state);
 }
@@ -94,8 +94,8 @@ pub fn build_matcher(hotkeys: &[LoadedHotkey]) -> bsp_hotkeys::matcher::Matcher 
 /// held Shift would turn the incoming symbol into `A`, which nothing
 /// parsed from the literal chord text `a` would ever equal (found live,
 /// testing this very binding).
-pub fn filter(
-    state: &mut State,
+pub fn filter<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     mods: &ModifiersState,
     keysym: KeysymHandle<'_>,
     pressed: bool,
@@ -213,7 +213,7 @@ fn resolve_modifiers(mods: &ModifiersState) -> HashSet<Modifier> {
 /// bit a chord's own text never named — this function restores that
 /// same one-time-resolution property instead of tracking `hyper`/`meta`
 /// as live, independently-held state.
-pub fn canonicalize_virtual_modifiers(state: &mut State) {
+pub fn canonicalize_virtual_modifiers<Bd: Backend + 'static>(state: &mut State<Bd>) {
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
     };
@@ -265,7 +265,9 @@ pub(crate) fn real_bit_for(
     xkb: &std::sync::Mutex<smithay::input::keyboard::Xkb>,
     name: &str,
 ) -> Option<Modifier> {
-    let guard = xkb.lock().unwrap();
+    let Ok(guard) = xkb.lock() else {
+        return None;
+    };
     // SAFETY: `state()` only requires that its returned reference not
     // outlive the `Xkb` it borrows from; the reference (and the
     // `Keymap`/scratch `State` derived from it) are used only inside
@@ -304,7 +306,7 @@ pub(crate) fn real_bit_for(
     None
 }
 
-fn run(state: &mut State, index: usize) {
+fn run<Bd: Backend + 'static>(state: &mut State<Bd>, index: usize) {
     let Some(hotkey) = state.hotkeys.get(index) else {
         return;
     };
@@ -339,7 +341,7 @@ fn run(state: &mut State, index: usize) {
 /// `bsp_ipc::command::parse` expects only the arguments *after* that,
 /// the same way the real `bspc` binary strips its own `argv[0]` before
 /// putting the rest on the wire (`docs/bsp-ipc.md`).
-fn run_inline(state: &mut State, tokens: &[String]) {
+fn run_inline<Bd: Backend + 'static>(state: &mut State<Bd>, tokens: &[String]) {
     let args = &tokens[1..];
     match bsp_ipc::command::parse(args) {
         Ok(bsp_ipc::command::Command::Quit(_status)) => {

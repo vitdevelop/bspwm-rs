@@ -14,8 +14,14 @@
 #![deny(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+// Every module below `state` builds a generic `State<B: state::Backend>`
+// (`docs/design.md` roadmap, Stage C) and is shared by both
+// backends; only `winit_backend`/`udev_backend` themselves are specific
+// to one.
 mod adapter;
 mod bspwmrc;
+mod cursor;
+mod hardware;
 mod hotkeys;
 mod input;
 mod ipc;
@@ -23,15 +29,24 @@ mod pointer_action;
 mod render;
 mod shell;
 mod state;
+#[cfg(feature = "real")]
+mod udev_backend;
+#[cfg(feature = "nested")]
 mod winit_backend;
 
-// `winit_backend` is the only backend that exists yet; the
-// `nested` feature (on by default, see `Cargo.toml`) exists so a later
-// step's real-hardware backend can be built without it, per
-// `docs/design.md`'s Performance budget ("nested winit backend ... sits
-// behind a cargo feature and is left out of release builds").
-#[cfg(not(feature = "nested"))]
-compile_error!("bsp-compositor currently requires the `nested` feature: no other backend exists yet (docs/design.md roadmap)");
+// `nested` (winit) and `real` (DRM/KMS, `docs/design.md` roadmap, step
+// 5) are kept mutually exclusive for now: both build a full `State<B>`
+// compositor, and nothing yet needs both compiled into the same binary
+// (no runtime backend selection exists) — see `Cargo.toml`'s `real`
+// feature comment for the full reasoning.
+#[cfg(not(any(feature = "nested", feature = "real")))]
+compile_error!(
+    "bsp-compositor requires the `nested` or `real` feature (docs/design.md roadmap)"
+);
+#[cfg(all(feature = "nested", feature = "real"))]
+compile_error!(
+    "bsp-compositor: build with exactly one of `nested`/`real` at a time for now, not both (docs/design.md roadmap)"
+);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -41,5 +56,8 @@ fn main() {
         )
         .init();
 
+    #[cfg(feature = "nested")]
     winit_backend::run();
+    #[cfg(feature = "real")]
+    udev_backend::run();
 }

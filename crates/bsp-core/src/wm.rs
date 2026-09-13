@@ -44,15 +44,67 @@ impl Wm {
         }
     }
 
-    /// Appends a monitor and returns its index. Focuses it if it is the
-    /// first monitor.
+    /// Appends a monitor, then walks it into on-screen-position order
+    /// among its neighbors ([`reorder_monitor`](Self::reorder_monitor)),
+    /// and returns its final index. Focuses it if it is the first
+    /// monitor.
     ///
-    /// bspwm: `src/monitor.c` `add_monitor()`, minus RandR/EWMH bookkeeping.
+    /// bspwm: `src/monitor.c` `add_monitor()`, minus RandR/EWMH
+    /// bookkeeping — and structured differently to reach the same result:
+    /// bspwm walks its linked list to find `m`'s correct position and
+    /// splices it straight in there; this pushes to the end and reuses
+    /// [`swap_monitors`](Self::swap_monitors) (via `reorder_monitor`) to
+    /// bubble it into place, so the already-correct focus-index
+    /// bookkeeping that function does is not duplicated here. The only
+    /// observable difference is for two monitors with the *exact* same
+    /// rectangle (`Rect::compare` returns `Equal`): bspwm's insertion
+    /// loop stops at the first tie and splices the new monitor in
+    /// *before* it (reversing arrival order for ties), while this leaves
+    /// ties in arrival order (a tie never satisfies `reorder_monitor`'s
+    /// strict `Less`/`Greater` swap condition) — real monitors
+    /// essentially never share an identical rectangle, so this is not
+    /// expected to matter in practice.
     pub fn add_monitor(&mut self, m: Monitor) -> usize {
         self.monitors.push(m);
         let index = self.monitors.len() - 1;
         if self.focused_monitor.is_none() {
             self.focused_monitor = Some(index);
+        }
+        self.reorder_monitor(index)
+    }
+
+    /// Moves the monitor at `index` earlier or later among its immediate
+    /// neighbors, one swap at a time, until it is positioned correctly
+    /// relative to them by on-screen position (`Rect::compare`) — a
+    /// local reordering after one monitor's rectangle changes (or it is
+    /// newly added), not a full re-sort of `monitors`. Returns the
+    /// monitor's index afterward (it may have moved); every swap goes
+    /// through [`swap_monitors`](Self::swap_monitors), so `focused_monitor`
+    /// stays correct throughout.
+    ///
+    /// bspwm: `src/monitor.c` `reorder_monitor()`. Bspwm's monitors are a
+    /// doubly linked list, so a monitor consults its own `prev`/`next`
+    /// directly; `self.monitors` is a `Vec`, so `index - 1`/`index + 1`
+    /// plays the same role.
+    pub fn reorder_monitor(&mut self, mut index: usize) -> usize {
+        use std::cmp::Ordering;
+        while index > 0
+            && self.monitors[index]
+                .rectangle
+                .compare(&self.monitors[index - 1].rectangle)
+                == Ordering::Less
+        {
+            self.swap_monitors(index, index - 1);
+            index -= 1;
+        }
+        while index + 1 < self.monitors.len()
+            && self.monitors[index]
+                .rectangle
+                .compare(&self.monitors[index + 1].rectangle)
+                == Ordering::Greater
+        {
+            self.swap_monitors(index, index + 1);
+            index += 1;
         }
         index
     }
@@ -140,6 +192,59 @@ mod tests {
             Rect::new(0, 0, 1920, 1080),
             &settings(),
         )
+    }
+
+    fn monitor_at(id: u32, rect: Rect) -> Monitor {
+        Monitor::new(MonitorId(id), None, rect, &settings())
+    }
+
+    #[test]
+    fn add_monitor_inserts_in_on_screen_position_order() {
+        // Monitor 2 is to the left of monitor 1; add_monitor should walk
+        // it into place ahead of 1 rather than leaving it appended after.
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor_at(1, Rect::new(1920, 0, 1920, 1080)));
+        wm.add_monitor(monitor_at(2, Rect::new(0, 0, 1920, 1080)));
+        assert_eq!(
+            wm.monitors.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![MonitorId(2), MonitorId(1)]
+        );
+    }
+
+    #[test]
+    fn add_monitor_keeps_arrival_order_for_identical_rectangles() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor(1));
+        wm.add_monitor(monitor(2));
+        assert_eq!(
+            wm.monitors.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![MonitorId(1), MonitorId(2)]
+        );
+    }
+
+    #[test]
+    fn add_monitor_follows_focus_when_a_new_monitor_lands_ahead_of_it() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor_at(1, Rect::new(1920, 0, 1920, 1080)));
+        assert_eq!(wm.focused_monitor, Some(0));
+        wm.add_monitor(monitor_at(2, Rect::new(0, 0, 1920, 1080)));
+        // Monitor 1 (still the only focused one) is now at index 1.
+        assert_eq!(wm.focused_monitor, Some(1));
+    }
+
+    #[test]
+    fn reorder_monitor_moves_a_resized_monitor_back_into_position() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor_at(1, Rect::new(0, 0, 1920, 1080)));
+        wm.add_monitor(monitor_at(2, Rect::new(1920, 0, 1920, 1080)));
+        // Monitor 1 moves to the right of monitor 2.
+        wm.monitors[0].rectangle = Rect::new(3840, 0, 1920, 1080);
+        let new_index = wm.reorder_monitor(0);
+        assert_eq!(new_index, 1);
+        assert_eq!(
+            wm.monitors.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![MonitorId(2), MonitorId(1)]
+        );
     }
 
     #[test]

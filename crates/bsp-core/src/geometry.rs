@@ -54,6 +54,29 @@ impl Rect {
         self.y + self.height
     }
 
+    /// Orders two rectangles by on-screen position: whichever is entirely
+    /// above the other first, then whichever is entirely to the left,
+    /// then — for two rectangles that overlap in both axes — the larger
+    /// one first. Used to keep monitors (and, on real hardware, DRM
+    /// outputs) in reading order rather than hotplug/connect order.
+    ///
+    /// bspwm: `src/geometry.c` `rect_cmp()`, translated from its `int`
+    /// return (negative/zero/positive) to [`std::cmp::Ordering`].
+    pub fn compare(&self, other: &Rect) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.y >= other.bottom() {
+            Ordering::Greater
+        } else if other.y >= self.bottom() {
+            Ordering::Less
+        } else if self.x >= other.right() {
+            Ordering::Greater
+        } else if other.x >= self.right() {
+            Ordering::Less
+        } else {
+            other.area().cmp(&self.area())
+        }
+    }
+
     /// Returns `true` if `self` fully contains `other`.
     ///
     /// bspwm: `src/geometry.c` `contains()`.
@@ -112,5 +135,45 @@ mod tests {
         assert!(r.contains_point(9, 9));
         assert!(!r.contains_point(10, 0));
         assert!(!r.contains_point(0, 10));
+    }
+
+    #[test]
+    fn compare_orders_entirely_above_before_entirely_below() {
+        let top = Rect::new(0, 0, 100, 100);
+        let bottom = Rect::new(0, 100, 100, 100);
+        assert_eq!(top.compare(&bottom), std::cmp::Ordering::Less);
+        assert_eq!(bottom.compare(&top), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_orders_left_before_right_when_y_ranges_overlap() {
+        let left = Rect::new(0, 0, 100, 100);
+        let right = Rect::new(100, 0, 100, 100);
+        assert_eq!(left.compare(&right), std::cmp::Ordering::Less);
+        assert_eq!(right.compare(&left), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_orders_partially_overlapping_rows_by_x_not_y() {
+        // Neither is entirely above/below the other (their y-ranges
+        // overlap), so bspwm's rect_cmp falls through to the x
+        // comparison rather than treating them as tied.
+        let a = Rect::new(0, 0, 100, 200);
+        let b = Rect::new(100, 100, 100, 200);
+        assert_eq!(a.compare(&b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn compare_prefers_the_larger_rectangle_when_fully_overlapping() {
+        let small = Rect::new(0, 0, 50, 50);
+        let large = Rect::new(0, 0, 100, 100);
+        assert_eq!(large.compare(&small), std::cmp::Ordering::Less);
+        assert_eq!(small.compare(&large), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_is_equal_for_identical_rectangles() {
+        let r = Rect::new(0, 0, 100, 100);
+        assert_eq!(r.compare(&r), std::cmp::Ordering::Equal);
     }
 }

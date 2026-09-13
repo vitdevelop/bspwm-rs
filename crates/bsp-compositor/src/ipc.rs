@@ -19,13 +19,13 @@ use bsp_ipc::exec::{self, ExecCtx};
 use bsp_ipc::server::{Connection, Listener};
 use bsp_ipc::wire::{self, Reply};
 
-use crate::state::State;
+use crate::state::{Backend, State};
 
 /// Binds the control socket and registers it with the event loop. Logs a
 /// warning and leaves IPC disabled if the socket path cannot be resolved
 /// or bound — `bspc-rs` then cannot reach this compositor, but nothing
 /// else is affected.
-pub fn init(state: &mut State) {
+pub fn init<Bd: Backend + 'static>(state: &mut State<Bd>) {
     let Some(path) = wire::socket_path() else {
         tracing::warn!("no BSPWM_SOCKET/XDG_RUNTIME_DIR: control socket disabled");
         return;
@@ -45,19 +45,19 @@ pub fn init(state: &mut State) {
     // `Listener` itself (and so this `FdWrapper`) is dropped.
     let wrapped = unsafe { FdWrapper::new(listener) };
     let source = Generic::new(wrapped, Interest::READ, Mode::Level);
-    state
-        .handle
-        .insert_source(source, |_, metadata, state| {
-            // SAFETY: the `Listener` inside is not dropped through this
-            // reference — only read via `&Listener` methods.
-            let listener = unsafe { metadata.get_mut() };
-            accept_new_connections(state, listener);
-            Ok(PostAction::Continue)
-        })
-        .expect("failed to register the control socket with the event loop");
+    let registered = state.handle.insert_source(source, |_, metadata, state| {
+        // SAFETY: the `Listener` inside is not dropped through this
+        // reference — only read via `&Listener` methods.
+        let listener = unsafe { metadata.get_mut() };
+        accept_new_connections(state, listener);
+        Ok(PostAction::Continue)
+    });
+    if let Err(err) = registered {
+        tracing::warn!("failed to register the control socket with the event loop: {err}");
+    }
 }
 
-fn accept_new_connections(state: &mut State, listener: &mut FdWrapper<Listener>) {
+fn accept_new_connections<Bd: Backend + 'static>(state: &mut State<Bd>, listener: &mut FdWrapper<Listener>) {
     loop {
         match listener.accept() {
             Ok(Some(connection)) => register_connection(state, connection),
@@ -105,7 +105,7 @@ impl AsFd for ConnSlot {
     }
 }
 
-fn register_connection(state: &mut State, connection: Connection) {
+fn register_connection<Bd: Backend + 'static>(state: &mut State<Bd>, connection: Connection) {
     let source = Generic::new(ConnSlot::new(connection), Interest::READ, Mode::Level);
     let result = state.handle.insert_source(source, |_, metadata, state| {
         // SAFETY: `on_readable` only ever empties `conn` via `Option::take`
@@ -120,7 +120,7 @@ fn register_connection(state: &mut State, connection: Connection) {
     }
 }
 
-fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
+fn on_readable<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot) -> PostAction {
     let Some(connection) = slot.conn.as_mut() else {
         return PostAction::Remove;
     };
@@ -180,7 +180,7 @@ fn on_readable(state: &mut State, slot: &mut ConnSlot) -> PostAction {
 /// `Some` when `command` was this setting (handled, whether get or set);
 /// `None` for anything else, meaning the caller should fall through to
 /// its usual handling.
-pub(crate) fn try_hotkeys_inline_bspc(state: &mut State, command: &Command) -> Option<Reply> {
+pub(crate) fn try_hotkeys_inline_bspc<Bd: Backend + 'static>(state: &mut State<Bd>, command: &Command) -> Option<Reply> {
     let Command::Config(c) = command else {
         return None;
     };
@@ -223,8 +223,8 @@ fn bool_str(b: bool) -> String {
 /// (`crate::bspwmrc::run`, `crate::hotkeys::reload`, the same as
 /// `SIGUSR1` does for the latter) — without disturbing any mapped
 /// client or `bsp-core` state.
-pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Reply {
-    let (reply, events) = {
+pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>, command: &Command) -> Reply {
+    let (mut reply, mut events) = {
         let mut ctx = ExecCtx {
             wm: &mut state.wm,
             registry: &mut state.registry,
@@ -232,12 +232,20 @@ pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Rep
         };
         exec::execute(&mut ctx, command)
     };
+    // `bspc output`/`bspc input` only validate and queue (`crate::hardware`);
+    // the real change happens here, where `Output`s and the backend live.
+    if let Err(msg) = apply_hardware_changes(state, &mut events) {
+        if matches!(reply, Reply::Ok(_)) {
+            reply = Reply::Fail(msg);
+        }
+    }
     crate::shell::sync_wayland_from_core(state);
     for event in &events {
         state.subscribers.broadcast_event(event);
     }
     let report = build_report(state);
     state.subscribers.broadcast_report(&report);
+    state.backend_data.queue_redraw();
 
     if matches!(reply, Reply::Ok(_)) && requests_restart(command) {
         crate::bspwmrc::run();
@@ -247,20 +255,105 @@ pub(crate) fn execute_and_broadcast(state: &mut State, command: &Command) -> Rep
     reply
 }
 
+/// Applies the output/input changes `crate::hardware::HwModel` queued
+/// while `bsp_ipc::exec` ran: mode/scale/position on the Smithay
+/// `Output` (and the backend, for a mode), then the matching `bsp-core`
+/// monitor's rectangle via `exec::set_monitor_rectangle` (the same path
+/// `bspc monitor -g` takes); keyboard repeat on the seat, pointer accel
+/// on the backend's libinput device. Returns the first failure's message
+/// (later changes are still attempted).
+fn apply_hardware_changes<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    events: &mut Vec<bsp_ipc::report::Event>,
+) -> Result<(), String> {
+    use bsp_ipc::command::{InputAction, OutputAction};
+    use smithay::output::Scale;
+
+    let outputs = std::mem::take(&mut state.adapter.hw.pending_outputs);
+    let inputs = std::mem::take(&mut state.adapter.hw.pending_inputs);
+    let mut first_error: Option<String> = None;
+
+    for (name, action) in outputs {
+        let Some(output) = state.space.outputs().find(|o| o.name() == name).cloned() else {
+            continue;
+        };
+        match action {
+            OutputAction::SetMode(mode) => match state.backend_data.set_output_mode(&output, mode) {
+                Ok(wl_mode) => output.change_current_state(Some(wl_mode), None, None, None),
+                Err(msg) => {
+                    first_error.get_or_insert(msg);
+                    continue;
+                }
+            },
+            OutputAction::SetScale(scale) => {
+                output.change_current_state(None, None, Some(Scale::Fractional(scale)), None)
+            }
+            OutputAction::SetPosition(x, y) => {
+                output.change_current_state(None, None, None, Some((x, y).into()));
+                state.space.map_output(&output, (x, y));
+            }
+        }
+        // Mode and scale change the output's logical size; a moved output
+        // also changed its origin: re-map at the (possibly new) position
+        // so the space's cached geometry follows, then mirror it into
+        // `bsp-core`.
+        let position = output.current_location();
+        state.space.map_output(&output, position);
+        let Some(geo) = state.space.output_geometry(&output) else {
+            continue;
+        };
+        if let Some(monitor) = state.wm.monitors.iter().position(|m| m.name == name) {
+            let mut ctx = ExecCtx {
+                wm: &mut state.wm,
+                registry: &mut state.registry,
+                adapter: &mut state.adapter,
+            };
+            exec::set_monitor_rectangle(
+                &mut ctx,
+                monitor,
+                bsp_core::geometry::Rect::new(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h),
+                events,
+            );
+        }
+    }
+
+    for (device, action) in inputs {
+        match action {
+            InputAction::SetRepeat { rate, delay } => {
+                if let Some(keyboard) = state.seat.get_keyboard() {
+                    keyboard.change_repeat_info(rate, delay);
+                }
+            }
+            InputAction::SetAccel(accel) => {
+                if let Err(msg) = state.backend_data.set_pointer_accel(&device, accel) {
+                    first_error.get_or_insert(msg);
+                }
+            }
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
+
 fn requests_restart(command: &Command) -> bool {
     matches!(command, Command::Wm(actions) if actions.contains(&bsp_ipc::command::WmAction::Restart))
 }
 
+/// Sends `reply` but deliberately leaves the connection in `slot`: every
+/// caller returns `PostAction::Remove` next, and calloop must deregister
+/// the fd from epoll *before* it is closed — closing it here (dropping
+/// the taken `Connection`) made that deregistration fail with EBADF, a
+/// warning per `bspc` call. Dropping the source afterward closes it.
 fn reply_and_close(slot: &mut ConnSlot, reply: Reply) {
-    if let Some(mut connection) = slot.conn.take() {
+    if let Some(connection) = slot.conn.as_mut() {
         let _ = connection.send_reply(reply);
     }
 }
 
-fn build_report(state: &State) -> bsp_ipc::report::Report {
+fn build_report<Bd: Backend + 'static>(state: &State<Bd>) -> bsp_ipc::report::Report {
     exec::build_report(&state.wm)
 }
 
-fn build_report_line(state: &State) -> String {
+fn build_report_line<Bd: Backend + 'static>(state: &State<Bd>) -> String {
     build_report(state).to_string()
 }

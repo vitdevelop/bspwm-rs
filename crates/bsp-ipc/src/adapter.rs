@@ -10,6 +10,8 @@
 
 use bsp_core::id::WindowId;
 
+use crate::command::{InputAction, OutputAction};
+
 /// What the executor needs from the window-system adapter.
 pub trait Adapter {
     /// The class and instance name of `window`, for `query -T`'s JSON and
@@ -26,6 +28,58 @@ pub trait Adapter {
     /// Forcibly terminates `window`'s client (bspwm: `kill_node()`,
     /// `xcb_kill_client`; on Wayland this is killing the client process).
     fn kill_window(&mut self, window: WindowId);
+
+    /// Real hardware output configuration (`bspc output`,
+    /// `docs/design.md`'s "Configuration beyond bspwm" — not a bspwm
+    /// command, `xrandr`'s replacement). Every method below defaults to
+    /// "no known outputs"/"not supported", so a backend that hasn't
+    /// implemented real hardware output config yet (the nested winit
+    /// backend today) needs no changes to keep compiling; the eventual
+    /// DRM backend overrides them for real.
+    ///
+    /// Every known output's name, in display order.
+    fn output_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `name`'s current settings, formatted for `Reply::Ok`, or `None`
+    /// if `name` names no known output.
+    fn output_settings(&self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
+
+    /// Applies one `bspc output` action to the named output. `Err`'s
+    /// string becomes the `Reply::Fail` message verbatim (already
+    /// `\n`-terminated, matching this crate's other failure messages).
+    fn set_output(&mut self, name: &str, action: &OutputAction) -> Result<(), String> {
+        let _ = (name, action);
+        Err("output: not supported (no hardware output backend yet).\n".to_string())
+    }
+
+    /// Real input device configuration (`bspc input`,
+    /// `docs/design.md`'s "Configuration beyond bspwm" — not a bspwm
+    /// command, `setxkbmap`/`xset r rate`/`xinput`'s replacement). Same
+    /// "defaults to not supported" reasoning as the output methods above.
+    ///
+    /// Every known input device's name, in no particular order.
+    fn input_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `device`'s current settings, formatted for `Reply::Ok`, or `None`
+    /// if `device` names no known input device.
+    fn input_settings(&self, device: &str) -> Option<String> {
+        let _ = device;
+        None
+    }
+
+    /// Applies one `bspc input` action to the named device. `Err`'s
+    /// string becomes the `Reply::Fail` message verbatim.
+    fn set_input(&mut self, device: &str, action: &InputAction) -> Result<(), String> {
+        let _ = (device, action);
+        Err("input: not supported (no hardware input backend yet).\n".to_string())
+    }
 }
 
 /// A recording, in-memory [`Adapter`] for tests: no real window system,

@@ -4,10 +4,9 @@
 //! key first, then matched against `bsp-hotkeys`' chord matcher
 //! (`crate::hotkeys::filter`) before it would otherwise reach the
 //! focused client. Ctrl+Alt+F1–F12 (TTY switch, `docs/design.md`'s
-//! Reliability section) is not implemented: switching a text console is
-//! a real DRM/libseat session concept the nested winit backend has
-//! nothing to switch *to* — it is deferred to the hardware backend, where a real
-//! session exists to drive it.
+//! Reliability section) is a real DRM/libseat session concept the nested
+//! winit backend has nothing to switch *to*: [`vt_switch_target`] only
+//! classifies the key, and `crate::udev_backend` acts on it.
 
 use smithay::backend::input::{
     Axis, AxisSource, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
@@ -22,11 +21,19 @@ use smithay::wayland::seat::WaylandFocus;
 
 use bsp_core::id::NodeId;
 
-use crate::state::State;
+use crate::state::{Backend, State};
 
 /// Handles one winit-sourced input event.
-pub fn process_input_event<B: InputBackend>(
-    state: &mut State,
+///
+/// `nested`-only in practice (`crate::udev_backend::process_input_event`
+/// is the `real`-backend sibling, `docs/bsp-compositor.md` the hardware backend
+/// progress) — this module itself stays unconditionally compiled, since
+/// its `on_pointer_button`/`on_pointer_axis` are shared by both
+/// backends, so a `real`-only build would otherwise warn on this
+/// function specifically as unreachable dead code.
+#[cfg_attr(not(feature = "nested"), allow(dead_code))]
+pub fn process_input_event<B: InputBackend, Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     event: InputEvent<B>,
     output: &Output,
 ) {
@@ -37,7 +44,9 @@ pub fn process_input_event<B: InputBackend>(
             let pressed = key_state == KeyState::Pressed;
             let serial = SERIAL_COUNTER.next_serial();
             let time = Event::time_msec(&event);
-            let keyboard = state.seat.get_keyboard().unwrap();
+            let Some(keyboard) = state.seat.get_keyboard() else {
+                return;
+            };
             keyboard.input::<(), _>(
                 state,
                 keycode,
@@ -76,7 +85,7 @@ pub fn process_input_event<B: InputBackend>(
 /// `modified_sym()` for the same reason `crate::hotkeys::filter` does:
 /// held modifiers are compared separately, not folded into the symbol
 /// itself.
-fn is_emergency_quit(mods: &ModifiersState, keysym: &KeysymHandle<'_>, pressed: bool) -> bool {
+pub(crate) fn is_emergency_quit(mods: &ModifiersState, keysym: &KeysymHandle<'_>, pressed: bool) -> bool {
     pressed
         && mods.ctrl
         && mods.alt
@@ -87,12 +96,44 @@ fn is_emergency_quit(mods: &ModifiersState, keysym: &KeysymHandle<'_>, pressed: 
             ))
 }
 
-fn on_pointer_motion_absolute<B: InputBackend>(
-    state: &mut State,
+/// The VT number (1–12) a `Ctrl+Alt+F<n>` press asks to switch to, if
+/// `keysym` is a match and `pressed`.
+///
+/// bspwm-rs's own emergency key (real bspwm runs under X11, where the
+/// kernel/X server handle VT switching). Accepts both plain `F1`–`F12`
+/// (the keysym before xkb's `Ctrl+Alt+Fn` → `XF86Switch_VT_n` remap)
+/// and the `XF86Switch_VT_1`–`12` keysyms themselves, since which one
+/// the layout reports depends on the xkb options in use.
+#[cfg_attr(not(feature = "real"), allow(dead_code))]
+pub(crate) fn vt_switch_target(mods: &ModifiersState, keysym: &KeysymHandle<'_>, pressed: bool) -> Option<i32> {
+    if !pressed || !mods.ctrl || !mods.alt {
+        return None;
+    }
+    keysym.raw_syms().iter().chain(std::iter::once(&keysym.modified_sym())).find_map(|s| vt_for_keysym(s.raw()))
+}
+
+/// Maps a raw keysym value to a VT number: `XK_F1..XK_F12` or
+/// `XF86XK_Switch_VT_1..12`.
+#[cfg_attr(not(feature = "real"), allow(dead_code))]
+pub(crate) fn vt_for_keysym(raw: u32) -> Option<i32> {
+    const F1: u32 = 0xffbe;
+    const SWITCH_VT_1: u32 = 0x1008fe01;
+    match raw {
+        F1..=0xffc9 => Some((raw - F1) as i32 + 1),
+        SWITCH_VT_1..=0x1008fe0c => Some((raw - SWITCH_VT_1) as i32 + 1),
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(feature = "nested"), allow(dead_code))]
+fn on_pointer_motion_absolute<B: InputBackend, Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     event: impl PointerMotionAbsoluteEvent<B>,
     output: &Output,
 ) {
-    let output_geo = state.space.output_geometry(output).unwrap();
+    let Some(output_geo) = state.space.output_geometry(output) else {
+        return;
+    };
     let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     let serial = SERIAL_COUNTER.next_serial();
 
@@ -114,7 +155,10 @@ fn on_pointer_motion_absolute<B: InputBackend>(
     pointer.frame(state);
 }
 
-fn on_pointer_button<B: InputBackend>(state: &mut State, event: impl PointerButtonEvent<B>) {
+pub(crate) fn on_pointer_button<B: InputBackend, Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    event: impl PointerButtonEvent<B>,
+) {
     let serial = SERIAL_COUNTER.next_serial();
     let button = event.button_code();
     let button_state = wl_pointer::ButtonState::from(event.state());
@@ -131,12 +175,15 @@ fn on_pointer_button<B: InputBackend>(state: &mut State, event: impl PointerButt
         return;
     }
 
+    let Ok(wire_state) = button_state.try_into() else {
+        return;
+    };
     let pointer = state.pointer.clone();
     pointer.button(
         state,
         &ButtonEvent {
             button,
-            state: button_state.try_into().unwrap(),
+            state: wire_state,
             serial,
             time,
         },
@@ -144,7 +191,10 @@ fn on_pointer_button<B: InputBackend>(state: &mut State, event: impl PointerButt
     pointer.frame(state);
 }
 
-fn on_pointer_axis<B: InputBackend>(state: &mut State, event: impl PointerAxisEvent<B>) {
+pub(crate) fn on_pointer_axis<B: InputBackend, Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    event: impl PointerAxisEvent<B>,
+) {
     let horizontal = event
         .amount(Axis::Horizontal)
         .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);
@@ -187,8 +237,8 @@ fn on_pointer_axis<B: InputBackend>(state: &mut State, event: impl PointerAxisEv
 /// adapter's `Window` ↔ `WindowId` map plus a tree scan, factored out
 /// so `crate::pointer_action` can resolve "what's under the pointer"
 /// the same way click-to-focus does.
-pub(crate) fn window_under(
-    state: &State,
+pub(crate) fn window_under<Bd: Backend + 'static>(
+    state: &State<Bd>,
     location: smithay::utils::Point<f64, smithay::utils::Logical>,
 ) -> Option<bsp_core::id::WindowId> {
     let (window, _) = state.space.element_under(location)?;
@@ -201,8 +251,8 @@ pub(crate) fn window_under(
 /// Architecture: that mapping is the adapter's job, `bsp-ipc::registry`
 /// only tracks the *wire* id), so this is a linear scan — fine at the
 /// scale a single compositor's monitors/desktops/windows reach.
-pub(crate) fn locate_window(
-    state: &State,
+pub(crate) fn locate_window<Bd: Backend + 'static>(
+    state: &State<Bd>,
     window_id: bsp_core::id::WindowId,
 ) -> Option<(usize, usize, NodeId)> {
     for mi in 0..state.wm.monitors.len() {
@@ -230,8 +280,8 @@ pub(crate) fn locate_window(
 /// Shared by click-to-focus and `crate::pointer_action`'s `Focus`
 /// pointer action, which both end up doing exactly this (bspwm: both
 /// paths call `focus_node()`, `src/tree.c`).
-pub(crate) fn set_focus(
-    state: &mut State,
+pub(crate) fn set_focus<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
     mi: usize,
     di: usize,
     node: NodeId,
@@ -251,13 +301,15 @@ pub(crate) fn set_focus(
     let Some(window) = state.adapter.window(client.window).cloned() else {
         return;
     };
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
     keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
 }
 
 /// Sets the seat's keyboard focus to `node`'s client surface (`bsp-core`'s
 /// side is the caller's job — this only drives the Wayland-visible half).
-pub fn focus_node(state: &mut State, mi: usize, di: usize, node: NodeId) {
+pub fn focus_node<Bd: Backend + 'static>(state: &mut State<Bd>, mi: usize, di: usize, node: NodeId) {
     let Some(client) = state.wm.monitors[mi].desktops[di]
         .tree
         .node(node)
@@ -270,6 +322,28 @@ pub fn focus_node(state: &mut State, mi: usize, di: usize, node: NodeId) {
         return;
     };
     let serial = SERIAL_COUNTER.next_serial();
-    let keyboard = state.seat.get_keyboard().unwrap();
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
     keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vt_for_keysym;
+
+    #[test]
+    fn function_keys_map_to_vts() {
+        assert_eq!(vt_for_keysym(0xffbe), Some(1));
+        assert_eq!(vt_for_keysym(0xffc9), Some(12));
+        assert_eq!(vt_for_keysym(0xffca), None);
+    }
+
+    #[test]
+    fn switch_vt_keysyms_map_to_vts() {
+        assert_eq!(vt_for_keysym(0x1008fe01), Some(1));
+        assert_eq!(vt_for_keysym(0x1008fe0c), Some(12));
+        assert_eq!(vt_for_keysym(0x1008fe0d), None);
+        assert_eq!(vt_for_keysym(0x61), None);
+    }
 }

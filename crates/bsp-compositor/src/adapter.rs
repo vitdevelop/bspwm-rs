@@ -26,6 +26,8 @@ pub struct WindowAdapter {
     next_id: u32,
     windows: HashMap<WindowId, Window>,
     classes: HashMap<WindowId, (String, String)>,
+    /// Outputs/input devices as `bspc output`/`bspc input` see them.
+    pub hw: crate::hardware::HwModel,
 }
 
 impl WindowAdapter {
@@ -35,6 +37,11 @@ impl WindowAdapter {
             next_id: FIRST_WAYLAND_WINDOW_ID,
             windows: HashMap::new(),
             classes: HashMap::new(),
+            hw: crate::hardware::HwModel {
+                // Matches `State::new`'s `seat.add_keyboard(_, 200, 25)`.
+                repeat: (25, 200),
+                ..Default::default()
+            },
         }
     }
 
@@ -102,6 +109,30 @@ impl bsp_ipc::adapter::Adapter for WindowAdapter {
         // same as `close_window`. A real force-kill needs the client's
         // pid (from `wl_client_get_credentials`), not implemented yet.
         self.close_window(window);
+    }
+
+    fn output_names(&self) -> Vec<String> {
+        self.hw.output_names()
+    }
+
+    fn output_settings(&self, name: &str) -> Option<String> {
+        self.hw.output_settings(name)
+    }
+
+    fn set_output(&mut self, name: &str, action: &bsp_ipc::command::OutputAction) -> Result<(), String> {
+        self.hw.set_output(name, action)
+    }
+
+    fn input_names(&self) -> Vec<String> {
+        self.hw.input_names()
+    }
+
+    fn input_settings(&self, device: &str) -> Option<String> {
+        self.hw.input_settings(device)
+    }
+
+    fn set_input(&mut self, device: &str, action: &bsp_ipc::command::InputAction) -> Result<(), String> {
+        self.hw.set_input(device, action)
     }
 }
 

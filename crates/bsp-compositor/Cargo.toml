@@ -31,9 +31,45 @@ calloop = { version = "0.14", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xkbcommon = "0.8"
+# Decodes the xcursor theme's default cursor (`crate::cursor`); already in
+# the tree via smithay.
+xcursor = "0.3"
+# Connector hotplug scanning (`DrmScanner`) for the `real` backend — a
+# separate crate from `smithay` itself, published independently
+# (confirmed via `anvil/Cargo.toml`, Smithay's own reference compositor,
+# `docs/bsp-compositor.md` Hardware backend progress). Optional: only pulled in
+# by the `real` feature, so a `nested`-only build never needs it.
+# `default-features = false` skips its own `display-info` feature (make/
+# model strings via the system `libdisplay-info` library, unused here —
+# `docs/design.md`'s Compatibility section only ever needs a connector's
+# *name*, e.g. `HDMI-A-1`, not its make/model) — this system's installed
+# `libdisplay-info` (0.3.0) is newer than that feature's own dependency
+# will accept (`< 0.3.0`) anyway, so enabling it would fail to build.
+smithay-drm-extras = { version = "0.1", optional = true, default-features = false }
 
 [features]
 default = ["nested"]
 # The nested (winit) backend used for development, kept out of release
 # builds (`docs/design.md`, Performance budget).
 nested = ["smithay/backend_winit"]
+# The real hardware backend (DRM/KMS/libseat/udev/libinput), the hardware backend
+# (`docs/design.md` roadmap) — mutually exclusive with `nested` for now
+# (`main.rs`'s `compile_error!`): `real` has its own `State<DrmData>`,
+# and nothing yet needs both backends compiled into the same binary.
+# Deliberately *not* included, unlike Smithay's own anvil reference
+# compositor (`docs/bsp-compositor.md` Hardware backend progress for the full
+# reasoning): DRM leasing (`backend_drm_lease`/`wayland_drm_lease`, VR
+# headset passthrough), explicit sync (`wayland_drm_syncobj`), and
+# Vulkan (`backend_vulkan`, anvil's optional renderer, this project
+# already has one via `renderer_gl`).
+real = [
+    "dep:smithay-drm-extras",
+    "smithay/backend_session_libseat",
+    "smithay/backend_udev",
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_egl",
+    "smithay/use_system_lib",
+    "smithay/renderer_multi",
+]

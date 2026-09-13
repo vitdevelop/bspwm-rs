@@ -16,16 +16,34 @@ use smithay::backend::renderer::damage::{
     Error as DamageTrackerError, OutputDamageTracker, RenderOutputResult,
 };
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::{Id, Kind};
+use smithay::backend::renderer::element::{AsRenderElements, Id, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::CommitCounter;
-use smithay::backend::renderer::{Color32F, RendererSuper};
-use smithay::desktop::space::render_output;
+use smithay::backend::renderer::{Color32F, ImportAll, ImportMem, Renderer, RendererSuper, Texture};
+use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::{Space, Window};
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
 
 use bsp_core::wm::Wm;
+
+// A window's own render elements plus this crate's border strips,
+// combined into one list — the shape both the winit backend (fed
+// through `OutputDamageTracker::render_output`) and the DRM backend
+// (fed straight into `DrmOutput::render_frame`) need, since neither
+// accepts a `Space` directly the way Smithay's own convenience
+// `desktop::space::render_output` free function does. Modeled on
+// Smithay's reference compositor anvil's own `render.rs`
+// `OutputRenderElements` (`docs/bsp-compositor.md` Hardware backend progress) —
+// Smithay's *own* internal type of the same name and role
+// (`desktop::space::mod.rs`) is not `pub`, so every consumer defines
+// its own via this same macro, not by reusing Smithay's.
+smithay::backend::renderer::element::render_elements! {
+    pub OutputRenderElements<R, E> where R: ImportAll + ImportMem;
+    Cursor = crate::cursor::CursorElement<R>,
+    Space = SpaceRenderElements<R, E>,
+    Border = SolidColorRenderElement,
+}
 
 /// The color a window's border is drawn with: focused if `focused`.
 ///
@@ -99,8 +117,56 @@ fn border_elements(wm: &Wm, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
     elements
 }
 
+/// Builds one frame's full render element list for `output`: border
+/// strips (always on top, see this module's doc comment for why) plus
+/// every window's own elements — the backend-agnostic half of
+/// rendering, shared by the winit driver ([`render_frame`], below,
+/// still damage-tracked) and the DRM driver
+/// (`crate::udev_backend::render_surface`, which feeds this straight
+/// into `DrmOutput::render_frame` — that call does its own internal
+/// damage tracking, so it needs no `OutputDamageTracker` of its own).
+///
+/// `Ok(None)` (not a hard rule 3 `.expect()`/`.unwrap()`) if `output`
+/// has no mode set yet — `space_render_elements` cannot enumerate a
+/// space's elements without one; a caller mid-way through output setup
+/// (mode not applied yet) just skips this frame instead of panicking.
+pub fn output_elements<R>(
+    output: &Output,
+    space: &Space<Window>,
+    wm: &Wm,
+    renderer: &mut R,
+    cursor: Vec<crate::cursor::CursorElement<R>>,
+) -> Option<Vec<OutputRenderElements<R, <Window as AsRenderElements<R>>::RenderElement>>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + 'static,
+{
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    // The cursor goes first: earlier elements are topmost.
+    let mut elements: Vec<OutputRenderElements<R, _>> =
+        cursor.into_iter().map(OutputRenderElements::Cursor).collect();
+    elements.extend(border_elements(wm, scale).into_iter().map(OutputRenderElements::Border));
+    let space_elements =
+        match smithay::desktop::space::space_render_elements::<_, Window, _>(renderer, [space], output, 1.0)
+        {
+            Ok(elements) => elements,
+            Err(err) => {
+                tracing::warn!("skipping a frame: {err}");
+                return None;
+            }
+        };
+    elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+    Some(elements)
+}
+
 /// Renders one frame for `output`: client surfaces plus border strips,
-/// composited against [`CLEAR_COLOR`] with damage tracking.
+/// composited against [`CLEAR_COLOR`] with damage tracking. The winit
+/// (nested) backend's own driver — see [`output_elements`] for the half
+/// of this shared with the DRM backend. `nested`-only in practice (this
+/// module stays unconditionally compiled since `output_elements` is
+/// shared, so a `real`-only build would otherwise warn on this function
+/// specifically as unreachable dead code).
+#[cfg_attr(not(feature = "nested"), allow(dead_code))]
 pub fn render_frame<'d>(
     output: &Output,
     space: &Space<Window>,
@@ -110,17 +176,6 @@ pub fn render_frame<'d>(
     damage_tracker: &'d mut OutputDamageTracker,
     age: usize,
 ) -> Result<RenderOutputResult<'d>, DamageTrackerError<<GlesRenderer as RendererSuper>::Error>> {
-    let scale = Scale::from(output.current_scale().fractional_scale());
-    let borders = border_elements(wm, scale);
-    render_output(
-        output,
-        renderer,
-        framebuffer,
-        1.0,
-        age,
-        [space],
-        &borders,
-        damage_tracker,
-        CLEAR_COLOR,
-    )
+    let elements = output_elements(output, space, wm, renderer, Vec::new()).unwrap_or_default();
+    damage_tracker.render_output(renderer, framebuffer, age, &elements, CLEAR_COLOR)
 }

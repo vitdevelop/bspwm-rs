@@ -38,6 +38,8 @@ Everything is implemented and tested end to end: wire framing, the full `bspc` a
 
 **`node --move`/`--resize` are implemented and live-verified**, closing the gap above: `bsp_core::tree::Tree::find_fence`/`resize_node`/`move_floating` (`docs/bsp-core.md`) port bspwm's `src/tree.c` `find_fence()` and `src/window.c` `move_client()`/`resize_client()`, verified against bspwm 0.9.12's actual source (fetched and read directly, not recalled) rather than guessed at, since several details are easy to get wrong from memory alone — notably that `--move` on a tiled node always fails (bspwm's own `move_client()` only takes that path while a live pointer drag is being tracked, which a `bspc` request never is) and that `--resize` on a tiled node adjusts an ancestor "fence" node's `split_ratio` rather than the node's own rectangle. `exec_node`'s `Move`/`Resize` arms call these and push `Event::NodeGeometry` exactly where bspwm's own `put_status(SBSC_MASK_NODE_GEOMETRY, …)` calls do: after a floating move, and after a floating (but not pseudo-tiled or tiled) resize. Confirmed live against a running compositor and two real `alacritty` clients: a tiled resize moved the shared fence (and both windows' on-screen rectangles) by exactly the given delta, a tiled move failed as bspwm's own does, and a floating move/resize (including from each of the 8 handles) produced the exact expected rectangle math. Not implemented: automatic transfer to a different monitor when a floating move's new rectangle would land under one (bspwm: `move_client()`'s `monitor_from_client`/`transfer_node` tail) — deferred alongside the cross-monitor `node --swap` gap above, a `Wm`-level cross-tree operation this pass didn't need to touch; and honoring ICCCM/`xdg_toplevel` size hints during a resize (bspwm: `apply_size_hints()`) — no such hints are tracked anywhere in this build yet (`bsp-core::node`'s own module doc comment).
 
+**`bspc output`/`bspc input` grammar and wire plumbing are implemented** (`command::parse_output`/`parse_input`, `exec::exec_output`/`exec_input`) — not bspwm commands at all, but this project's own extensions replacing `xrandr` and `setxkbmap`/`xset r rate`/`xinput` (`docs/design.md`'s "Configuration beyond bspwm" and its the hardware backend roadmap row). `output [<name> [-m WxH@Hz] [-s SCALE] [-p X Y]]` and `input [<device> [-r HZ DELAY] [-a FACTOR]]` parse and route through `Adapter` (new default-implemented methods: `output_names`/`output_settings`/`set_output`, `input_names`/`input_settings`/`set_input`) exactly the way every other domain does — but every default returns "no known outputs/devices" or a `Reply::Fail("... not supported (no hardware ... backend yet).\n")`, since there is no real DRM output list or `libinput` device list for any backend to report yet (the hardware backend; wired for the DRM backend in Stage E, `docs/bsp-compositor.md`). Deliberately staged this way per `docs/design.md`'s roadmap: settle the wire protocol and grammar first (unit-tested against `FakeAdapter`'s defaults), wire it to real hardware once the DRM/udev backend exists to answer it (`docs/bsp-compositor.md`). Flag letters (`-m`/`-s`/`-p`/`-r`/`-a`) are this project's own choice, matching this crate's existing dash-flag style — `docs/design.md`'s own `bspc output`/`bspc input` examples are illustrative prose, not a literal CLI spec.
+
 Selector *resolution* (not parsing, which is complete) has its own known gaps, each returning `ResolveError::Unsupported` rather than a wrong answer:
 
 - **Focus history** (`last`, `newest`, `older`, `newer` on any selector, and `wm -d`'s `focusHistory` JSON array, always empty here): bspwm's `history.c` has no `bsp-core` counterpart yet.
@@ -90,6 +92,7 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | --- | --- | --- |
 | `parse` | `fn(&[String]) -> Result<Command, ParseError>` | Full request parse: domain word dispatch (bspwm: `messages.c` `process_message()`) |
 | `parse_node` / `parse_desktop` / `parse_monitor` / `parse_query` / `parse_rule` / `parse_wm` / `parse_subscribe` / `parse_quit` / `parse_config` | `fn(&[String]) -> Result<Command, ParseError>` | One per domain, mirroring `cmd_node()` … `cmd_config()`; every flag accepts both its short and long spelling |
+| `parse_output` / `parse_input` | `fn(&[String]) -> Result<Command, ParseError>` | Not bspwm domains — this project's own `xrandr`/`setxkbmap`/`xset r rate`/`xinput` replacements (`docs/design.md`) |
 
 ### `registry`
 
@@ -115,7 +118,8 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | Function | Signature | Behavior |
 | --- | --- | --- |
 | `Adapter` (trait) | `window_class`/`close_window`/`kill_window` | What `exec` needs from the real window system: class/instance lookup, close, kill |
-| `FakeAdapter` | `new`/`set_class` + `Adapter` impl | An in-memory adapter for tests: a lookup table plus a record of what was closed/killed |
+| `Adapter`'s output/input methods | `output_names`/`output_settings`/`set_output`, `input_names`/`input_settings`/`set_input` | Default-implemented as "no known outputs/devices"/"not supported"; a real hardware backend overrides them |
+| `FakeAdapter` | `new`/`set_class` + `Adapter` impl | An in-memory adapter for tests: a lookup table plus a record of what was closed/killed; uses every output/input default as-is |
 
 ### `exec`
 
@@ -123,6 +127,8 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | --- | --- | --- |
 | `execute` | `fn(&mut ExecCtx<A>, &Command) -> (Reply, Vec<Event>)` | Runs any `Command` but `Subscribe`/`Quit` (the server handles those directly) against `bsp-core`, mirroring `src/messages.c`'s `cmd_node()` … `cmd_config()` |
 | `build_report` | `fn(&Wm) -> Report` | Builds the current `subscribe report`/`wm -g` line from live state |
+| `exec::set_monitor_rectangle` | `fn(&mut ExecCtx<A>, usize, Rect, &mut Vec<Event>) -> usize` | Applies a new monitor rectangle (adapt tree geometry, re-arrange, `MonitorGeometry` event, `reorder_monitor`); extracted from `bspc monitor -g`, shared with the compositor's output changes. Returns the monitor's index after reordering |
+| `exec_output` / `exec_input` | `fn(&mut ExecCtx<A>, Option<&str>, &[OutputAction]/&[InputAction]) -> Reply` | List/get/set over `Adapter`'s output/input methods; no hardware knowledge of its own |
 
 ### `server`
 

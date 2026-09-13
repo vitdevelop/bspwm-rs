@@ -47,6 +47,12 @@ pub fn execute<A: Adapter>(ctx: &mut ExecCtx<A>, cmd: &Command) -> (Reply, Vec<E
         Command::Rule(actions) => (exec_rule(ctx, actions), Vec::new()),
         Command::Wm(actions) => exec_wm(ctx, actions),
         Command::Config(c) => (exec_config(ctx, c), Vec::new()),
+        Command::Output { name, actions } => {
+            (exec_output(ctx, name.as_deref(), actions), Vec::new())
+        }
+        Command::Input { device, actions } => {
+            (exec_input(ctx, device.as_deref(), actions), Vec::new())
+        }
         Command::Subscribe { .. } | Command::Quit(_) => {
             unreachable!("Subscribe/Quit are handled by the server, not exec::execute")
         }
@@ -150,6 +156,45 @@ fn two_trees_mut(wm: &mut Wm, a: (usize, usize), b: (usize, usize)) -> (&mut Tre
             &mut left[b.0].desktops[b.1].tree,
         )
     }
+}
+
+/// Applies a new rectangle to monitor `monitor`: adapts every desktop's
+/// tree geometry, re-arranges, records a `MonitorGeometry` event, and
+/// re-sorts the monitor into on-screen-position order. Returns the
+/// monitor's index after that reorder. Shared by `bspc monitor -g` and
+/// the compositor's own output mode/scale/position changes (`bspc
+/// output`, the hardware backend).
+pub fn set_monitor_rectangle<A: Adapter>(
+    ctx: &mut ExecCtx<A>,
+    monitor: usize,
+    r: bsp_core::geometry::Rect,
+    events: &mut Vec<Event>,
+) -> usize {
+    let old = ctx.wm.monitors[monitor].rectangle;
+    ctx.wm.monitors[monitor].rectangle = r;
+    for i in 0..ctx.wm.monitors[monitor].desktops.len() {
+        let root = ctx.wm.monitors[monitor].desktops[i].tree.root;
+        bsp_core::monitor::adapt_geometry(&mut ctx.wm.monitors[monitor].desktops[i].tree, root, old, r);
+    }
+    events.push(Event::MonitorGeometry {
+        id: monitor_wire_id(ctx.wm, monitor),
+        geometry: r,
+    });
+    for i in 0..ctx.wm.monitors[monitor].desktops.len() {
+        arrange(
+            ctx,
+            Coordinates {
+                monitor,
+                desktop: i,
+                node: None,
+            },
+        );
+    }
+    // bspwm: `src/monitor.c` `update_root()` calls `reorder_monitor(m)`
+    // right after applying a new rectangle, so a monitor that moved on
+    // screen sorts back into on-screen-position order among its
+    // neighbors.
+    ctx.wm.reorder_monitor(monitor)
 }
 
 /// bspwm: `src/tree.c` `arrange()`, invoked via `crate::monitor::Monitor::arrange`.
@@ -1189,31 +1234,7 @@ fn exec_monitor<A: Adapter>(
                 break 'actions;
             }
             MonitorAction::SetRectangle(r) => {
-                let old = ctx.wm.monitors[trg_monitor].rectangle;
-                ctx.wm.monitors[trg_monitor].rectangle = *r;
-                for i in 0..ctx.wm.monitors[trg_monitor].desktops.len() {
-                    let root = ctx.wm.monitors[trg_monitor].desktops[i].tree.root;
-                    bsp_core::monitor::adapt_geometry(
-                        &mut ctx.wm.monitors[trg_monitor].desktops[i].tree,
-                        root,
-                        old,
-                        *r,
-                    );
-                }
-                events.push(Event::MonitorGeometry {
-                    id: monitor_wire_id(ctx.wm, trg_monitor),
-                    geometry: *r,
-                });
-                for i in 0..ctx.wm.monitors[trg_monitor].desktops.len() {
-                    arrange(
-                        ctx,
-                        Coordinates {
-                            monitor: trg_monitor,
-                            desktop: i,
-                            node: None,
-                        },
-                    );
-                }
+                trg_monitor = set_monitor_rectangle(ctx, trg_monitor, *r, &mut events);
             }
             MonitorAction::Rename(name) => {
                 ctx.wm.monitors[trg_monitor].rename(name);
@@ -1657,6 +1678,69 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
         Some(value) => set_setting(ctx, target, &c.name, value),
         None => get_setting(ctx, target, &c.name),
     }
+}
+
+// ======================= output/input =======================
+
+/// `bspc output` — see `Command::Output`. Every case defers entirely to
+/// `Adapter`'s output methods, which default to "no known outputs"/
+/// "not supported" until a real hardware backend overrides them
+/// (`docs/design.md` roadmap, the hardware backend): this function itself has no
+/// hardware knowledge, only the wire-protocol shape (list/get/set).
+fn exec_output<A: Adapter>(
+    ctx: &mut ExecCtx<A>,
+    name: Option<&str>,
+    actions: &[OutputAction],
+) -> Reply {
+    let Some(name) = name else {
+        let names = ctx.adapter.output_names();
+        return Reply::Ok(if names.is_empty() {
+            String::new()
+        } else {
+            names.join("\n") + "\n"
+        });
+    };
+    if actions.is_empty() {
+        return match ctx.adapter.output_settings(name) {
+            Some(s) => Reply::Ok(s),
+            None => Reply::Fail(format!("output: unknown output '{name}'.\n")),
+        };
+    }
+    for action in actions {
+        if let Err(msg) = ctx.adapter.set_output(name, action) {
+            return Reply::Fail(msg);
+        }
+    }
+    Reply::Ok(String::new())
+}
+
+/// `bspc input` — see `Command::Input`. Mirrors `exec_output` exactly,
+/// one layer down (`Adapter`'s input methods instead of its output ones).
+fn exec_input<A: Adapter>(
+    ctx: &mut ExecCtx<A>,
+    device: Option<&str>,
+    actions: &[InputAction],
+) -> Reply {
+    let Some(device) = device else {
+        let names = ctx.adapter.input_names();
+        return Reply::Ok(if names.is_empty() {
+            String::new()
+        } else {
+            names.join("\n") + "\n"
+        });
+    };
+    if actions.is_empty() {
+        return match ctx.adapter.input_settings(device) {
+            Some(s) => Reply::Ok(s),
+            None => Reply::Fail(format!("input: unknown device '{device}'.\n")),
+        };
+    }
+    for action in actions {
+        if let Err(msg) = ctx.adapter.set_input(device, action) {
+            return Reply::Fail(msg);
+        }
+    }
+    Reply::Ok(String::new())
 }
 
 fn set_setting<A: Adapter>(
@@ -2223,6 +2307,82 @@ mod tests {
         assert_eq!(wm.monitors[0].name, "HDMI-A-1");
         assert_eq!(wm.monitors[1].name, "eDP-1");
         assert!(events.iter().any(|e| e.kind() == EventKind::MonitorSwap));
+    }
+
+    #[test]
+    fn monitor_set_rectangle_reorders_a_monitor_moved_past_its_neighbor() {
+        // eDP-1 starts at index 0 (0,0,800,600), left of HDMI-A-1 at
+        // index 1 (800,0,800,600). Moving eDP-1 to x=1600 puts it to the
+        // right of HDMI-A-1, so `bspc monitor -g` should walk it into
+        // the new position — bspwm: `src/monitor.c` `update_root()`
+        // calls `reorder_monitor()` right after applying the rectangle.
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, events) = run(
+            &mut wm,
+            &mut registry,
+            &mut adapter,
+            "monitor eDP-1 -g 800x600+1600+0",
+        );
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert_eq!(wm.monitors[0].name, "HDMI-A-1");
+        assert_eq!(wm.monitors[1].name, "eDP-1");
+        assert!(events
+            .iter()
+            .any(|e| e.kind() == EventKind::MonitorGeometry));
+    }
+
+    #[test]
+    fn output_bare_lists_the_adapters_known_outputs() {
+        // FakeAdapter never overrides `Adapter::output_names`, so this
+        // exercises the trait's own default ("no known outputs") —
+        // exactly what the nested winit backend gets until a real DRM
+        // backend overrides it.
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "output");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn output_get_on_an_unknown_name_fails() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "output eDP-1");
+        assert_eq!(
+            reply,
+            Reply::Fail("output: unknown output 'eDP-1'.\n".to_string())
+        );
+    }
+
+    #[test]
+    fn output_set_fails_with_no_hardware_backend() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "output eDP-1 -s 1.25");
+        assert_eq!(
+            reply,
+            Reply::Fail("output: not supported (no hardware output backend yet).\n".to_string())
+        );
+    }
+
+    #[test]
+    fn input_bare_lists_the_adapters_known_devices() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "input");
+        assert_eq!(reply, Reply::Ok(String::new()));
+    }
+
+    #[test]
+    fn input_set_fails_with_no_hardware_backend() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(
+            &mut wm,
+            &mut registry,
+            &mut adapter,
+            "input keyboard -r 25 200",
+        );
+        assert_eq!(
+            reply,
+            Reply::Fail("input: not supported (no hardware input backend yet).\n".to_string())
+        );
     }
 
     #[test]
