@@ -16,11 +16,14 @@ use smithay::backend::renderer::damage::{
     Error as DamageTrackerError, OutputDamageTracker, RenderOutputResult,
 };
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::{AsRenderElements, Id, Kind};
+use smithay::backend::renderer::element::{AsRenderElements, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Color32F, ImportAll, ImportMem, Renderer, RendererSuper, Texture};
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::desktop::layer_map_for_output;
 use smithay::desktop::space::SpaceRenderElements;
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::desktop::{Space, Window};
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
@@ -41,6 +44,7 @@ use bsp_core::wm::Wm;
 smithay::backend::renderer::element::render_elements! {
     pub OutputRenderElements<R, E> where R: ImportAll + ImportMem;
     Cursor = crate::cursor::CursorElement<R>,
+    Layer = smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<R>,
     Space = SpaceRenderElements<R, E>,
     Border = SolidColorRenderElement,
 }
@@ -72,7 +76,11 @@ fn strip(geo: Rectangle<i32, Physical>, color: Color32F) -> SolidColorRenderElem
 fn border_elements(wm: &Wm, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
     let mut elements = Vec::new();
     for m in &wm.monitors {
-        for d in &m.desktops {
+        for (di, d) in m.desktops.iter().enumerate() {
+            // Only a monitor's focused desktop is on screen.
+            if m.focused != Some(di) {
+                continue;
+            }
             let mut n = d.tree.first_extrema(d.tree.root);
             while let Some(id) = n {
                 let node = d.tree.node(id);
@@ -117,6 +125,38 @@ fn border_elements(wm: &Wm, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
     elements
 }
 
+/// Render elements for `output`'s layer surfaces on the given `layers`,
+/// in that order (earlier = topmost).
+fn layer_elements<R, E>(
+    output: &Output,
+    renderer: &mut R,
+    scale: Scale<f64>,
+    layers: &[Layer],
+) -> Vec<OutputRenderElements<R, E>>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + Texture + 'static,
+    E: RenderElement<R>,
+{
+    let map = layer_map_for_output(output);
+    let mut elements = Vec::new();
+    for &wanted in layers {
+        for layer in map.layers_on(wanted).rev() {
+            let Some(geo) = map.layer_geometry(layer) else {
+                continue;
+            };
+            let location = geo.loc.to_f64().to_physical(scale).to_i32_round();
+            elements.extend(
+                layer
+                    .render_elements::<WaylandSurfaceRenderElement<R>>(renderer, location, scale, 1.0)
+                    .into_iter()
+                    .map(OutputRenderElements::Layer),
+            );
+        }
+    }
+    elements
+}
+
 /// Builds one frame's full render element list for `output`: border
 /// strips (always on top, see this module's doc comment for why) plus
 /// every window's own elements — the backend-agnostic half of
@@ -142,9 +182,31 @@ where
     R::TextureId: Clone + Texture + 'static,
 {
     let scale = Scale::from(output.current_scale().fractional_scale());
+    // A locked session shows the lock surface (or black) and nothing else.
+    if crate::session_lock::is_locked(output) {
+        let mut elements: Vec<OutputRenderElements<R, _>> =
+            cursor.into_iter().map(OutputRenderElements::Cursor).collect();
+        if let Some(surface) = crate::session_lock::lock_surface(output) {
+            elements.extend(
+                smithay::backend::renderer::element::surface::render_elements_from_surface_tree::<R, WaylandSurfaceRenderElement<R>>(
+                    renderer,
+                    &surface,
+                    (0, 0),
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                )
+                .into_iter()
+                .map(OutputRenderElements::Layer),
+            );
+        }
+        return Some(elements);
+    }
     // The cursor goes first: earlier elements are topmost.
     let mut elements: Vec<OutputRenderElements<R, _>> =
         cursor.into_iter().map(OutputRenderElements::Cursor).collect();
+    // Overlay and top layers, above windows and their borders.
+    elements.extend(layer_elements(output, renderer, scale, &[Layer::Overlay, Layer::Top]));
     elements.extend(border_elements(wm, scale).into_iter().map(OutputRenderElements::Border));
     let space_elements =
         match smithay::desktop::space::space_render_elements::<_, Window, _>(renderer, [space], output, 1.0)
@@ -156,6 +218,8 @@ where
             }
         };
     elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+    // Bottom and background layers, under everything.
+    elements.extend(layer_elements(output, renderer, scale, &[Layer::Bottom, Layer::Background]));
     Some(elements)
 }
 

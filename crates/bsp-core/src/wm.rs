@@ -11,6 +11,60 @@ use crate::monitor::Monitor;
 use crate::rules::Rule;
 use crate::settings::Settings;
 
+/// The `_NET_WM_STRUT_PARTIAL` property of a panel window (EWMH): how much
+/// of each screen edge it covers, and along which stretch of that edge.
+///
+/// bspwm: `xcb_ewmh_wm_strut_partial_t`, read by `src/ewmh.c` `ewmh_handle_struts()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EwmhStruts {
+    /// Width reserved at the left edge.
+    pub left: u32,
+    /// Width reserved at the right edge.
+    pub right: u32,
+    /// Height reserved at the top edge.
+    pub top: u32,
+    /// Height reserved at the bottom edge.
+    pub bottom: u32,
+    /// First `y` the left strut covers.
+    pub left_start_y: u32,
+    /// Last `y` the left strut covers.
+    pub left_end_y: u32,
+    /// First `y` the right strut covers.
+    pub right_start_y: u32,
+    /// Last `y` the right strut covers.
+    pub right_end_y: u32,
+    /// First `x` the top strut covers.
+    pub top_start_x: u32,
+    /// Last `x` the top strut covers.
+    pub top_end_x: u32,
+    /// First `x` the bottom strut covers.
+    pub bottom_start_x: u32,
+    /// Last `x` the bottom strut covers.
+    pub bottom_end_x: u32,
+}
+
+impl EwmhStruts {
+    /// Builds the struts from the property's twelve `CARDINAL`s, in the
+    /// order EWMH defines: left, right, top, bottom, then the start/end pairs.
+    pub fn from_cardinals(v: &[u32]) -> Option<Self> {
+        let v: &[u32; 12] = v.try_into().ok()?;
+        Some(Self {
+            left: v[0],
+            right: v[1],
+            top: v[2],
+            bottom: v[3],
+            left_start_y: v[4],
+            left_end_y: v[5],
+            right_start_y: v[6],
+            right_end_y: v[7],
+            top_start_x: v[8],
+            top_end_x: v[9],
+            bottom_start_x: v[10],
+            bottom_end_x: v[11],
+        })
+    }
+}
+
 /// The complete state of the window manager: every monitor in display
 /// order, which one is focused, the global rule list, and settings.
 ///
@@ -159,6 +213,65 @@ impl Wm {
         };
     }
 
+    /// Reserves the space a panel's `_NET_WM_STRUT_PARTIAL` asks for on every
+    /// monitor whose edge it touches, growing that monitor's `padding`
+    /// (never shrinking it); `screen` is the X screen's `(width, height)`.
+    /// Returns whether any padding changed, in which case the caller
+    /// re-arranges every desktop.
+    ///
+    /// bspwm: `src/ewmh.c` `ewmh_handle_struts()`. A negative padding
+    /// (`bspc config -m M top_padding -10`) is offset by the strut instead
+    /// of maxed with it, exactly as there. Like bspwm, nothing ever gives
+    /// the space back when the panel goes away.
+    pub fn apply_ewmh_struts(&mut self, struts: &EwmhStruts, screen: (i32, i32)) -> bool {
+        let (screen_width, screen_height) = screen;
+        let mut changed = false;
+        let grow = |padding: &mut i32, d: i32| {
+            if *padding < 0 {
+                *padding += d;
+            } else {
+                *padding = d.max(*padding);
+            }
+        };
+        for m in &mut self.monitors {
+            let rect = m.rectangle;
+            let (left, right, top, bottom) = (struts.left as i32, struts.right as i32, struts.top as i32, struts.bottom as i32);
+            if rect.x < left
+                && left < rect.x + rect.width - 1
+                && struts.left_end_y as i32 >= rect.y
+                && (struts.left_start_y as i32) < rect.y + rect.height
+            {
+                grow(&mut m.padding.left, left - rect.x);
+                changed = true;
+            }
+            if rect.x + rect.width > screen_width - right
+                && screen_width - right > rect.x
+                && struts.right_end_y as i32 >= rect.y
+                && (struts.right_start_y as i32) < rect.y + rect.height
+            {
+                grow(&mut m.padding.right, rect.x + rect.width - screen_width + right);
+                changed = true;
+            }
+            if rect.y < top
+                && top < rect.y + rect.height - 1
+                && struts.top_end_x as i32 >= rect.x
+                && (struts.top_start_x as i32) < rect.x + rect.width
+            {
+                grow(&mut m.padding.top, top - rect.y);
+                changed = true;
+            }
+            if rect.y + rect.height > screen_height - bottom
+                && screen_height - bottom > rect.y
+                && struts.bottom_end_x as i32 >= rect.x
+                && (struts.bottom_start_x as i32) < rect.x + rect.width
+            {
+                grow(&mut m.padding.bottom, rect.y + rect.height - screen_height + bottom);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The focused monitor, if any.
     pub fn focused_monitor(&self) -> Option<&Monitor> {
         self.focused_monitor.map(|i| &self.monitors[i])
@@ -295,5 +408,76 @@ mod tests {
         wm.add_monitor(monitor(7));
         assert_eq!(wm.monitor_index(MonitorId(7)), Some(1));
         assert_eq!(wm.monitor_index(MonitorId(9)), None);
+    }
+
+    fn strut_monitor(id: u32, x: i32, y: i32, w: i32, h: i32) -> Monitor {
+        Monitor::new(MonitorId(id), Some("m"), crate::geometry::Rect { x, y, width: w, height: h }, &settings())
+    }
+
+    /// A 30px-high bar across the top of a 1000x800 screen.
+    fn top_bar() -> EwmhStruts {
+        EwmhStruts { top: 30, top_start_x: 0, top_end_x: 999, ..Default::default() }
+    }
+
+    #[test]
+    fn a_top_strut_pads_the_monitor_it_touches() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        assert!(wm.apply_ewmh_struts(&top_bar(), (1000, 800)));
+        assert_eq!(wm.monitors[0].padding.top, 30);
+        assert_eq!(wm.monitors[0].padding.bottom, 0);
+    }
+
+    #[test]
+    fn a_strut_never_shrinks_padding_it_only_maxes_it() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        wm.monitors[0].padding.top = 50;
+        wm.apply_ewmh_struts(&top_bar(), (1000, 800));
+        assert_eq!(wm.monitors[0].padding.top, 50);
+    }
+
+    #[test]
+    fn a_negative_padding_is_offset_by_the_strut() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        wm.monitors[0].padding.top = -10;
+        wm.apply_ewmh_struts(&top_bar(), (1000, 800));
+        assert_eq!(wm.monitors[0].padding.top, 20);
+    }
+
+    #[test]
+    fn a_strut_along_a_stretch_only_touches_monitors_in_that_stretch() {
+        // Two monitors side by side; the bar covers only the left one's x range.
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        wm.add_monitor(strut_monitor(2, 1000, 0, 1000, 800));
+        let bar = EwmhStruts { top: 30, top_start_x: 0, top_end_x: 999, ..Default::default() };
+        assert!(wm.apply_ewmh_struts(&bar, (2000, 800)));
+        assert_eq!(wm.monitors[0].padding.top, 30);
+        assert_eq!(wm.monitors[1].padding.top, 0);
+    }
+
+    #[test]
+    fn a_bottom_and_a_right_strut_measure_from_the_screen_edge() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        let s = EwmhStruts { bottom: 40, bottom_end_x: 999, right: 20, right_end_y: 799, ..Default::default() };
+        assert!(wm.apply_ewmh_struts(&s, (1000, 800)));
+        assert_eq!(wm.monitors[0].padding.bottom, 40);
+        assert_eq!(wm.monitors[0].padding.right, 20);
+    }
+
+    #[test]
+    fn an_all_zero_strut_changes_nothing() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(strut_monitor(1, 0, 0, 1000, 800));
+        assert!(!wm.apply_ewmh_struts(&EwmhStruts::default(), (1000, 800)));
+    }
+
+    #[test]
+    fn struts_need_exactly_twelve_cardinals() {
+        assert!(EwmhStruts::from_cardinals(&[0; 11]).is_none());
+        assert_eq!(EwmhStruts::from_cardinals(&[1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]).map(|s| (s.left, s.right, s.top, s.bottom)), Some((1, 2, 3, 4)));
     }
 }

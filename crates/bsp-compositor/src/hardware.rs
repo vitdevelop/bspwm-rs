@@ -87,6 +87,12 @@ impl HwModel {
         ))
     }
 
+    /// Whether `action` would be accepted for output `name`, without
+    /// recording or queueing anything (`zwlr_output_configuration_v1.test`).
+    pub fn check_output(&self, name: &str, action: &OutputAction) -> Result<(), String> {
+        self.clone().set_output(name, action)
+    }
+
     /// Validates `action` against output `name`, records it in the model
     /// and queues it for the backend to apply.
     pub fn set_output(&mut self, name: &str, action: &OutputAction) -> Result<(), String> {

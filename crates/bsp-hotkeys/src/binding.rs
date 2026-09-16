@@ -217,7 +217,13 @@ pub fn parse_chain(chain: &str) -> Result<Vec<Chord>, UnknownName> {
             if let Some(m) = Modifier::parse(n) {
                 modifiers.push(m);
             } else {
-                let keysym = xkb::keysym_from_name(n, xkb::KEYSYM_NO_FLAGS);
+                // xkbcommon's wrapper unwraps a `CString`, so an interior
+                // NUL would panic; no keysym name can contain one.
+                let keysym = if n.contains('\0') {
+                    Keysym::NoSymbol
+                } else {
+                    xkb::keysym_from_name(n, xkb::KEYSYM_NO_FLAGS)
+                };
                 if keysym != Keysym::NoSymbol {
                     key = Some(Key::Keysym(keysym));
                 } else if let Some(button) = parse_button(n) {
@@ -254,6 +260,11 @@ mod tests {
 
     fn keysym(name: &str) -> Keysym {
         xkb::keysym_from_name(name, xkb::KEYSYM_NO_FLAGS)
+    }
+
+    #[test]
+    fn an_interior_nul_is_an_unknown_name_not_a_panic() {
+        assert!(parse_chain("super + a\0b").is_err());
     }
 
     #[test]

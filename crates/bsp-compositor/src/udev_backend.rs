@@ -7,16 +7,12 @@
 //! specifically to read while writing this — its module docs point to
 //! it as "the" hardware-backend reference, and it is not vendored in
 //! the packaged crates.io source), with scope deliberately trimmed:
-//! **not** implemented here (all real anvil features, left out because
-//! they are unrelated to getting a single display rendering — see
-//! `Cargo.toml`'s `real` feature comment): DRM lease (VR headset
-//! passthrough), explicit sync (`drm_syncobj`), the multi-GPU
-//! render-node *copy* path (`GpuManager::single_renderer` only, not
-//! `GpuManager::renderer`'s cross-device copy), tablet/touch device
-//! bookkeeping, cursor rendering (no visible pointer image is drawn to
-//! any plane yet — a real, known gap, not an oversight), and Wayland
-//! presentation-time feedback (not implemented anywhere in this crate
-//! yet either, `docs/bsp-compositor.md`'s module table).
+//! **not** implemented here (real anvil features left out because they
+//! are unrelated to getting displays rendering — see `Cargo.toml`'s `real`
+//! feature comment): DRM lease (VR headset passthrough) and explicit sync
+//! (`drm_syncobj`). Cursor drawing (`crate::cursor`), presentation-time
+//! feedback, gestures, touch and tablets (`crate::devices`) and the
+//! multi-GPU copy route are implemented; see `docs/bsp-compositor.md`.
 //!
 //! bspwm has no equivalent code at all: X11 and its display manager
 //! handle session/VT/GPU ownership beneath the window manager entirely.
@@ -89,6 +85,124 @@ pub struct DrmData {
     cursor_images: crate::cursor::CursorImages,
 }
 
+/// Where a capture is rendered to.
+enum CaptureTarget<'a> {
+    /// A texture read back into CPU memory (shm clients).
+    Memory,
+    /// A client's (or our own) dmabuf, rendered on the GPU.
+    Dmabuf(&'a mut smithay::backend::allocator::dmabuf::Dmabuf),
+}
+
+impl DrmData {
+    /// The render node captures run on: the primary GPU's.
+    fn capture_render_node(&self) -> DrmNode {
+        self.backends.get(&self.primary_gpu).and_then(|d| d.render_node).unwrap_or(self.primary_gpu)
+    }
+
+    /// Renders what `request` asks for (a whole output, or one window)
+    /// into `target`. `Some` frame for [`CaptureTarget::Memory`].
+    fn capture(
+        &mut self,
+        request: crate::screencopy::CaptureRequest<'_>,
+        target: CaptureTarget<'_>,
+    ) -> Result<Option<crate::screencopy::CapturedFrame>, String> {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::damage::OutputDamageTracker;
+        use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+        use smithay::backend::renderer::element::AsRenderElements;
+        use smithay::backend::renderer::gles::GlesTexture;
+        use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
+        use smithay::utils::{Buffer as BufferCoord, Rectangle, Size};
+
+        let output = request.output;
+        let mode = output.current_mode().ok_or_else(|| "output has no mode".to_string())?;
+        let render_node = self.capture_render_node();
+        let mut multi = self
+            .gpus
+            .single_renderer(&render_node)
+            .map_err(|err| format!("no renderer: {err}"))?;
+        // The render node's own GLES renderer: capture needs `Offscreen` and
+        // `ExportMem`, which the multi-GPU wrapper does not offer.
+        let gles: &mut GlesRenderer = multi.as_mut();
+
+        let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+        type Elements = Vec<crate::render::OutputRenderElements<GlesRenderer, <smithay::desktop::Window as AsRenderElements<GlesRenderer>>::RenderElement>>;
+        let (elements, size): (Elements, Size<i32, smithay::utils::Physical>) = match request.window {
+            Some(window) => {
+                // One window's surface tree with its geometry's corner at the origin.
+                let geometry = window.geometry();
+                let origin = (-geometry.loc.x, -geometry.loc.y);
+                let origin = smithay::utils::Point::<i32, smithay::utils::Logical>::from(origin).to_f64().to_physical(scale).to_i32_round();
+                let size = geometry.size.to_f64().to_physical(scale).to_i32_ceil();
+                let elements = window
+                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(gles, origin, scale, 1.0)
+                    .into_iter()
+                    .map(crate::render::OutputRenderElements::Layer)
+                    .collect();
+                (elements, size)
+            }
+            None => {
+                let cursor = match request.cursor {
+                    Some((status, location)) => crate::cursor::cursor_elements(gles, &mut self.cursor_images, status, location, scale),
+                    None => Vec::new(),
+                };
+                let elements = crate::render::output_elements(output, request.space, request.wm, gles, cursor)
+                    .ok_or_else(|| "output has no elements yet".to_string())?;
+                (elements, mode.size)
+            }
+        };
+        if size.w <= 0 || size.h <= 0 {
+            return Err("nothing to capture".to_string());
+        }
+
+        if let CaptureTarget::Dmabuf(dmabuf) = target {
+            let mut framebuffer = gles.bind(dmabuf).map_err(|err| format!("cannot bind the dmabuf: {err}"))?;
+            let mut tracker = OutputDamageTracker::new(size, scale, DMABUF_CAPTURE_TRANSFORM);
+            let result = tracker
+                .render_output(gles, &mut framebuffer, 0, &elements, crate::render::CLEAR_COLOR)
+                .map_err(|err| format!("off-screen render failed: {err}"))?;
+            // The client reads the buffer as soon as it sees `ready`.
+            result.sync.wait().map_err(|err| format!("waiting for the render failed: {err:?}"))?;
+            return Ok(None);
+        }
+
+        let buffer_size: Size<i32, BufferCoord> = (size.w, size.h).into();
+        let mut texture: GlesTexture = gles
+            .create_buffer(Fourcc::Abgr8888, buffer_size)
+            .map_err(|err| format!("cannot create an off-screen buffer: {err}"))?;
+        let mut framebuffer = gles.bind(&mut texture).map_err(|err| format!("cannot bind it: {err}"))?;
+        // Rendering into a GLES texture comes out y-inverted (GL's origin is
+        // the bottom-left); rendering with `Flipped180` cancels that, so the
+        // read-back is top row first, which is what `wl_shm` clients expect
+        // (found live: without it `grim` screenshots were upside down).
+        let mut tracker = OutputDamageTracker::new(size, scale, Transform::Flipped180);
+        tracker
+            .render_output(gles, &mut framebuffer, 0, &elements, crate::render::CLEAR_COLOR)
+            .map_err(|err| format!("off-screen render failed: {err}"))?;
+        let mapping = gles
+            .copy_framebuffer(&framebuffer, Rectangle::from_size(buffer_size), Fourcc::Argb8888)
+            .map_err(|err| format!("reading back failed: {err}"))?;
+        let flipped = smithay::backend::renderer::TextureMapping::flipped(&mapping);
+        tracing::debug!(flipped, "screencopy read-back orientation");
+        let bytes = gles.map_texture(&mapping).map_err(|err| format!("mapping failed: {err}"))?;
+
+        let (w, h) = (size.w, size.h);
+        let stride = (w * 4) as usize;
+        let mut data = Vec::with_capacity(stride * h as usize);
+        if flipped {
+            for row in (0..h as usize).rev() {
+                data.extend_from_slice(&bytes[row * stride..(row + 1) * stride]);
+            }
+        } else {
+            data.extend_from_slice(&bytes[..stride * h as usize]);
+        }
+        Ok(Some(crate::screencopy::CapturedFrame { width: w, height: h, data }))
+    }
+}
+
+/// How a capture into a dmabuf is oriented (settled by the live test, see `docs/bsp-compositor.md`).
+const DMABUF_CAPTURE_TRANSFORM: Transform = Transform::Normal;
+
 impl Backend for DrmData {
     fn seat_name(&self) -> String {
         self.session.seat()
@@ -117,6 +231,139 @@ impl Backend for DrmData {
         if let Err(err) = self.gpus.early_import(self.primary_gpu, surface) {
             tracing::debug!(primary = %self.primary_gpu, "early import of a client buffer failed: {err}");
         }
+    }
+
+    fn capture_output(&mut self, request: crate::screencopy::CaptureRequest<'_>) -> Result<crate::screencopy::CapturedFrame, String> {
+        self.capture(request, CaptureTarget::Memory)?
+            .ok_or_else(|| "no pixels were read back".to_string())
+    }
+
+    fn capture_dmabuf_caps(&mut self) -> Option<crate::screencopy::DmabufCaps> {
+        use smithay::backend::allocator::{Format, Fourcc};
+        use smithay::backend::renderer::Bind;
+        let render_node = self.capture_render_node();
+        let mut multi = self.gpus.single_renderer(&render_node).ok()?;
+        let gles: &mut GlesRenderer = multi.as_mut();
+        let supported = Bind::<smithay::backend::allocator::dmabuf::Dmabuf>::supported_formats(gles)?;
+        let mut formats: Vec<(Fourcc, Vec<smithay::backend::allocator::Modifier>)> = Vec::new();
+        for Format { code, modifier } in supported.iter() {
+            if !matches!(code, Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888) {
+                continue;
+            }
+            match formats.iter_mut().find(|(c, _)| c == code) {
+                Some((_, mods)) => mods.push(*modifier),
+                None => formats.push((*code, vec![*modifier])),
+            }
+        }
+        if formats.is_empty() {
+            return None;
+        }
+        Some(crate::screencopy::DmabufCaps { device: render_node.dev_id(), formats })
+    }
+
+    fn capture_into_dmabuf(
+        &mut self,
+        request: crate::screencopy::CaptureRequest<'_>,
+        dmabuf: &mut smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), String> {
+        self.capture(request, CaptureTarget::Dmabuf(dmabuf)).map(|_| ())
+    }
+
+    fn allocate_capture_buffer(&mut self, width: i32, height: i32) -> Result<smithay::backend::allocator::dmabuf::Dmabuf, String> {
+        use smithay::backend::allocator::dmabuf::AsDmabuf;
+        use smithay::backend::allocator::{Allocator, Fourcc, Modifier};
+        let caps = self.capture_dmabuf_caps().ok_or_else(|| "no dmabuf render formats".to_string())?;
+        let (code, modifiers) = caps
+            .formats
+            .iter()
+            .find(|(code, _)| *code == Fourcc::Argb8888)
+            .or_else(|| caps.formats.first())
+            .ok_or_else(|| "no dmabuf render formats".to_string())?;
+        // Linear when possible: every importer understands it.
+        let modifiers: Vec<Modifier> = if modifiers.contains(&Modifier::Linear) { vec![Modifier::Linear] } else { modifiers.clone() };
+        let render_node = self.capture_render_node();
+        let gbm = self
+            .backends
+            .values()
+            .find(|d| d.render_node == Some(render_node))
+            .or_else(|| self.backends.values().next())
+            .map(|d| d.gbm.clone())
+            .ok_or_else(|| "no GPU".to_string())?;
+        let mut allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+        let buffer = allocator
+            .create_buffer(width as u32, height as u32, *code, &modifiers)
+            .map_err(|err| format!("cannot allocate a buffer: {err}"))?;
+        buffer.export().map_err(|err| format!("cannot export the buffer: {err}"))
+    }
+
+    fn output_power(&mut self, output: &Output) -> Option<bool> {
+        let id = output.user_data().get::<UdevOutputId>()?;
+        Some(self.backends.get(&id.device_id)?.surfaces.get(&id.crtc)?.powered)
+    }
+
+    fn set_output_power(&mut self, output: &Output, on: bool) -> Result<(), String> {
+        use smithay::reexports::drm::control::Device as ControlDevice;
+        let id = *output.user_data().get::<UdevOutputId>().ok_or_else(|| "not a hardware output".to_string())?;
+        let device = self.backends.get_mut(&id.device_id).ok_or_else(|| "its GPU is gone".to_string())?;
+        let surface = device.surfaces.get_mut(&id.crtc).ok_or_else(|| "output is not active".to_string())?;
+        let drm = device.drm_output_manager.device();
+        let props = drm.get_properties(surface.connector).map_err(|err| format!("reading connector properties: {err}"))?;
+        let (ids, _) = props.as_props_and_values();
+        let dpms = ids
+            .iter()
+            .find(|id| drm.get_property(**id).is_ok_and(|info| info.name().to_bytes() == b"DPMS"))
+            .copied()
+            .ok_or_else(|| "connector has no DPMS property".to_string())?;
+        // DRM_MODE_DPMS_ON = 0, DRM_MODE_DPMS_OFF = 3.
+        drm.set_property(surface.connector, dpms, if on { 0 } else { 3 })
+            .map_err(|err| format!("setting DPMS failed: {err}"))?;
+        tracing::debug!(output = output.name(), on, "DPMS written");
+        surface.powered = on;
+        if on {
+            // The screen lost its image; repaint from scratch.
+            surface.drm_output.reset_buffers();
+            surface.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn gamma_size(&mut self, output: &Output) -> Option<u32> {
+        let (drm, crtc) = self.crtc_of(output)?;
+        let (_, value) = crtc_property(drm, crtc, "GAMMA_LUT_SIZE")?;
+        u32::try_from(value).ok().filter(|&size| size > 1)
+    }
+
+    fn set_gamma(&mut self, output: &Output, ramp: Option<&[u16]>) -> Result<(), String> {
+        use smithay::reexports::drm::control::Device as ControlDevice;
+        use std::os::fd::AsFd;
+        let (drm, crtc) = self
+            .crtc_of(output)
+            .ok_or_else(|| "output is not a hardware output".to_string())?;
+        let (lut_prop, _) = crtc_property(drm, crtc, "GAMMA_LUT").ok_or_else(|| "no GAMMA_LUT property".to_string())?;
+        let (_, size) = crtc_property(drm, crtc, "GAMMA_LUT_SIZE").ok_or_else(|| "no GAMMA_LUT_SIZE".to_string())?;
+        let size = size as usize;
+        let value = match ramp {
+            None => 0, // no blob: the kernel restores the identity ramp
+            Some(ramp) => {
+                if ramp.len() != size * 3 {
+                    return Err(format!("expected {} ramp values, got {}", size * 3, ramp.len()));
+                }
+                // `struct drm_color_lut { u16 red, green, blue, reserved; }` per entry.
+                let mut blob = Vec::with_capacity(size * 8);
+                for i in 0..size {
+                    for channel in 0..3 {
+                        blob.extend_from_slice(&ramp[channel * size + i].to_ne_bytes());
+                    }
+                    blob.extend_from_slice(&0u16.to_ne_bytes());
+                }
+                drm_ffi::mode::create_property_blob(drm.as_fd(), &mut blob)
+                    .map_err(|err| format!("creating the LUT blob failed: {err}"))?
+                    .blob_id as u64
+            }
+        };
+        tracing::debug!(output = output.name(), size, reset = ramp.is_none(), "writing the gamma LUT");
+        drm.set_property(crtc, lut_prop, value)
+            .map_err(|err| format!("setting GAMMA_LUT failed: {err}"))
     }
 
     fn queue_redraw(&mut self) {
@@ -206,6 +453,41 @@ impl Backend for DrmData {
         dev.config_accel_set_speed(accel)
             .map(|_| ())
             .map_err(|err| format!("input: could not set accel on '{device}': {err:?}\n"))
+    }
+}
+
+/// The `(make, model)` from a connector's EDID property blob, if it has one.
+fn connector_make_model(drm: &DrmDevice, connector: &connector::Info) -> Option<(String, String)> {
+    use smithay::reexports::drm::control::Device as ControlDevice;
+    let props = drm.get_properties(connector.handle()).ok()?;
+    let (ids, values) = props.as_props_and_values();
+    for (id, value) in ids.iter().zip(values) {
+        let info = drm.get_property(*id).ok()?;
+        if info.name().to_bytes() == b"EDID" {
+            let blob = drm.get_property_blob(*value).ok()?;
+            return crate::edid::make_and_model(&blob);
+        }
+    }
+    None
+}
+
+/// A CRTC property's handle and current raw value, by name.
+fn crtc_property(drm: &DrmDevice, crtc: crtc::Handle, name: &str) -> Option<(smithay::reexports::drm::control::property::Handle, u64)> {
+    use smithay::reexports::drm::control::Device as ControlDevice;
+    let props = drm.get_properties(crtc).ok()?;
+    let (ids, values) = props.as_props_and_values();
+    ids.iter().zip(values).find_map(|(id, value)| {
+        let info = drm.get_property(*id).ok()?;
+        (info.name().to_bytes() == name.as_bytes()).then_some((*id, *value))
+    })
+}
+
+impl DrmData {
+    /// The DRM device and CRTC driving `output`.
+    fn crtc_of(&self, output: &Output) -> Option<(&DrmDevice, crtc::Handle)> {
+        let id = output.user_data().get::<UdevOutputId>()?;
+        let device = self.backends.get(&id.device_id)?;
+        Some((device.drm_output_manager.device(), id.crtc))
     }
 }
 
@@ -308,15 +590,21 @@ type DrmRenderElements<'a> = crate::render::OutputRenderElements<
     >>::RenderElement,
 >;
 
+/// What travels with each queued frame: the `wp_presentation` feedback its
+/// surfaces asked for, answered when the frame's vblank arrives.
+type FrameFeedback = Option<smithay::desktop::utils::OutputPresentationFeedback>;
+
 type GbmDrmOutputManager =
-    DrmOutputManager<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+    DrmOutputManager<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, FrameFeedback, DrmDeviceFd>;
 type GbmDrmOutput =
-    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, FrameFeedback, DrmDeviceFd>;
 
 /// Per-GPU-node state: every connector currently scanned into an
 /// `Output`/surface, and the machinery `device_added` set up to drive
 /// them.
 struct DrmDeviceData {
+    /// The GBM device, for allocating capture buffers.
+    gbm: GbmDevice<DrmDeviceFd>,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
     drm_output_manager: GbmDrmOutputManager,
     drm_scanner: DrmScanner,
@@ -329,6 +617,10 @@ struct DrmDeviceData {
 /// hotplug elsewhere can reorder/remove other monitors and shift plain
 /// indices) this connector was matched to.
 struct SurfaceData {
+    /// The connector this output scans out to (its `DPMS` property).
+    connector: connector::Handle,
+    /// Display powered on (`wlr-output-power-management`); while off nothing is rendered.
+    powered: bool,
     /// The primary-GPU-plus-copy route failed for this output at run time
     /// (`render_surface`): from now on it renders on its own GPU alone.
     /// Never set for outputs on the primary GPU.
@@ -488,6 +780,7 @@ impl State<DrmData> {
             smithay::reexports::drm::buffer::DrmFourcc::Abgr8888,
         ];
 
+        let gbm_for_captures = gbm.clone();
         let drm_output_manager = DrmOutputManager::new(
             drm,
             allocator,
@@ -500,6 +793,7 @@ impl State<DrmData> {
         self.backend_data.backends.insert(
             node,
             DrmDeviceData {
+                gbm: gbm_for_captures,
                 surfaces: HashMap::new(),
                 drm_output_manager,
                 drm_scanner: DrmScanner::new(),
@@ -587,13 +881,16 @@ impl State<DrmData> {
         let wl_mode = WlMode::from(drm_mode);
         let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
 
+        let (make, model) = connector_make_model(device.drm_output_manager.device(), &connector)
+            .unwrap_or_else(|| ("Unknown".into(), "Unknown".into()));
+        tracing::debug!(output_name, make, model, "monitor identity (EDID)");
         let output = Output::new(
             output_name.clone(),
             PhysicalProperties {
                 size: (phys_w as i32, phys_h as i32).into(),
                 subpixel: connector.subpixel().into(),
-                make: "Unknown".into(),
-                model: "Unknown".into(),
+                make,
+                model,
             },
         );
         output.create_global::<State<DrmData>>(&self.display_handle);
@@ -657,6 +954,8 @@ impl State<DrmData> {
             crtc,
             SurfaceData {
                 copy_route_failed: false,
+                connector: connector.handle(),
+                powered: true,
                 dirty: true,
                 frame_pending: false,
                 modes: connector.modes().to_vec(),
@@ -696,6 +995,7 @@ impl State<DrmData> {
                 })
                 .cloned();
             if let Some(output) = output {
+                crate::layers::close_all(&output);
                 self.space.unmap_output(&output);
             }
             self.adapter.hw.outputs.retain(|o| o.name != removed.name);
@@ -727,6 +1027,7 @@ impl State<DrmData> {
                 })
                 .cloned();
             if let Some(output) = output {
+                crate::layers::close_all(&output);
                 self.space.unmap_output(&output);
             }
         }
@@ -749,8 +1050,16 @@ impl State<DrmData> {
         &mut self,
         node: DrmNode,
         crtc: crtc::Handle,
-        _metadata: &mut Option<smithay::backend::drm::DrmEventMetadata>,
+        metadata: &mut Option<smithay::backend::drm::DrmEventMetadata>,
     ) {
+        let refresh = self
+            .space
+            .outputs()
+            .find(|o| o.user_data().get::<UdevOutputId>().is_some_and(|id| *id == UdevOutputId { device_id: node, crtc }))
+            .and_then(|o| o.current_mode())
+            .map(|mode| mode.refresh)
+            .filter(|&mhz| mhz > 0);
+        let now = self.clock.now();
         let Some(device) = self.backend_data.backends.get_mut(&node) else {
             return;
         };
@@ -759,8 +1068,24 @@ impl State<DrmData> {
         };
         tracing::debug!(?crtc, "vblank");
         surface.frame_pending = false;
-        if let Err(err) = surface.drm_output.frame_submitted() {
-            tracing::warn!(?crtc, "failed to mark a frame submitted: {err}");
+        match surface.drm_output.frame_submitted() {
+            Ok(Some(Some(mut feedback))) => {
+                // `wp_presentation`: the frame reached the screen. The
+                // clock is CLOCK_MONOTONIC; use the kernel's timestamp when
+                // it gave one in that clock, else "now".
+                let time: smithay::utils::Time<smithay::utils::Monotonic> = match metadata.map(|m| m.time) {
+                    Some(smithay::backend::drm::DrmEventTime::Monotonic(d)) => d.into(),
+                    _ => now,
+                };
+                let seq = metadata.map_or(0, |m| u64::from(m.sequence));
+                let refresh = smithay::wayland::presentation::Refresh::fixed(Duration::from_secs_f64(
+                    1000.0 / refresh.unwrap_or(60_000) as f64,
+                ));
+                use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+                feedback.presented::<_, smithay::utils::Monotonic>(time, refresh, seq, Kind::Vsync | Kind::HwClock | Kind::HwCompletion);
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(?crtc, "failed to mark a frame submitted: {err}"),
         }
     }
 
@@ -775,7 +1100,7 @@ impl State<DrmData> {
         let mut due = Vec::new();
         for (node, device) in &mut self.backend_data.backends {
             for (crtc, surface) in &mut device.surfaces {
-                if surface.dirty && !surface.frame_pending {
+                if surface.dirty && !surface.frame_pending && surface.powered {
                     surface.dirty = false;
                     due.push((*node, *crtc));
                 }
@@ -840,7 +1165,7 @@ impl State<DrmData> {
         let output_loc = self.space.output_geometry(&output).map_or_else(Default::default, |g| g.loc);
         let cursor = crate::cursor::cursor_elements(
             &mut renderer,
-            &self.backend_data.cursor_images,
+            &mut self.backend_data.cursor_images,
             &self.cursor_status,
             self.pointer.current_location() - output_loc.to_f64(),
             smithay::utils::Scale::from(output.current_scale().fractional_scale()),
@@ -860,6 +1185,7 @@ impl State<DrmData> {
         match render_result {
             Ok(result) => {
                 if !result.is_empty {
+                    self.protocols.screencopy.frames_rendered += 1;
                     // No fence can be handed to KMS (e.g. no explicit-sync
                     // support): the render must be finished before the
                     // buffer is scanned out, or a static frame stays
@@ -875,7 +1201,16 @@ impl State<DrmData> {
                         }
                     }
                     tracing::debug!(?crtc, "queueing a frame");
-                    match surface.drm_output.queue_frame(()) {
+                    // Feedback for every surface shown by this frame.
+                    let mut feedback = smithay::desktop::utils::OutputPresentationFeedback::new(&output);
+                    for window in self.space.elements() {
+                        window.take_presentation_feedback(
+                            &mut feedback,
+                            |_, _| Some(output.clone()),
+                            |_, _| smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                        );
+                    }
+                    match surface.drm_output.queue_frame(Some(feedback)) {
                         Ok(()) => surface.frame_pending = true,
                         Err(err) => tracing::warn!(?crtc, "failed to queue a frame: {err}"),
                     }
@@ -883,10 +1218,7 @@ impl State<DrmData> {
                 // Frame callbacks go out even for an empty frame: a client
                 // that committed without visible damage still waits on one
                 // to draw its next frame.
-                let now = self.start_time.elapsed();
-                for window in self.space.elements() {
-                    window.send_frame(&output, now, Some(Duration::from_secs(1)), |_, _| Some(output.clone()));
-                }
+                crate::extras::finish_frame(self, &output);
             }
             Err(err) => {
                 let hybrid = render_node_of(render_node) != render_node_of(self.backend_data.primary_gpu);
@@ -937,11 +1269,16 @@ impl State<DrmData> {
 /// different handling — everything else (keyboard, buttons, axis) is
 /// identical and reused as-is from `crate::input`.
 fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInputBackend>) {
-    // Any input may move the pointer, change focus or re-tile.
+    // Any input may move the pointer, change focus or re-tile — and is
+    // user activity for idle timers.
     state.backend_data.queue_redraw();
+    crate::protocols::notify_activity(state);
     match event {
         InputEvent::DeviceAdded { mut device } => {
             tracing::info!(name = device.name(), "input device added");
+            if device.has_capability(smithay::reexports::input::DeviceCapability::TabletTool) {
+                crate::devices::tablet_added(state, &device);
+            }
             if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard) {
                 if let Some(led_state) = state.seat.get_keyboard().map(|k| k.led_state()) {
                     device.led_update(led_state.into());
@@ -955,6 +1292,9 @@ fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInp
             }
         }
         InputEvent::DeviceRemoved { device } => {
+            if device.has_capability(smithay::reexports::input::DeviceCapability::TabletTool) {
+                crate::devices::tablet_removed(state, &device);
+            }
             state.backend_data.keyboards.retain(|d| d != &device);
             if state.backend_data.pointers.iter().any(|d| d == &device) {
                 state.backend_data.pointers.retain(|d| d != &device);
@@ -987,46 +1327,19 @@ fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInp
         }
         InputEvent::PointerMotion { event } => {
             use smithay::backend::input::PointerMotionEvent;
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            let bounds = state
-                .space
-                .outputs()
-                .next()
-                .and_then(|o| state.space.output_geometry(o))
-                .map(|geo| geo.to_f64())
-                .unwrap_or_else(|| smithay::utils::Rectangle::from_size((0.0, 0.0).into()));
-            let mut location = state.pointer.current_location() + event.delta();
-            location.x = location.x.clamp(bounds.loc.x, bounds.loc.x + bounds.size.w);
-            location.y = location.y.clamp(bounds.loc.y, bounds.loc.y + bounds.size.h);
-            let under = state.space.element_under(location).and_then(|(window, loc)| {
-                window
-                    .surface_under(location - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-                    .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-            });
-            let pointer = state.pointer.clone();
-            pointer.motion(
+            crate::constraints::relative_motion(
                 state,
-                under,
-                &smithay::input::pointer::MotionEvent {
-                    location,
-                    serial,
-                    time: smithay::backend::input::Event::time_msec(&event),
-                },
+                event.delta(),
+                event.delta_unaccel(),
+                event.time(),
+                smithay::backend::input::Event::time_msec(&event),
             );
-            pointer.relative_motion(
-                state,
-                None,
-                &smithay::input::pointer::RelativeMotionEvent {
-                    delta: event.delta(),
-                    delta_unaccel: event.delta_unaccel(),
-                    utime: event.time(),
-                },
-            );
-            pointer.frame(state);
         }
         InputEvent::PointerButton { event } => crate::input::on_pointer_button(state, event),
         InputEvent::PointerAxis { event } => crate::input::on_pointer_axis(state, event),
-        _ => {}
+        other => {
+            crate::devices::process::<LibinputInputBackend, DrmData>(state, other);
+        }
     }
 }
 
@@ -1344,6 +1657,8 @@ pub fn run() {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
     }
 
+    crate::state::export_session_env();
+    crate::xwayland::init(&mut state);
     crate::hotkeys::canonicalize_virtual_modifiers(&mut state);
     crate::ipc::init(&mut state);
     crate::bspwmrc::run();
@@ -1372,6 +1687,15 @@ pub fn run() {
         } else {
             state.space.refresh();
             state.popups.cleanup();
+            crate::protocols::refresh_idle_inhibit(&mut state);
+            crate::taskbar::sync(&mut state);
+            crate::workspaces::sync(&mut state);
+            crate::output_management::sync(&mut state);
+            crate::screencopy::fulfill(&mut state);
+            crate::ext_capture::fulfill(&mut state);
+            crate::export_dmabuf::fulfill(&mut state);
+            crate::extras::arm_commit_timers(&mut state);
+            crate::session_lock::poll(&mut state);
             state.render_dirty();
             let _ = display_handle.clone().flush_clients();
         }

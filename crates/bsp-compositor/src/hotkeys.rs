@@ -100,6 +100,13 @@ pub fn filter<Bd: Backend + 'static>(
     keysym: KeysymHandle<'_>,
     pressed: bool,
 ) -> FilterResult<()> {
+    // The focused client asked for shortcuts to be suspended
+    // (`zwp_keyboard_shortcuts_inhibit`): every key goes to it. The
+    // emergency quit key and VT switching are checked before this filter
+    // runs, so they still work.
+    if state.protocols.session_lock.locked || crate::protocols::shortcuts_inhibited(state) {
+        return FilterResult::Forward;
+    }
     let sym = keysym
         .raw_syms()
         .first()
@@ -353,6 +360,7 @@ fn run_inline<Bd: Backend + 'static>(state: &mut State<Bd>, tokens: &[String]) {
         Ok(command) => {
             let _ = crate::ipc::try_hotkeys_inline_bspc(state, &command)
                 .or_else(|| crate::pointer_action::try_config(state, &command))
+                .or_else(|| crate::xwayland::try_config(state, &command))
                 .unwrap_or_else(|| crate::ipc::execute_and_broadcast(state, &command));
         }
         Err(err) => {

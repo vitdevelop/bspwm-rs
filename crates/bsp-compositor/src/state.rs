@@ -47,15 +47,14 @@ pub trait Backend {
     /// Whether this backend's pointer motion events carry a real
     /// relative-motion delta (real hardware, via `libinput`) rather than
     /// only absolute positions (the nested winit backend). Declared for
-    /// interface parity with anvil's own `Backend` trait, matching what
-    /// a future gesture-forwarding pass would read; nothing in this
-    /// crate consults it yet (`crate::udev_backend`'s own doc comment:
-    /// gestures are one of this pass's deliberately out-of-scope items).
+    /// interface parity with anvil's own `Backend` trait; nothing in this
+    /// crate consults it (`crate::udev_backend` handles relative motion
+    /// itself).
     #[allow(dead_code)]
     const HAS_RELATIVE_MOTION: bool = false;
     /// Whether this backend's input can deliver gesture events (real
-    /// `libinput`, not the nested winit backend). Same status as
-    /// `HAS_RELATIVE_MOTION` above.
+    /// `libinput`, not the nested winit backend); `crate::devices`
+    /// forwards them. Same status as `HAS_RELATIVE_MOTION` above.
     #[allow(dead_code)]
     const HAS_GESTURES: bool = false;
 
@@ -79,6 +78,56 @@ pub trait Backend {
     /// Forwards the keyboard's LED state to real hardware — a no-op for
     /// the nested backend's virtual keyboard, which has no LEDs.
     fn update_led_state(&mut self, led_state: LedState);
+    /// Entries per channel of `output`'s hardware gamma LUT, if it has one
+    /// (`wlr-gamma-control`). The default (nested backend) has none.
+    fn gamma_size(&mut self, output: &smithay::output::Output) -> Option<u32> {
+        let _ = output;
+        None
+    }
+    /// Loads a gamma ramp (`3 * size` values: red, green, blue) into
+    /// `output`'s LUT, or with `None` restores the identity ramp.
+    fn set_gamma(&mut self, output: &smithay::output::Output, ramp: Option<&[u16]>) -> Result<(), String> {
+        let _ = (output, ramp);
+        Err("no hardware gamma LUT".to_string())
+    }
+    /// Whether `output`'s display is powered on, if the backend can tell
+    /// (`wlr-output-power-management`); `None` = no DPMS support.
+    fn output_power(&mut self, output: &smithay::output::Output) -> Option<bool> {
+        let _ = output;
+        None
+    }
+    /// Powers `output`'s display on or off (DPMS). The default refuses.
+    fn set_output_power(&mut self, output: &smithay::output::Output, on: bool) -> Result<(), String> {
+        let _ = (output, on);
+        Err("no display power control".to_string())
+    }
+    /// Renders `request.output` off-screen into memory (`wlr-screencopy`).
+    /// The default (nested backend) cannot.
+    fn capture_output(&mut self, request: crate::screencopy::CaptureRequest<'_>) -> Result<crate::screencopy::CapturedFrame, String> {
+        let _ = request;
+        Err("screen capture is not supported by this backend".to_string())
+    }
+    /// Which `linux-dmabuf` formats a capture can be rendered into, and
+    /// on which device; `None` = only shm capture (the default).
+    fn capture_dmabuf_caps(&mut self) -> Option<crate::screencopy::DmabufCaps> {
+        None
+    }
+    /// Like [`Backend::capture_output`], but rendered straight into a
+    /// client's dmabuf on the GPU.
+    fn capture_into_dmabuf(
+        &mut self,
+        request: crate::screencopy::CaptureRequest<'_>,
+        dmabuf: &mut smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), String> {
+        let _ = (request, dmabuf);
+        Err("dmabuf capture is not supported by this backend".to_string())
+    }
+    /// Allocates a buffer of `width`×`height` a capture can be rendered
+    /// into and handed to a client (`wlr-export-dmabuf`).
+    fn allocate_capture_buffer(&mut self, width: i32, height: i32) -> Result<smithay::backend::allocator::dmabuf::Dmabuf, String> {
+        let _ = (width, height);
+        Err("dmabuf capture is not supported by this backend".to_string())
+    }
     /// Something visible may have changed (a client committed, the
     /// pointer moved, a command re-tiled): the backend should render a
     /// new frame soon. The DRM backend renders on demand rather than
@@ -133,6 +182,9 @@ pub fn init_quit_signals<Bd: Backend + 'static>(state: &mut State<Bd>) {
 /// Per-client state Smithay asks every client to carry.
 #[derive(Default)]
 pub struct ClientState {
+    /// Connected through a `wp_security_context_v1` socket (a sandboxed
+    /// app): privileged protocols are hidden from it.
+    pub sandboxed: bool,
     /// Per-client compositor bookkeeping (required by `CompositorHandler`).
     pub compositor_state: CompositorClientState,
 }
@@ -178,6 +230,10 @@ pub struct State<Bd: Backend + 'static> {
     // Smithay protocol globals.
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
+    /// XWayland: display sockets, the running server and its window manager (`crate::xwayland`).
+    pub xwayland: crate::xwayland::XWaylandState,
+    /// the protocol globals (`crate::protocols`).
+    pub protocols: crate::protocols::Protocols<Bd>,
     /// `zwp_linux_dmabuf_v1` bookkeeping; its global is created by
     /// backends that can import dmabufs (`crate::udev_backend`).
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
@@ -241,6 +297,7 @@ impl<Bd: Backend + 'static> State<Bd> {
         wm: bsp_core::wm::Wm,
         hotkeys: Vec<bsp_hotkeys::config::LoadedHotkey>,
     ) -> Self {
+        let protocols = crate::protocols::Protocols::new(&display_handle, handle.clone());
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let mut seat_state = SeatState::new();
@@ -248,6 +305,7 @@ impl<Bd: Backend + 'static> State<Bd> {
 
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat0");
         let pointer = seat.add_pointer();
+        seat.add_touch();
         // Without a keyboard every keyboard path degrades to a no-op
         // (each looks the keyboard up and returns if absent).
         if let Err(err) = seat.add_keyboard(Default::default(), 200, 25) {
@@ -267,6 +325,8 @@ impl<Bd: Backend + 'static> State<Bd> {
             pending_toplevels: Vec::new(),
             compositor_state,
             shm_state,
+            protocols,
+            xwayland: crate::xwayland::XWaylandState::default(),
             dmabuf_state: smithay::wayland::dmabuf::DmabufState::new(),
             seat_state,
             xdg_shell_state,
@@ -315,6 +375,7 @@ impl<Bd: Backend + 'static> CompositorHandler for State<Bd> {
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) {
         crate::shell::on_commit(self, surface);
+        crate::layers::on_commit(self, surface);
         self.backend_data.early_import(surface);
         self.backend_data.queue_redraw();
     }
@@ -354,10 +415,32 @@ delegate_output!(@<Bd: Backend + 'static> State<Bd>);
 
 impl<Bd: Backend + 'static> SelectionHandler for State<Bd> {
     type SelectionUserData = ();
+
+    /// A Wayland client set the clipboard/primary selection: tell X11 clients.
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        self.selection_to_xwm(ty, source.map(|s| s.mime_types()));
+    }
+
+    /// A Wayland client wants an X11 client's selection contents.
+    fn send_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &Self::SelectionUserData,
+    ) {
+        self.selection_from_xwm(ty, mime_type, fd);
+    }
 }
 
 impl<Bd: Backend + 'static> SeatHandler for State<Bd> {
-    type KeyboardFocus = smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+    type KeyboardFocus = crate::focus::FocusTarget;
     type PointerFocus = smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
     type TouchFocus = smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
@@ -370,11 +453,51 @@ impl<Bd: Backend + 'static> SeatHandler for State<Bd> {
         self.backend_data.queue_redraw();
     }
 
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
+        use smithay::wayland::seat::WaylandFocus;
+        let surface = focused.and_then(|target| target.wl_surface()).map(|s| s.into_owned());
+        crate::protocols::keyboard_focus_changed(self, seat, surface.as_ref());
+        self.activate_x11_focus(surface.as_ref());
+    }
+
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
         self.backend_data.update_led_state(led_state);
     }
 }
 delegate_seat!(@<Bd: Backend + 'static> State<Bd>);
+
+/// Exports what desktop portals and session tooling look for, so programs
+/// started from `bspwmrc` inherit it: `XDG_CURRENT_DESKTOP=bspwm-rs` (how
+/// `xdg-desktop-portal` picks a portal backend — see
+/// `contrib/portals/bspwm-rs-portals.conf`) and `XDG_SESSION_TYPE=wayland`.
+/// Both are only set if the environment did not already say otherwise (a
+/// console login's `XDG_SESSION_TYPE=tty` counts as "unset").
+pub fn export_session_env() {
+    for (key, value) in [("XDG_CURRENT_DESKTOP", "bspwm-rs"), ("XDG_SESSION_TYPE", "wayland")] {
+        // A console login (logind) says `XDG_SESSION_TYPE=tty`, which is not
+        // what a Wayland compositor is: treat it like unset.
+        let unset = match std::env::var(key) {
+            Err(_) => true,
+            Ok(current) => key == "XDG_SESSION_TYPE" && current == "tty",
+        };
+        if unset {
+            // SAFETY: `set_var` is unsound only if another thread reads or
+            // writes the environment concurrently; this runs once at
+            // startup, before the event loop and before any child process
+            // (`bspwmrc`) or helper thread exists.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
+/// Whether `client` may use privileged protocols (screen capture, input
+/// injection, window lists, output configuration, session lock …): any
+/// client except one that came in through a security-context socket.
+pub fn is_privileged(client: &Client) -> bool {
+    !client.get_data::<ClientState>().is_some_and(|c| c.sandboxed)
+}
 
 /// Registers a new Wayland client connection with the display.
 pub fn insert_client(display_handle: &DisplayHandle, stream: std::os::unix::net::UnixStream) {

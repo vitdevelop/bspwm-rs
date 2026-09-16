@@ -15,7 +15,9 @@ use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRend
 use smithay::backend::renderer::element::surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ImportAll, ImportMem, Renderer, Texture};
-use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use std::collections::HashMap;
+
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::utils::{Logical, Point, Scale, Transform};
 use smithay::wayland::compositor::with_states;
 
@@ -29,17 +31,52 @@ smithay::backend::renderer::element::render_elements! {
     Surface = WaylandSurfaceRenderElement<R>,
 }
 
-/// The theme's default arrow, decoded once at startup.
-pub struct CursorImages {
+/// One decoded cursor image and where its hot spot is.
+struct Entry {
     buffer: MemoryRenderBuffer,
     hotspot: Point<i32, Logical>,
 }
 
+/// The xcursor theme's cursors, decoded on first use and cached per
+/// `CursorIcon` (`wp_cursor_shape` and `wl_pointer.set_cursor` both end up
+/// asking for a named cursor).
+pub struct CursorImages {
+    theme: xcursor::CursorTheme,
+    theme_name: String,
+    size: u32,
+    cache: HashMap<CursorIcon, Entry>,
+    /// The plain default arrow (or a square if the theme has none), used
+    /// for any name the theme lacks.
+    fallback: Entry,
+}
+
+fn load_entry(theme: &xcursor::CursorTheme, names: &[&str], size: u32) -> Option<Entry> {
+    names.iter().find_map(|name| {
+        let path = theme.load_icon(name)?;
+        let data = std::fs::read(path).ok()?;
+        let images = xcursor::parser::parse_xcursor(&data)?;
+        let image = images
+            .into_iter()
+            .min_by_key(|i| (i.size as i64 - size as i64).abs())?;
+        Some(Entry {
+            buffer: MemoryRenderBuffer::from_slice(
+                &image.pixels_rgba,
+                Fourcc::Abgr8888,
+                (image.width as i32, image.height as i32),
+                1,
+                Transform::Normal,
+                None,
+            ),
+            hotspot: (image.xhot as i32, image.yhot as i32).into(),
+        })
+    })
+}
+
 impl CursorImages {
-    /// Loads the default cursor from the xcursor theme named by
-    /// `XCURSOR_THEME` (else `default`) at `XCURSOR_SIZE` (else 24).
-    /// Falls back to a small solid square if no theme provides one, so
-    /// the pointer is always visible.
+    /// Opens the xcursor theme named by `XCURSOR_THEME` (else `default`)
+    /// at `XCURSOR_SIZE` (else 24) and decodes its default arrow. Falls
+    /// back to a small solid square if no theme provides one, so the
+    /// pointer is always visible.
     pub fn load() -> Self {
         let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
         let size = std::env::var("XCURSOR_SIZE")
@@ -47,35 +84,16 @@ impl CursorImages {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_SIZE);
         let theme = xcursor::CursorTheme::load(&theme_name);
-        let loaded = ["default", "left_ptr", "arrow"].iter().find_map(|name| {
-            let path = theme.load_icon(name)?;
-            let data = std::fs::read(path).ok()?;
-            let images = xcursor::parser::parse_xcursor(&data)?;
-            images
-                .into_iter()
-                .min_by_key(|i| (i.size as i64 - size as i64).abs())
-        });
-        match loaded {
-            Some(image) => {
-                tracing::info!(theme = theme_name, size = image.size, "loaded the default cursor");
-                Self {
-                    buffer: MemoryRenderBuffer::from_slice(
-                        &image.pixels_rgba,
-                        Fourcc::Abgr8888,
-                        (image.width as i32, image.height as i32),
-                        1,
-                        Transform::Normal,
-                        None,
-                    ),
-                    hotspot: (image.xhot as i32, image.yhot as i32).into(),
-                }
+        let fallback = match load_entry(&theme, &["default", "left_ptr", "arrow"], size) {
+            Some(entry) => {
+                tracing::info!(theme = theme_name, size, "loaded the default cursor");
+                entry
             }
             None => {
                 tracing::warn!(theme = theme_name, "no xcursor theme found; using a plain square cursor");
-                let pixels = vec![0xFFu8; 12 * 12 * 4];
-                Self {
+                Entry {
                     buffer: MemoryRenderBuffer::from_slice(
-                        &pixels,
+                        &[0xFFu8; 12 * 12 * 4],
                         Fourcc::Abgr8888,
                         (12, 12),
                         1,
@@ -85,7 +103,33 @@ impl CursorImages {
                     hotspot: (0, 0).into(),
                 }
             }
+        };
+        Self {
+            theme,
+            theme_name,
+            size,
+            cache: HashMap::new(),
+            fallback,
         }
+    }
+
+    /// The image for `icon`: the theme's cursor of that name (or one of
+    /// the icon's legacy alternative names), else the default arrow.
+    fn entry(&mut self, icon: CursorIcon) -> &Entry {
+        if !self.cache.contains_key(&icon) {
+            let mut names = vec![icon.name()];
+            names.extend_from_slice(icon.alt_names());
+            match load_entry(&self.theme, &names, self.size) {
+                Some(entry) => {
+                    self.cache.insert(icon, entry);
+                }
+                None => {
+                    tracing::debug!(theme = self.theme_name, icon = icon.name(), "theme has no such cursor; using the default arrow");
+                    return &self.fallback;
+                }
+            }
+        }
+        self.cache.get(&icon).unwrap_or(&self.fallback)
     }
 }
 
@@ -93,7 +137,7 @@ impl CursorImages {
 /// pointer position in that output's own logical coordinates.
 pub fn cursor_elements<R>(
     renderer: &mut R,
-    images: &CursorImages,
+    images: &mut CursorImages,
     status: &CursorImageStatus,
     location: Point<f64, Logical>,
     scale: Scale<f64>,
@@ -104,9 +148,10 @@ where
 {
     match status {
         CursorImageStatus::Hidden => Vec::new(),
-        CursorImageStatus::Named(_) => {
-            let at = (location - images.hotspot.to_f64()).to_physical(scale);
-            match MemoryRenderBufferRenderElement::from_buffer(renderer, at, &images.buffer, None, None, None, Kind::Cursor) {
+        CursorImageStatus::Named(icon) => {
+            let entry = images.entry(*icon);
+            let at = (location - entry.hotspot.to_f64()).to_physical(scale);
+            match MemoryRenderBufferRenderElement::from_buffer(renderer, at, &entry.buffer, None, None, None, Kind::Cursor) {
                 Ok(element) => vec![CursorElement::Named(element)],
                 Err(err) => {
                     tracing::warn!("failed to import the cursor: {err}");

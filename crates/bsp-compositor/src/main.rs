@@ -20,15 +20,37 @@
 // to one.
 mod adapter;
 mod bspwmrc;
+mod constraints;
 mod cursor;
+#[cfg(feature = "real")]
+mod devices;
+#[cfg(any(feature = "real", test))]
+mod edid;
+mod ext_capture;
+mod export_dmabuf;
+mod extras;
+mod focus;
+mod gamma;
 mod hardware;
 mod hotkeys;
 mod input;
+mod layers;
 mod ipc;
+mod output_management;
+mod output_power;
 mod pointer_action;
+mod protocols;
 mod render;
+mod screencopy;
+mod session_lock;
 mod shell;
 mod state;
+mod taskbar;
+mod tearing;
+mod toplevel_drag;
+mod virtual_pointer;
+mod workspaces;
+mod xwayland;
 #[cfg(feature = "real")]
 mod udev_backend;
 #[cfg(feature = "nested")]
@@ -49,6 +71,9 @@ compile_error!(
 );
 
 fn main() {
+    // Run as the lazy-start shim when invoked through the `Xwayland` symlink.
+    xwayland::run_shim_if_invoked();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("BSPWM_LOG")

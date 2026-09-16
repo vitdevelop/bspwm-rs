@@ -19,6 +19,7 @@ smithay = { version = "0.7", default-features = false, features = [
     "desktop",
     "renderer_gl",
     "renderer_pixman",
+    "xwayland",
 ] }
 # Not used directly — this only turns on calloop's own "signals" feature
 # (SIGUSR1 sxhkdrc reload, `docs/bsp-hotkeys.md`) for the version
@@ -28,6 +29,15 @@ smithay = { version = "0.7", default-features = false, features = [
 calloop = { version = "0.14", default-features = false, features = [
     "signals",
 ] }
+# Server-side bindings for the protocols Smithay does not implement itself
+#: the wlr family (foreign-toplevel-management, screencopy,
+# output-management, gamma-control, virtual-pointer) and the staging
+# `ext-workspace-v1`. Both use the same `wayland-server` as Smithay.
+wayland-protocols = { version = "0.32", features = ["server", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+# Reads a panel's `_NET_WM_STRUT_PARTIAL` from Xwayland (`crate::xwayland`); the
+# same version Smithay's own X11 window manager uses.
+x11rb = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xkbcommon = "0.8"
@@ -46,6 +56,22 @@ xcursor = "0.3"
 # `libdisplay-info` (0.3.0) is newer than that feature's own dependency
 # will accept (`< 0.3.0`) anyway, so enabling it would fail to build.
 smithay-drm-extras = { version = "0.1", optional = true, default-features = false }
+# Raw DRM ioctls the `drm` crate wraps too narrowly: creating a property
+# blob of runtime size (the gamma LUT, `crate::gamma`). Same version `drm` uses.
+drm-ffi = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# For `examples/protocol_probe.rs`, the tiny Wayland client used to
+# live-test protocols in the QEMU VM.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+rustix = { version = "1", features = ["fs", "time"] }
+
+[[example]]
+name = "capture_probe"
+required-features = ["real"]
 
 [features]
 default = ["nested"]
@@ -64,6 +90,7 @@ nested = ["smithay/backend_winit"]
 # already has one via `renderer_gl`).
 real = [
     "dep:smithay-drm-extras",
+    "dep:drm-ffi",
     "smithay/backend_session_libseat",
     "smithay/backend_udev",
     "smithay/backend_drm",

@@ -78,3 +78,7 @@ Chord parsing resolves keysym *names* via `xkbcommon::xkb::keysym_from_name` (sx
 | `dispatch::classify` | `fn(&str) -> Dispatch` | Classifies a command as an in-process `bspc` call (tokenized) or a shell command |
 | `config::load` | `fn(&str) -> Vec<LoadedHotkey>` | Loads every hotkey in a whole sxhkdrc file's contents |
 | `config::resolve_path` | `fn(Option<&str>, Option<&str>) -> Option<PathBuf>` | Resolves the sxhkdrc path from `XDG_CONFIG_HOME`/`HOME` |
+
+## Fuzzing
+
+`tests/fuzz.rs` (proptest) feeds sxhkdrc-shaped random text (brace groups, ranges, escapes, NULs, unicode) to `lexer::parse`, `expand::expand`, `config::load`, `dispatch::classify` and `binding::parse_chain`, asserting no panics. It found one: a NUL in a key name panicked inside `xkbcommon`, now an `UnknownName` error. A single huge range such as `{a-\u{10ffff}}` paired with a constant other side expands to about a million bindings, exactly as sxhkd would.

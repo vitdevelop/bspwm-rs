@@ -11,7 +11,7 @@ The pure-logic crate: it owns every piece of bspwm state and behavior and has no
 | `node` | Client data: `WindowId`, state (tiled, pseudo_tiled, floating, fullscreen), layer, urgent flag |
 | `tree` | Arena of nodes (`NodeId(u32)`), split type and ratio, first/second child, presel, receptacles; every tree operation; `apply_layout` |
 | `desktop` | Desktop name, layout (tiled or monocle), padding, window gap, the tree |
-| `monitor` | Monitor name, rectangle, padding, desktop list, focused desktop, `arrange`, `adapt_geometry` |
+| `monitor` | Monitor name, rectangle, padding, panel `struts` (compositor-owned reserved space, added to padding in `arrange`), desktop list, focused desktop, `arrange`, `adapt_geometry` |
 | `rules` | `bspc rule` entries matched on class, instance and name; `RuleConsequence` |
 | `settings` | Every `bspc config` key the tree engine reads, with bspwm's defaults |
 | `wm` | `Wm`: every monitor, the focused one, the global rule list and settings — bspwm's `mon_head`/`mon_tail`/`mon`/`rule_head` globals collected into one struct, for `bsp-ipc` to resolve selectors and run commands against |
@@ -122,6 +122,8 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Wm::reorder_monitor` | `fn(&mut self, usize) -> usize` | `src/monitor.c` `reorder_monitor()`; returns the monitor's index after reordering. |
 | `Wm::focused_monitor`/`focused_monitor_mut` | `fn(&self/&mut self) -> Option<&/&mut Monitor>` | The focused monitor, if any. |
 | `Wm::monitor_index` | `fn(&self, MonitorId) -> Option<usize>` | Finds a monitor's slot by id. |
+| `Wm::apply_ewmh_struts` | `fn(&mut self, &EwmhStruts, (i32, i32)) -> bool` | `src/ewmh.c` `ewmh_handle_struts()`: grows the padding of every monitor a panel's `_NET_WM_STRUT_PARTIAL` touches (max with the existing padding, offset for a negative one); `true` if any changed. |
+| `EwmhStruts::from_cardinals` | `fn(&[u32]) -> Option<EwmhStruts>` | The twelve `CARDINAL`s of `_NET_WM_STRUT_PARTIAL` in EWMH order. |
 
 ## Testing
 

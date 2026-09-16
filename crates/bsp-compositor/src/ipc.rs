@@ -159,6 +159,7 @@ fn on_readable<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot
         other => {
             let reply = try_hotkeys_inline_bspc(state, &other)
                 .or_else(|| crate::pointer_action::try_config(state, &other))
+                .or_else(|| crate::xwayland::try_config(state, &other))
                 .unwrap_or_else(|| execute_and_broadcast(state, &other));
             reply_and_close(slot, reply);
             PostAction::Remove
@@ -315,6 +316,9 @@ fn apply_hardware_changes<Bd: Backend + 'static>(
                 events,
             );
         }
+        // Panels are laid out against the output's size: re-arrange them
+        // and refresh the monitor's struts for the new geometry.
+        state.rearrange_layers(&output);
     }
 
     for (device, action) in inputs {
@@ -333,6 +337,23 @@ fn apply_hardware_changes<Bd: Backend + 'static>(
     }
 
     first_error.map_or(Ok(()), Err)
+}
+
+/// Applies the output/input changes queued in the hardware model right
+/// now, outside a `bspc` command: for protocols that reconfigure outputs
+/// (`wlr-output-management`). Broadcasts the resulting `bspc subscribe`
+/// events like a command would.
+pub(crate) fn apply_hardware_now<Bd: Backend + 'static>(state: &mut State<Bd>) -> Result<(), String> {
+    let mut events = Vec::new();
+    let result = apply_hardware_changes(state, &mut events);
+    crate::shell::sync_wayland_from_core(state);
+    for event in &events {
+        state.subscribers.broadcast_event(event);
+    }
+    let report = build_report(state);
+    state.subscribers.broadcast_report(&report);
+    state.backend_data.queue_redraw();
+    result
 }
 
 fn requests_restart(command: &Command) -> bool {

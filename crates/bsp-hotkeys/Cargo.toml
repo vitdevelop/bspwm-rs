@@ -11,3 +11,6 @@ repository.workspace = true
 # `Keymap` or `State` here; those need a live keyboard mapping, which is
 # `bsp-compositor`'s job (`docs/design.md` Architecture).
 xkbcommon = "0.8"
+
+[dev-dependencies]
+proptest = "1"

@@ -99,7 +99,33 @@ impl<Bd: Backend + 'static> XdgShellHandler for State<Bd> {
         })
         .unwrap_or_default();
         self.adapter.set_app_id(id, &app_id);
+        let title = toplevel_title(&surface);
+        self.toplevel_changed(id, &title, &app_id);
     }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self.window_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let Some(id) = self.adapter.id_of(&window) else {
+            return;
+        };
+        let app_id = self.adapter.class_of(id).0;
+        let title = toplevel_title(&surface);
+        self.toplevel_changed(id, &title, &app_id);
+    }
+}
+
+/// A toplevel's current title (empty if unset or unreadable).
+fn toplevel_title(surface: &ToplevelSurface) -> String {
+    with_states(surface.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok().map(|d| d.title.clone()))
+            .flatten()
+    })
+    .unwrap_or_default()
 }
 smithay::delegate_xdg_shell!(@<Bd: Backend + 'static> State<Bd>);
 
@@ -158,6 +184,45 @@ impl<Bd: Backend + 'static> State<Bd> {
 /// rather than an improvised default position (hard rule 7). Every window
 /// is managed unconditionally until that is decided.
 fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: ToplevelSurface) {
+    let (app_id, title, modal) = with_states(toplevel.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok())
+            .map(|d| (d.app_id.clone().unwrap_or_default(), d.title.clone().unwrap_or_default(), d.modal))
+            .unwrap_or_default()
+    });
+    // A modal dialog (`xdg_dialog_v1`) floats centred, like an X11 dialog
+    // (bspwm: `src/rule.c` `apply_rules()`, `_NET_WM_WINDOW_TYPE_DIALOG`).
+    let mut defaults = bsp_core::rules::RuleConsequence::default();
+    if modal {
+        defaults.state = Some(bsp_core::node::ClientState::Floating);
+        defaults.center = true;
+    }
+    // Native Wayland windows match `app_id` as both class and instance,
+    // and the surface title as name (`docs/design.md` Compatibility).
+    map_new_window(state, Window::new_wayland_window(toplevel), app_id.clone(), app_id, title, defaults);
+}
+
+/// Manages a new window of either kind (an `xdg_toplevel`, or an X11 window
+/// from XWayland — `crate::xwayland`): everything [`map_new_toplevel`]'s doc
+/// comment describes, given the window and the `class`/`instance`/`title`
+/// `bspc rule`s match on. Only the final size/state announcement to the
+/// client differs by kind.
+///
+/// `defaults` is what the window's own hints ask for (an X11 dialog wants to
+/// float centred, a dock wants no management); matched rules are merged on
+/// top of it, so a rule overrides a hint (bspwm: `src/rule.c` `apply_rules()`
+/// applies `_NET_WM_WINDOW_TYPE` first, then the rules).
+pub(crate) fn map_new_window<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    window: Window,
+    class: String,
+    instance: String,
+    title: String,
+    defaults: bsp_core::rules::RuleConsequence,
+) {
+    let app_id = class.clone();
     let Some(mi) = state.wm.focused_monitor else {
         tracing::warn!("no monitor to map a new window onto");
         return;
@@ -167,22 +232,20 @@ fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: Topl
         return;
     };
 
-    let (app_id, title) = with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .and_then(|data| data.lock().ok())
-            .map(|d| (d.app_id.clone().unwrap_or_default(), d.title.clone().unwrap_or_default()))
-            .unwrap_or_default()
-    });
-    // Native Wayland windows match `app_id` as both class and instance,
-    // and the surface title as name (`docs/design.md` Compatibility).
-    let consequence = bsp_core::rules::match_rules(&mut state.wm.rules, &app_id, &app_id, &title);
+    let mut consequence = defaults;
+    consequence.merge(&bsp_core::rules::match_rules(&mut state.wm.rules, &class, &instance, &title));
 
-    let window = Window::new_wayland_window(toplevel.clone());
+    // bspwm: `manage_window()`'s `!csq->manage` branch shows the window
+    // where it is, outside the tree. Only an X11 window has a position of
+    // its own to be shown at; an `xdg_toplevel` is managed regardless.
+    if !consequence.should_manage() && crate::xwayland::map_unmanaged(state, &window) {
+        return;
+    }
+
     window.on_commit();
     let window_id = state.adapter.insert(window.clone());
-    state.adapter.set_app_id(window_id, &app_id);
+    state.adapter.set_class(window_id, &class, &instance);
+    state.toplevel_mapped(window_id, &title, &app_id);
 
     let settings = state.wm.settings.clone();
     let desktop_id: DesktopId = state.wm.monitors[mi].desktops[di].id;
@@ -250,6 +313,17 @@ fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: Topl
         // at `Rect::default()` (0×0), which would collapse the window to
         // nothing the moment it is set floating (`bspc node -t floating`).
         client.floating_rectangle = client.tiled_rectangle;
+        // An X11 window does have a geometry of its own to start from, and
+        // bspwm uses it (`initialize_floating_rectangle()`): its size, at
+        // the position it asked for.
+        if let Some(geometry) = window.x11_surface().map(|x11| x11.geometry()).filter(|g| g.size.w > 0 && g.size.h > 0) {
+            client.floating_rectangle = bsp_core::geometry::Rect {
+                x: geometry.loc.x,
+                y: geometry.loc.y,
+                width: geometry.size.w,
+                height: geometry.size.h,
+            };
+        }
     }
 
     if let Some(cstate) = consequence.state {
@@ -264,6 +338,18 @@ fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: Topl
         tree.set_private(node, consequence.private.unwrap_or(false));
         tree.set_locked(node, consequence.locked.unwrap_or(false));
         tree.set_marked(node, consequence.marked.unwrap_or(false));
+    }
+    // bspwm: `manage_window()`'s `if (csq->center && is_floating(...))
+    // window_center()`: the floating rectangle centred in the monitor's
+    // rectangle (`src/window.c` `window_center()`).
+    if consequence.center {
+        let monitor_rect = state.wm.monitors[mi].rectangle;
+        if let Some(client) = state.wm.monitors[mi].desktops[di].tree.node_mut(node).client.as_mut() {
+            if !client.state.is_tiled() {
+                client.floating_rectangle.x = monitor_rect.x + (monitor_rect.width - client.floating_rectangle.width) / 2;
+                client.floating_rectangle.y = monitor_rect.y + (monitor_rect.height - client.floating_rectangle.height) / 2;
+            }
+        }
     }
     // A second `arrange()`: the first pass above may now be stale for
     // tiled siblings if `state`/`hidden` just made this node vacant
@@ -286,16 +372,26 @@ fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: Topl
         return;
     };
 
-    toplevel.with_pending_state(|s| {
-        s.size = Some(Size::from((rect.width.max(1), rect.height.max(1))));
-        if tiled {
-            s.states.set(xdg_toplevel::State::TiledLeft);
-            s.states.set(xdg_toplevel::State::TiledRight);
-            s.states.set(xdg_toplevel::State::TiledTop);
-            s.states.set(xdg_toplevel::State::TiledBottom);
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|s| {
+            s.size = Some(Size::from((rect.width.max(1), rect.height.max(1))));
+            if tiled {
+                s.states.set(xdg_toplevel::State::TiledLeft);
+                s.states.set(xdg_toplevel::State::TiledRight);
+                s.states.set(xdg_toplevel::State::TiledTop);
+                s.states.set(xdg_toplevel::State::TiledBottom);
+            }
+        });
+        toplevel.send_configure();
+    } else if let Some(x11) = window.x11_surface() {
+        let geometry = smithay::utils::Rectangle::new(
+            (rect.x, rect.y).into(),
+            (rect.width.max(1), rect.height.max(1)).into(),
+        );
+        if let Err(err) = x11.configure(geometry) {
+            tracing::warn!("failed to configure a new X11 window: {err}");
         }
-    });
-    toplevel.send_configure();
+    }
 
     state.space.map_element(window, (rect.x, rect.y), true);
 
@@ -319,6 +415,13 @@ fn unmap_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &Toplev
     let Some(window) = state.window_for_surface(surface.wl_surface()) else {
         return;
     };
+    unmap_window(state, &window);
+}
+
+/// Removes a window of either kind (see [`map_new_window`]) from the
+/// tree, the space and every mapping.
+pub(crate) fn unmap_window<Bd: Backend + 'static>(state: &mut State<Bd>, window: &Window) {
+    let window = window.clone();
     let Some(window_id) = state.adapter.id_of(&window) else {
         return;
     };
@@ -328,6 +431,7 @@ fn unmap_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &Toplev
 
     state.space.unmap_elem(&window);
     state.adapter.remove(window_id);
+    state.toplevel_unmapped(window_id);
 
     let settings = state.wm.settings.clone();
     let desktop_id = state.wm.monitors[mi].desktops[di].id;
@@ -400,12 +504,18 @@ pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
     // since applying each one needs `&mut state.space`/`&mut state.adapter`.
     let mut updates = Vec::new();
     for m in &state.wm.monitors {
-        for d in &m.desktops {
+        for (di, d) in m.desktops.iter().enumerate() {
+            // bspwm shows only a monitor's focused desktop
+            // (`src/desktop.c` `show_desktop()`/`hide_desktop()`): windows
+            // of every other desktop are unmapped, exactly like a hidden
+            // node (sticky nodes, which bspwm keeps visible across
+            // desktops, are not implemented in `bsp-core` yet).
+            let on_shown_desktop = m.focused == Some(di);
             let mut n = d.tree.first_extrema(d.tree.root);
             while let Some(id) = n {
                 let node = d.tree.node(id);
                 if let Some(client) = &node.client {
-                    updates.push((client.window, client.clone(), node.hidden));
+                    updates.push((client.window, client.clone(), node.hidden || !on_shown_desktop));
                 }
                 n = d.tree.next_leaf(Some(id), d.tree.root);
             }
@@ -424,6 +534,9 @@ pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
         }
         sync_one_window(state, &window, &client);
     }
+    crate::input::sync_keyboard_focus(state);
+    crate::protocols::update_fractional_scales(state);
+    state.raise_unmanaged_x11();
 }
 
 fn sync_one_window<Bd: Backend + 'static>(
@@ -449,6 +562,16 @@ fn sync_one_window<Bd: Backend + 'static>(
             toplevel.with_pending_state(|s| s.size = Some(target));
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_configure();
+            }
+        }
+    } else if let Some(x11) = window.x11_surface() {
+        let target = smithay::utils::Rectangle::new(
+            (rect.x, rect.y).into(),
+            (rect.width.max(1), rect.height.max(1)).into(),
+        );
+        if x11.geometry() != target {
+            if let Err(err) = x11.configure(target) {
+                tracing::debug!("cannot configure an X11 window: {err}");
             }
         }
     }

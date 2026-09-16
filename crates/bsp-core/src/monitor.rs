@@ -30,6 +30,12 @@ pub struct Monitor {
     pub rectangle: Rect,
     /// Padding around this monitor's usable area.
     pub padding: Padding,
+    /// Space reserved by panels (Wayland layer-shell exclusive zones,
+    /// `docs/design.md` Compatibility: bspwm's `_NET_WM_STRUT` analogue),
+    /// added to `padding` when laying out. Owned by the compositor, not
+    /// `bspc config` — so a configured padding and a panel's strut
+    /// never overwrite each other.
+    pub struts: Padding,
     /// Default gap between tiled windows for desktops on this monitor.
     pub window_gap: i32,
     /// Default border width for desktops on this monitor.
@@ -56,6 +62,7 @@ impl Monitor {
             name: name.unwrap_or(DEFAULT_MON_NAME).to_string(),
             rectangle,
             padding: settings.padding,
+            struts: Padding::default(),
             window_gap: settings.window_gap,
             border_width: settings.border_width,
             desktops: Vec::new(),
@@ -152,7 +159,12 @@ impl Monitor {
     /// bspwm: `src/tree.c` `arrange()`.
     pub fn arrange(&mut self, index: usize, settings: &Settings) {
         let m_rect = self.rectangle;
-        let m_padding = self.padding;
+        let m_padding = Padding {
+            top: self.padding.top + self.struts.top,
+            right: self.padding.right + self.struts.right,
+            bottom: self.padding.bottom + self.struts.bottom,
+            left: self.padding.left + self.struts.left,
+        };
         let d = &mut self.desktops[index];
 
         if d.tree.root.is_none() {
@@ -343,6 +355,27 @@ mod tests {
         // the full monitor minus that single gap on every edge.
         let gap = settings.window_gap;
         assert_eq!(r, Rect::new(gap, gap, 800 - gap, 600 - gap));
+    }
+
+    #[test]
+    fn arrange_reserves_panel_struts_on_top_of_padding() {
+        let settings = settings();
+        let mut m = Monitor::new(MonitorId(1), None, Rect::new(0, 0, 800, 600), &settings);
+        m.padding = Padding { top: 5, right: 0, bottom: 0, left: 0 };
+        // A 30 px top panel and a 40 px left dock.
+        m.struts = Padding { top: 30, right: 0, bottom: 0, left: 40 };
+        let mut d = Desktop::new(DesktopId(1), None, &settings);
+        let client = crate::node::Client::new(crate::id::WindowId(1), settings.border_width);
+        let n = d.tree.new_client_node(&settings, client);
+        d.tree.insert_node(&settings, n, None);
+        m.add_desktop(d);
+
+        m.arrange(0, &settings);
+
+        let root = m.desktops[0].tree.root.unwrap();
+        let r = m.desktops[0].tree.node(root).rect;
+        let gap = settings.window_gap;
+        assert_eq!(r, Rect::new(40 + gap, 35 + gap, 800 - 40 - gap, 600 - 35 - gap));
     }
 
     #[test]

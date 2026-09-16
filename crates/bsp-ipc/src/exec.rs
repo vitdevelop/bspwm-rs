@@ -1311,6 +1311,14 @@ fn exec_query<A: Adapter>(ctx: &mut ExecCtx<A>, q: &QueryCommand) -> Reply {
                         node: Some(id),
                         ..loc
                     };
+                    // bspwm: `src/query.c` `query_node_ids()` — `-n SEL`
+                    // resolves to one node and only that node is listed
+                    // (`bspc query -N -n focused` prints the focused
+                    // node's id, not every node).
+                    if q.node.is_some() && c != node_ref {
+                        n = t.next_leaf(Some(id), t.root);
+                        continue;
+                    }
                     out.push_str(&format!("0x{:08X}\n", wid(ctx, c)));
                     n = t.next_leaf(Some(id), t.root);
                 }
@@ -1674,9 +1682,13 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
         }
     };
 
+    // bspwm: `cmd_config()` leaves the desktop out of the coordinates for
+    // `-m`, so paddings and gaps land on the *monitor* (`SET_DEF_MON_DESK`),
+    // not on its focused desktop.
+    let monitor_level = matches!(c.target, ConfigTarget::Monitor(_));
     match &c.value {
-        Some(value) => set_setting(ctx, target, &c.name, value),
-        None => get_setting(ctx, target, &c.name),
+        Some(value) => set_setting(ctx, target, monitor_level, &c.name, value),
+        None => get_setting(ctx, target, monitor_level, &c.name),
     }
 }
 
@@ -1746,6 +1758,7 @@ fn exec_input<A: Adapter>(
 fn set_setting<A: Adapter>(
     ctx: &mut ExecCtx<A>,
     target: Option<Coordinates>,
+    monitor_level: bool,
     name: &str,
     value: &str,
 ) -> Reply {
@@ -1755,6 +1768,7 @@ fn set_setting<A: Adapter>(
                 return Reply::Fail(String::new());
             };
             match target {
+                Some(c) if monitor_level => ctx.wm.monitors[c.monitor].window_gap = v,
                 Some(c) => ctx.wm.monitors[c.monitor].desktops[c.desktop].window_gap = v,
                 None => {
                     ctx.wm.settings.window_gap = v;
@@ -1843,6 +1857,7 @@ fn set_setting<A: Adapter>(
                 _ => p.left = v,
             };
             match target {
+                Some(c) if monitor_level => apply(&mut ctx.wm.monitors[c.monitor].padding),
                 Some(c) if c.node.is_none() => {
                     apply(&mut ctx.wm.monitors[c.monitor].desktops[c.desktop].padding)
                 }
@@ -1889,11 +1904,12 @@ fn set_setting<A: Adapter>(
     Reply::Ok(String::new())
 }
 
-fn get_setting<A: Adapter>(ctx: &ExecCtx<A>, target: Option<Coordinates>, name: &str) -> Reply {
+fn get_setting<A: Adapter>(ctx: &ExecCtx<A>, target: Option<Coordinates>, monitor_level: bool, name: &str) -> Reply {
     let s = &ctx.wm.settings;
     let out = match name {
         "split_ratio" => format!("{}", s.split_ratio),
         "window_gap" => match target {
+            Some(c) if monitor_level => format!("{}", ctx.wm.monitors[c.monitor].window_gap),
             Some(c) => format!(
                 "{}",
                 ctx.wm.monitors[c.monitor].desktops[c.desktop].window_gap
@@ -1901,10 +1917,10 @@ fn get_setting<A: Adapter>(ctx: &ExecCtx<A>, target: Option<Coordinates>, name: 
             None => format!("{}", s.window_gap),
         },
         "border_width" => format!("{}", s.border_width),
-        "top_padding" => padding_get(ctx, target, |p| p.top),
-        "right_padding" => padding_get(ctx, target, |p| p.right),
-        "bottom_padding" => padding_get(ctx, target, |p| p.bottom),
-        "left_padding" => padding_get(ctx, target, |p| p.left),
+        "top_padding" => padding_get(ctx, target, monitor_level, |p| p.top),
+        "right_padding" => padding_get(ctx, target, monitor_level, |p| p.right),
+        "bottom_padding" => padding_get(ctx, target, monitor_level, |p| p.bottom),
+        "left_padding" => padding_get(ctx, target, monitor_level, |p| p.left),
         "top_monocle_padding" => format!("{}", s.monocle_padding.top),
         "right_monocle_padding" => format!("{}", s.monocle_padding.right),
         "bottom_monocle_padding" => format!("{}", s.monocle_padding.bottom),
@@ -1936,9 +1952,11 @@ fn bool_str(b: bool) -> String {
 fn padding_get<A: Adapter>(
     ctx: &ExecCtx<A>,
     target: Option<Coordinates>,
+    monitor_level: bool,
     get: impl Fn(&bsp_core::geometry::Padding) -> i32,
 ) -> String {
     match target {
+        Some(c) if monitor_level => format!("{}", get(&ctx.wm.monitors[c.monitor].padding)),
         Some(c) if c.node.is_none() => {
             format!(
                 "{}",
@@ -2400,6 +2418,21 @@ mod tests {
     }
 
     #[test]
+    fn query_nodes_with_a_node_selector_lists_only_that_node() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (all, _) = run(&mut wm, &mut registry, &mut adapter, "query -N");
+        let (one, _) = run(&mut wm, &mut registry, &mut adapter, "query -N -n focused");
+        match (all, one) {
+            (Reply::Ok(all), Reply::Ok(one)) => {
+                assert!(all.lines().count() >= 2);
+                assert_eq!(one.lines().count(), 1);
+                assert!(all.contains(one.trim()));
+            }
+            other => panic!("expected Ok replies, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn query_monitors_names() {
         let (mut wm, mut registry, mut adapter) = fixture();
         let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "query -M --names");
@@ -2492,6 +2525,24 @@ mod tests {
 
         let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "config window_gap");
         assert_eq!(reply, Reply::Ok("12\n".to_string()));
+    }
+
+    #[test]
+    fn config_padding_with_m_targets_the_monitor_and_with_d_the_desktop() {
+        // bspwm: `cmd_config()` leaves the desktop out of the coordinates for
+        // `-m`, so the padding lands on the monitor (`SET_DEF_MON_DESK`).
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "config -m HDMI-A-1 top_padding 30");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert_eq!(wm.monitors[1].padding.top, 30);
+        assert_eq!(wm.monitors[1].desktops[0].padding.top, 0);
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "config -m HDMI-A-1 top_padding");
+        assert_eq!(reply, Reply::Ok("30\n".to_string()));
+
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "config -d II left_padding 7");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert_eq!(wm.monitors[1].desktops[0].padding.left, 7);
+        assert_eq!(wm.monitors[1].padding.left, 0);
     }
 
     #[test]

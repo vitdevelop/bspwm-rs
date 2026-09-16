@@ -73,10 +73,23 @@ impl WindowAdapter {
             .map(|(id, _)| *id)
     }
 
-    /// Records a window's class/instance name (from the `xdg_toplevel`
-    /// `app_id`; native Wayland windows have no separate instance name,
-    /// so both are set to `app_id`, matching how XWayland windows keep
-    /// distinct class/instance — `docs/design.md`, Compatibility).
+    /// A window's `(class, instance)` as recorded by [`WindowAdapter::set_app_id`]
+    /// (empty strings if unknown).
+    pub fn class_of(&self, id: WindowId) -> (String, String) {
+        self.classes.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Records a window's class and instance names: an X11 window's
+    /// `WM_CLASS` pair, which `bspc rule` matches separately
+    /// (`docs/design.md`, Compatibility).
+    pub fn set_class(&mut self, id: WindowId, class: &str, instance: &str) {
+        self.classes
+            .insert(id, (class.to_string(), instance.to_string()));
+    }
+
+    /// Records a native Wayland window's class/instance name from its
+    /// `xdg_toplevel` `app_id`; there is no separate instance name, so both
+    /// are `app_id` (see [`WindowAdapter::set_class`] for X11 windows).
     pub fn set_app_id(&mut self, id: WindowId, app_id: &str) {
         self.classes
             .insert(id, (app_id.to_string(), app_id.to_string()));
@@ -98,6 +111,10 @@ impl bsp_ipc::adapter::Adapter for WindowAdapter {
         if let Some(w) = self.windows.get(&window) {
             if let Some(toplevel) = w.toplevel() {
                 toplevel.send_close();
+            } else if let Some(x11) = w.x11_surface() {
+                if let Err(err) = x11.close() {
+                    tracing::debug!("cannot close an X11 window: {err}");
+                }
             }
         }
     }

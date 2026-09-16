@@ -37,6 +37,7 @@ pub fn process_input_event<B: InputBackend, Bd: Backend + 'static>(
     event: InputEvent<B>,
     output: &Output,
 ) {
+    crate::protocols::notify_activity(state);
     match event {
         InputEvent::Keyboard { event } => {
             let keycode = event.key_code();
@@ -137,11 +138,7 @@ fn on_pointer_motion_absolute<B: InputBackend, Bd: Backend + 'static>(
     let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     let serial = SERIAL_COUNTER.next_serial();
 
-    let under = state.space.element_under(pos).and_then(|(window, loc)| {
-        window
-            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-            .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
-    });
+    let under = crate::layers::surface_under(state, pos);
     let pointer = state.pointer.clone();
     pointer.motion(
         state,
@@ -153,25 +150,46 @@ fn on_pointer_motion_absolute<B: InputBackend, Bd: Backend + 'static>(
         },
     );
     pointer.frame(state);
+    crate::toplevel_drag::follow(state);
 }
 
 pub(crate) fn on_pointer_button<B: InputBackend, Bd: Backend + 'static>(
     state: &mut State<Bd>,
     event: impl PointerButtonEvent<B>,
 ) {
+    deliver_button(
+        state,
+        event.button_code(),
+        wl_pointer::ButtonState::from(event.state()),
+        event.time_msec(),
+    );
+}
+
+/// A pointer button changed state, from whatever source (a real device,
+/// or `zwlr_virtual_pointer_v1`): click-to-focus and pointer bindings
+/// first, then the focused client.
+pub(crate) fn deliver_button<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    button: u32,
+    button_state: wl_pointer::ButtonState,
+    time: u32,
+) {
     let serial = SERIAL_COUNTER.next_serial();
-    let button = event.button_code();
-    let button_state = wl_pointer::ButtonState::from(event.state());
-    let time = event.time_msec();
+    let locked = state.protocols.session_lock.locked;
+    tracing::debug!(button, ?button_state, "pointer button");
 
     // `crate::pointer_action::on_button_press` covers both click-to-focus
     // and `pointer_modifier`-held drag bindings, and decides whether
     // this press should still reach the client afterward — see its own
     // doc comment for why a press matching neither is always forwarded
     // untouched, same as bspwm's un-grabbed default.
-    if button_state == wl_pointer::ButtonState::Pressed
-        && !crate::pointer_action::on_button_press(state, button, serial, time)
-    {
+    let pressed = button_state == wl_pointer::ButtonState::Pressed && !locked;
+    let on_layer = pressed
+        && state
+            .pointer
+            .current_focus()
+            .is_some_and(|surface| crate::layers::focus_on_click(state, &surface, serial));
+    if pressed && !on_layer && !crate::pointer_action::on_button_press(state, button, serial, time) {
         return;
     }
 
@@ -230,6 +248,74 @@ pub(crate) fn on_pointer_axis<B: InputBackend, Bd: Backend + 'static>(
     let pointer = state.pointer.clone();
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// Makes the seat's keyboard focus follow `bsp-core`'s focus after a
+/// command changed it (`bspc desktop -f`, `bspc node -f`, closing the
+/// focused window …): the focused desktop's focused node's window, or no
+/// focus at all if there is none. A layer surface holding keyboard focus
+/// (a launcher, a lock screen) is left alone.
+pub(crate) fn sync_keyboard_focus<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
+    let current = keyboard.current_focus();
+    if let Some(surface) = current.as_ref().and_then(|t| t.wl_surface()) {
+        if state.window_for_surface(&surface).is_none() {
+            // Not a tiled window: a layer surface (or something else) owns focus.
+            return;
+        }
+    }
+    if state.protocols.session_lock.locked {
+        // Locked: the lock surface owns the keyboard (set when it was made).
+        return;
+    }
+    let wanted = state
+        .wm
+        .focused_monitor
+        .and_then(|mi| state.wm.monitors.get(mi))
+        .and_then(|m| m.focused.and_then(|di| m.desktops.get(di)))
+        .and_then(|d| d.tree.focus.map(|f| d.tree.node(f)))
+        .filter(|node| !node.hidden)
+        .and_then(|node| node.client.as_ref())
+        .and_then(|client| state.adapter.window(client.window).cloned())
+        .and_then(|window| crate::focus::focus_target_of(&window));
+    if wanted != current {
+        tracing::debug!("keyboard focus follows the focused node");
+        keyboard.set_focus(state, wanted, SERIAL_COUNTER.next_serial());
+    }
+}
+
+/// Warps the pointer to `location` (global logical coordinates) and tells
+/// the surface under it — the motion half shared by absolute devices and
+/// `zwlr_virtual_pointer_v1` (real relative motion, which also sends
+/// `relative_motion`, has its own path in `crate::udev_backend`).
+pub(crate) fn pointer_motion_to<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    time: u32,
+) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let under = crate::layers::surface_under(state, location);
+    tracing::trace!(?location, has_surface = under.is_some(), "pointer_motion_to");
+    let pointer = state.pointer.clone();
+    pointer.motion(state, under, &MotionEvent { location, serial, time });
+    pointer.frame(state);
+    crate::constraints::update(state);
+    crate::toplevel_drag::follow(state);
+    state.backend_data.queue_redraw();
+}
+
+/// The bounding box of every output, in global logical coordinates (where
+/// the pointer may go).
+pub(crate) fn outputs_bounds<Bd: Backend + 'static>(state: &State<Bd>) -> smithay::utils::Rectangle<f64, smithay::utils::Logical> {
+    let mut bounds: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> = None;
+    for output in state.space.outputs() {
+        if let Some(geo) = state.space.output_geometry(output) {
+            bounds = Some(bounds.map_or(geo, |b| b.merge(geo)));
+        }
+    }
+    bounds.map_or_else(|| smithay::utils::Rectangle::from_size((0.0, 0.0).into()), |b| b.to_f64())
 }
 
 /// The window currently showing under `location`, resolved down to a
@@ -304,7 +390,7 @@ pub(crate) fn set_focus<Bd: Backend + 'static>(
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
     };
-    keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
+    keyboard.set_focus(state, crate::focus::focus_target_of(&window), serial);
 }
 
 /// Sets the seat's keyboard focus to `node`'s client surface (`bsp-core`'s
@@ -325,7 +411,7 @@ pub fn focus_node<Bd: Backend + 'static>(state: &mut State<Bd>, mi: usize, di: u
     let Some(keyboard) = state.seat.get_keyboard() else {
         return;
     };
-    keyboard.set_focus(state, window.wl_surface().map(|s| s.into_owned()), serial);
+    keyboard.set_focus(state, crate::focus::focus_target_of(&window), serial);
 }
 
 #[cfg(test)]

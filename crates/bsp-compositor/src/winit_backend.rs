@@ -207,6 +207,8 @@ pub fn run() {
     // resolves them
     // (`crate::hotkeys::canonicalize_virtual_modifiers`'s own doc
     // comment).
+    crate::state::export_session_env();
+    crate::xwayland::init(&mut state);
     crate::hotkeys::canonicalize_virtual_modifiers(&mut state);
     state
         .shm_state
@@ -292,12 +294,7 @@ pub fn run() {
                         tracing::warn!("failed to submit the frame: {err}");
                     }
                 }
-                let now = state.start_time.elapsed();
-                for window in state.space.elements() {
-                    window.send_frame(&output, now, Some(Duration::from_secs(1)), |_, _| {
-                        Some(output.clone())
-                    });
-                }
+                crate::extras::finish_frame(&mut state, &output);
             }
             Err(smithay::backend::SwapBuffersError::ContextLost(err)) => {
                 tracing::error!("critical rendering error: {err}");
@@ -313,6 +310,15 @@ pub fn run() {
             state.running = false;
         } else {
             state.space.refresh();
+            crate::protocols::refresh_idle_inhibit(&mut state);
+            crate::taskbar::sync(&mut state);
+            crate::workspaces::sync(&mut state);
+            crate::output_management::sync(&mut state);
+            crate::screencopy::fulfill(&mut state);
+            crate::ext_capture::fulfill(&mut state);
+            crate::export_dmabuf::fulfill(&mut state);
+            crate::extras::arm_commit_timers(&mut state);
+            crate::session_lock::poll(&mut state);
             state.popups.cleanup();
             let _ = display_handle.flush_clients();
         }
