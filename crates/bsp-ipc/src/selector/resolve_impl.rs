@@ -8,7 +8,7 @@
 //!
 //! Every descriptor and modifier that needs no history, pointer or EWMH-
 //! primary state is resolved here; the rest return
-//! [`super::ResolveError::Unsupported`] (`docs/bsp-ipc.md`, scope).
+//! [`super::ResolveError::Unsupported`] (`docs/bsp-ipc.md`, IPC scope).
 //! Search descriptors (`any`, `first_ancestor`, `biggest`, `smallest`, a
 //! direction, `next`/`prev`) apply modifiers *while* searching, as bspwm's
 //! own `find_*` functions do (each candidate is tested with
@@ -25,13 +25,14 @@ use super::{
 use crate::registry::NodeRegistry;
 use crate::value::CycleDir;
 use bsp_core::geometry::Rect;
+use bsp_core::history::Dir;
 use bsp_core::id::{DesktopId, NodeId};
 use bsp_core::tree::{Direction, Tree};
 use bsp_core::wm::Wm;
 
 /// bspwm default (`src/settings.c` `load_settings()`:
 /// `directional_focus_tightness = TIGHTNESS_HIGH`). Not yet a `bsp-core`
-/// setting (`docs/bsp-ipc.md`, scope), so directional resolution
+/// setting (`docs/bsp-ipc.md`, IPC scope), so directional resolution
 /// always behaves as bspwm's own default rather than a configurable one
 /// (the `on_dir_side` below implements only the `TIGHTNESS_HIGH` branch of
 /// bspwm's `src/geometry.c`).
@@ -85,6 +86,36 @@ impl<'a> Ctx<'a> {
                 node: None,
             })
         })
+    }
+
+    /// The coordinates a history entry names, if its monitor, desktop and
+    /// node all still exist.
+    pub(crate) fn coordinates_of(&self, loc: &bsp_core::history::Loc) -> Option<Coordinates> {
+        let monitor = self.wm.monitor_index(loc.monitor)?;
+        let desktop = self.wm.monitors[monitor].desktops.iter().position(|d| d.id == loc.desktop)?;
+        let node = match loc.node {
+            None => None,
+            Some(w) => {
+                let tree = &self.wm.monitors[monitor].desktops[desktop].tree;
+                let mut f = tree.first_extrema(tree.root);
+                let mut found = None;
+                while let Some(n) = f {
+                    if tree.node(n).client.as_ref().is_some_and(|c| c.window == w) {
+                        found = Some(n);
+                        break;
+                    }
+                    f = tree.next_leaf(Some(n), tree.root);
+                }
+                Some(found?)
+            }
+        };
+        Some(Coordinates { monitor, desktop, node })
+    }
+
+    /// The window of the client at `loc`'s node, if it has one.
+    pub(crate) fn window_at(&self, loc: Coordinates) -> Option<bsp_core::id::WindowId> {
+        let n = loc.node?;
+        self.tree(loc).node(n).client.as_ref().map(|c| c.window)
     }
 
     pub(crate) fn locate_desktop(&self, desktop: DesktopId) -> Option<(usize, usize)> {
@@ -142,14 +173,95 @@ fn resolve_node_descriptor(
             })
         }
         NodeDescriptor::Path(path) => resolve_path(ctx, reference, path),
-        NodeDescriptor::Last
-        | NodeDescriptor::Newest
-        | NodeDescriptor::Older
-        | NodeDescriptor::Newer => Err(ResolveError::Unsupported(
-            "focus history is not tracked yet",
-        )),
+        NodeDescriptor::Last => history_node(ctx, reference, modifiers, Some(Dir::Older)),
+        NodeDescriptor::Older => history_node(ctx, reference, modifiers, Some(Dir::Older)),
+        NodeDescriptor::Newer => history_node(ctx, reference, modifiers, Some(Dir::Newer)),
+        NodeDescriptor::Newest => history_node(ctx, reference, modifiers, None),
         NodeDescriptor::Pointed => Err(ResolveError::Unsupported("no pointer state yet")),
     }
+}
+
+/// `last`/`older`/`newer` (`dir` is `Some`) and `newest` (`None`) for nodes.
+///
+/// bspwm: `src/history.c` `history_find_node()` and
+/// `history_find_newest_node()`. A hidden node and the reference node itself
+/// are skipped by `older`/`newer`; `newest` skips only hidden ones.
+fn history_node(
+    ctx: Ctx,
+    reference: Coordinates,
+    modifiers: &NodeModifiers,
+    dir: Option<Dir>,
+) -> Result<Coordinates, ResolveError> {
+    let ref_window = ctx.window_at(reference);
+    let accepts = |l: &bsp_core::history::Loc| {
+        let Some(w) = l.node else { return false };
+        if dir.is_some() && Some(w) == ref_window {
+            return false;
+        }
+        let Some(c) = ctx.coordinates_of(l) else { return false };
+        let hidden = c.node.is_some_and(|n| ctx.tree(c).node(n).hidden);
+        !hidden && node_matches(ctx, c, reference, modifiers)
+    };
+    let found = match dir {
+        Some(d) => ctx.wm.history.find(d, accepts),
+        None => ctx.wm.history.find_newest(accepts),
+    };
+    found.and_then(|l| ctx.coordinates_of(&l)).ok_or(ResolveError::NoMatch)
+}
+
+/// `last`/`older`/`newer` and `newest` for desktops.
+///
+/// bspwm: `src/history.c` `history_find_desktop()` and
+/// `history_find_newest_desktop()`.
+fn history_desktop(
+    ctx: Ctx,
+    reference: Coordinates,
+    modifiers: &DesktopModifiers,
+    dir: Option<Dir>,
+) -> Result<Coordinates, ResolveError> {
+    let ref_desktop = ctx.wm.monitors[reference.monitor].desktops[reference.desktop].id;
+    let accepts = |l: &bsp_core::history::Loc| {
+        if dir.is_some() && l.desktop == ref_desktop {
+            return false;
+        }
+        ctx.coordinates_of(l)
+            .is_some_and(|c| desktop_matches(ctx, Coordinates { node: None, ..c }, reference, modifiers))
+    };
+    let found = match dir {
+        Some(d) => ctx.wm.history.find(d, accepts),
+        None => ctx.wm.history.find_newest(accepts),
+    };
+    found
+        .and_then(|l| ctx.coordinates_of(&l))
+        .map(|c| Coordinates { node: None, ..c })
+        .ok_or(ResolveError::NoMatch)
+}
+
+/// `last`/`older`/`newer` and `newest` for monitors.
+///
+/// bspwm: `src/history.c` `history_find_monitor()` and
+/// `history_find_newest_monitor()`.
+fn history_monitor(
+    ctx: Ctx,
+    reference: Coordinates,
+    modifiers: &MonitorModifiers,
+    dir: Option<Dir>,
+) -> Result<Coordinates, ResolveError> {
+    let ref_monitor = ctx.wm.monitors[reference.monitor].id;
+    let accepts = |l: &bsp_core::history::Loc| {
+        if dir.is_some() && l.monitor == ref_monitor {
+            return false;
+        }
+        ctx.coordinates_of(l).is_some_and(|c| monitor_matches(ctx, Coordinates { node: None, ..c }, modifiers))
+    };
+    let found = match dir {
+        Some(d) => ctx.wm.history.find(d, accepts),
+        None => ctx.wm.history.find_newest(accepts),
+    };
+    found
+        .and_then(|l| ctx.coordinates_of(&l))
+        .map(|c| at_focused_desktop(ctx, c.monitor))
+        .ok_or(ResolveError::NoMatch)
 }
 
 /// bspwm: `src/tree.c` `find_any_node()`: monitor list order, desktop list
@@ -216,7 +328,7 @@ fn find_first_ancestor(
 
 /// `biggest`/`smallest`: searched across every desktop, like `any`
 /// (bspwm's own scoping for these two is not in the sources read for this
-/// step; whole-`Wm` search keeps behavior consistent with `any`).
+/// work; whole-`Wm` search keeps behavior consistent with `any`).
 fn find_extremal(
     ctx: Ctx,
     modifiers: &NodeModifiers,
@@ -260,9 +372,9 @@ fn find_extremal(
 
 /// `next`/`prev`: depth-first in-order traversal within the reference
 /// node's own desktop tree, wrapping past either end. Traversal across
-/// desktop/monitor boundaries is not implemented (`docs/bsp-ipc.md`, Step
-/// 2 scope): bspwm's own `CYCLE_DIR` node traversal scope was not
-/// confirmed from source for this step, so this stays within one tree
+/// desktop/monitor boundaries is not implemented (`docs/bsp-ipc.md`, IPC
+/// scope): bspwm's own `CYCLE_DIR` node traversal scope was not
+/// confirmed from source yet, so this stays within one tree
 /// rather than guess.
 fn cycle_node(
     ctx: Ctx,
@@ -405,7 +517,7 @@ fn boundary_distance(r1: Rect, r2: Rect, dir: Direction) -> i64 {
 
 /// bspwm: `src/geometry.c` `on_dir_side()`, the `TIGHTNESS_HIGH` branch
 /// only — bspwm's default (`src/settings.c`) and, for now, the only mode
-/// this build implements (`docs/bsp-ipc.md`, scope: no
+/// this build implements (`docs/bsp-ipc.md`, IPC scope: no
 /// `directional_focus_tightness` setting yet).
 fn on_dir_side(r1: Rect, r2: Rect, dir: Direction) -> bool {
     let (r1_max_x, r1_max_y) = (r1.x + r1.width - 1, r1.y + r1.height - 1);
@@ -434,10 +546,9 @@ fn on_dir_side(r1: Rect, r2: Rect, dir: Direction) -> bool {
 }
 
 /// bspwm: `src/tree.c` `find_nearest_neighbor()`, restricted to each
-/// monitor's *focused* desktop, as bspwm itself does. The `history_rank`
-/// tie-break is not available yet (no focus history, `docs/bsp-ipc.md`
-/// scope); ties keep whichever candidate was found first in
-/// monitor/leaf order, which is deterministic but not bspwm-identical.
+/// monitor's *focused* desktop, as bspwm itself does. Candidates at the
+/// same distance are ordered by `history_rank` (more recently focused wins),
+/// then by whichever was found first.
 fn find_nearest_neighbor(
     ctx: Ctx,
     reference: Coordinates,
@@ -451,7 +562,7 @@ fn find_nearest_neighbor(
     let ref_desktop = &ctx.wm.monitors[reference.monitor].desktops[reference.desktop];
     let ref_rect = ref_tree.get_rectangle(ref_node, ref_desktop.window_gap, ref_desktop.layout);
 
-    let mut best: Option<(Coordinates, i64)> = None;
+    let mut best: Option<(Coordinates, i64, u32)> = None;
     for (mi, m) in ctx.wm.monitors.iter().enumerate() {
         let Some(di) = m.focused else { continue };
         let d = &m.desktops[di];
@@ -473,15 +584,16 @@ fn find_nearest_neighbor(
                 let r = d.tree.get_rectangle(n, d.window_gap, d.layout);
                 if on_dir_side(ref_rect, r, dir) {
                     let dist = boundary_distance(ref_rect, r, dir);
-                    if best.is_none_or(|(_, bd)| dist < bd) {
-                        best = Some((candidate, dist));
+                    let rank = ctx.window_at(candidate).map_or(u32::MAX, |w| ctx.wm.history.rank(w));
+                    if best.is_none_or(|(_, bd, br)| dist < bd || (dist == bd && rank < br)) {
+                        best = Some((candidate, dist, rank));
                     }
                 }
             }
             f = d.tree.next_leaf(Some(n), d.tree.root);
         }
     }
-    best.map(|(c, _)| c).ok_or(ResolveError::NoMatch)
+    best.map(|(c, _, _)| c).ok_or(ResolveError::NoMatch)
 }
 
 pub(crate) fn node_matches(
@@ -544,7 +656,7 @@ pub(crate) fn node_matches(
     }
     if m.same_class.is_some() {
         // No adapter-supplied window class/instance metadata yet
-        // (`docs/bsp-ipc.md`, scope): treat as never matching
+        // (`docs/bsp-ipc.md`, IPC scope): treat as never matching
         // rather than silently ignoring the constraint.
         return false;
     }
@@ -593,7 +705,7 @@ pub fn resolve_desktop(
         Some(r) => resolve_desktop(ctx, reference, r)?,
         None => reference,
     };
-    let candidate = resolve_desktop_descriptor(ctx, reference, &sel.descriptor)?;
+    let candidate = resolve_desktop_descriptor(ctx, reference, &sel.descriptor, &sel.modifiers)?;
     if desktop_matches(ctx, candidate, reference, &sel.modifiers) {
         Ok(candidate)
     } else {
@@ -605,6 +717,7 @@ fn resolve_desktop_descriptor(
     ctx: Ctx,
     reference: Coordinates,
     d: &DesktopDescriptor,
+    modifiers: &DesktopModifiers,
 ) -> Result<Coordinates, ResolveError> {
     match d {
         DesktopDescriptor::Focused => ctx.focused().ok_or(ResolveError::NoMatch),
@@ -661,12 +774,9 @@ fn resolve_desktop_descriptor(
             }
             Err(ResolveError::NoMatch)
         }
-        DesktopDescriptor::Last
-        | DesktopDescriptor::Newest
-        | DesktopDescriptor::Older
-        | DesktopDescriptor::Newer => Err(ResolveError::Unsupported(
-            "focus history is not tracked yet",
-        )),
+        DesktopDescriptor::Last | DesktopDescriptor::Older => history_desktop(ctx, reference, modifiers, Some(Dir::Older)),
+        DesktopDescriptor::Newer => history_desktop(ctx, reference, modifiers, Some(Dir::Newer)),
+        DesktopDescriptor::Newest => history_desktop(ctx, reference, modifiers, None),
     }
 }
 
@@ -740,7 +850,7 @@ pub fn resolve_monitor(
         Some(r) => resolve_monitor(ctx, reference, r)?,
         None => reference,
     };
-    let candidate = resolve_monitor_descriptor(ctx, reference, &sel.descriptor)?;
+    let candidate = resolve_monitor_descriptor(ctx, reference, &sel.descriptor, &sel.modifiers)?;
     if monitor_matches(ctx, candidate, &sel.modifiers) {
         Ok(candidate)
     } else {
@@ -760,6 +870,7 @@ fn resolve_monitor_descriptor(
     ctx: Ctx,
     reference: Coordinates,
     d: &MonitorDescriptor,
+    modifiers: &MonitorModifiers,
 ) -> Result<Coordinates, ResolveError> {
     match d {
         MonitorDescriptor::Focused => {
@@ -806,12 +917,9 @@ fn resolve_monitor_descriptor(
                 .ok_or(ResolveError::NoMatch)?;
             Ok(at_focused_desktop(ctx, idx))
         }
-        MonitorDescriptor::Last
-        | MonitorDescriptor::Newest
-        | MonitorDescriptor::Older
-        | MonitorDescriptor::Newer => Err(ResolveError::Unsupported(
-            "focus history is not tracked yet",
-        )),
+        MonitorDescriptor::Last | MonitorDescriptor::Older => history_monitor(ctx, reference, modifiers, Some(Dir::Older)),
+        MonitorDescriptor::Newer => history_monitor(ctx, reference, modifiers, Some(Dir::Newer)),
+        MonitorDescriptor::Newest => history_monitor(ctx, reference, modifiers, None),
         MonitorDescriptor::Pointed => Err(ResolveError::Unsupported("no pointer state yet")),
         MonitorDescriptor::Primary => {
             Err(ResolveError::Unsupported("no primary monitor concept yet"))

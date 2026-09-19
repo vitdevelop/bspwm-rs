@@ -14,7 +14,7 @@
 //! circulate, swap, transplant), desktops and monitors, and rule matching.
 //! Side effects bspwm performs alongside these — drawing borders, EWMH,
 //! the input focus, the stacking list, `subscribe` reports, history — need
-//! an adapter with a real display and are left to later steps; each
+//! an adapter with a real display and are left to later work; each
 //! function that leaves one out says so and names the bspwm function it
 //! mirrors.
 
@@ -23,6 +23,7 @@
 
 pub mod desktop;
 pub mod geometry;
+pub mod history;
 pub mod id;
 pub mod monitor;
 pub mod node;

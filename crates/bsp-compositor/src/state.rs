@@ -6,7 +6,7 @@
 //! xdg-shell, tiling through the core, focus, borders"): the compositor,
 //! shm, output, seat and xdg-shell globals only. Data-device (clipboard),
 //! xdg-decoration, layer-shell, presentation-time and every other
-//! protocol in `docs/bsp-compositor.md`'s module table are later steps
+//! protocol in `docs/bsp-compositor.md`'s module table are later work
 //! and not wired up yet — a client that needs one simply doesn't see that
 //! global advertised.
 
@@ -221,6 +221,9 @@ pub struct State<Bd: Backend + 'static> {
     pub space: Space<Window>,
     /// Popup (e.g. menu, tooltip) tracking.
     pub popups: PopupManager,
+    /// Popups that asked for a grab (`xdg_popup.grab`): a click outside them
+    /// dismisses them (`crate::shell::dismiss_grabbed_popups`).
+    pub grabbed_popups: Vec<smithay::wayland::shell::xdg::PopupSurface>,
     /// Toplevels whose role was just created but have not yet reached
     /// their first `commit` (`crate::shell::new_toplevel`/`on_commit`):
     /// rule matching needs `app_id`/`title`, which are only reliably set
@@ -232,7 +235,7 @@ pub struct State<Bd: Backend + 'static> {
     pub shm_state: ShmState,
     /// XWayland: display sockets, the running server and its window manager (`crate::xwayland`).
     pub xwayland: crate::xwayland::XWaylandState,
-    /// the protocol globals (`crate::protocols`).
+    /// The the protocols protocol globals (`crate::protocols`).
     pub protocols: crate::protocols::Protocols<Bd>,
     /// `zwp_linux_dmabuf_v1` bookkeeping; its global is created by
     /// backends that can import dmabufs (`crate::udev_backend`).
@@ -322,6 +325,7 @@ impl<Bd: Backend + 'static> State<Bd> {
             clock: Clock::new(),
             space: Space::default(),
             popups: PopupManager::default(),
+            grabbed_popups: Vec::new(),
             pending_toplevels: Vec::new(),
             compositor_state,
             shm_state,
@@ -449,6 +453,14 @@ impl<Bd: Backend + 'static> SeatHandler for State<Bd> {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        tracing::debug!(
+            image = match &image {
+                CursorImageStatus::Hidden => "hidden".to_string(),
+                CursorImageStatus::Named(icon) => format!("named {}", icon.name()),
+                CursorImageStatus::Surface(_) => "surface".to_string(),
+            },
+            "cursor image requested"
+        );
         self.cursor_status = image;
         self.backend_data.queue_redraw();
     }

@@ -41,7 +41,7 @@ fn resolve_path(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<Pat
 ///
 /// bspwm: `src/settings.c` `run_config()`. `run_level` is always `"0"`
 /// here (bspwm's own default): this build has neither `--load-state`
-/// nor an externally-provided socket fd (`docs/bsp-ipc.md`'s the IPC
+/// nor an externally-provided socket fd (`docs/bsp-ipc.md`'s The IPC
 /// progress) to set its two bits.
 pub fn run() {
     let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
@@ -50,8 +50,13 @@ pub fn run() {
         tracing::warn!("no XDG_CONFIG_HOME/HOME: bspwmrc disabled");
         return;
     };
-    match std::process::Command::new(&path).arg("0").spawn() {
-        Ok(_child) => tracing::info!(path = %path.display(), "ran bspwmrc"),
+    let mut rc = std::process::Command::new(&path);
+    rc.arg("0");
+    match crate::spawn::clean_signal_mask(&mut rc).spawn() {
+        Ok(child) => {
+            crate::hotkeys::reap(child);
+            tracing::info!(path = %path.display(), "ran bspwmrc");
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(path = %path.display(), "no bspwmrc found");
         }

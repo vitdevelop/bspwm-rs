@@ -1,4 +1,4 @@
-//! Property-based fuzzing of the sxhkdrc parser (design.md, hardening):
+//! Property-based fuzzing of the sxhkdrc parser (design.md, The hardening):
 //! arbitrary file contents must never panic, and brace expansion must
 //! stay bounded.
 

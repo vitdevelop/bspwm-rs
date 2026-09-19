@@ -65,6 +65,13 @@ impl WindowAdapter {
         self.windows.get(&id)
     }
 
+    /// The mapped window showing `surface`, hidden desktops included (the
+    /// space only holds the windows of shown desktops).
+    pub fn window_of_surface(&self, surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface) -> Option<Window> {
+        use smithay::wayland::seat::WaylandFocus;
+        self.windows.values().find(|w| w.wl_surface().as_deref() == Some(surface)).cloned()
+    }
+
     /// The `WindowId` for a Smithay `Window`, if it is mapped.
     pub fn id_of(&self, window: &Window) -> Option<WindowId> {
         self.windows

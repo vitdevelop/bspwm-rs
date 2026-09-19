@@ -9,7 +9,7 @@
 //! selector against live state ([`resolve_node`]/[`resolve_desktop`]/
 //! [`resolve_monitor`]) covers the structural subset
 //! that needs no pointer, EWMH-primary or focus-history state — none of
-//! which exist yet (`docs/bsp-ipc.md`, scope). A selector that
+//! which exist yet (`docs/bsp-ipc.md`, IPC scope). A selector that
 //! parses but names an unsupported descriptor or modifier resolves to
 //! [`ResolveError::Unsupported`].
 
@@ -550,7 +550,7 @@ pub enum ResolveError {
     NoMatch,
     /// The selector names a descriptor or modifier that needs state this
     /// build does not track yet (focus history, the pointer, or the X11
-    /// "primary monitor" concept) — see `docs/bsp-ipc.md`, scope.
+    /// "primary monitor" concept) — see `docs/bsp-ipc.md`, IPC scope.
     Unsupported(&'static str),
 }
 

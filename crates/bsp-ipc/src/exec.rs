@@ -39,6 +39,16 @@ pub struct ExecCtx<'a, A: Adapter> {
 /// Executes `cmd`. Panics if given `Command::Subscribe` or `Command::Quit`
 /// — see this module's doc comment.
 pub fn execute<A: Adapter>(ctx: &mut ExecCtx<A>, cmd: &Command) -> (Reply, Vec<Event>) {
+    // Focus may have changed since the last command (a click, a new window):
+    // record it first, so `last`/`older` see it, and again for what this
+    // command itself changes.
+    ctx.wm.sync_history();
+    let result = execute_inner(ctx, cmd);
+    ctx.wm.sync_history();
+    result
+}
+
+fn execute_inner<A: Adapter>(ctx: &mut ExecCtx<A>, cmd: &Command) -> (Reply, Vec<Event>) {
     match cmd {
         Command::Node { selector, actions } => exec_node(ctx, selector.as_ref(), actions),
         Command::Desktop { selector, actions } => exec_desktop(ctx, selector.as_ref(), actions),
@@ -752,6 +762,12 @@ impl ReplyExt for Reply {
 }
 
 fn do_focus<A: Adapter>(ctx: &mut ExecCtx<A>, dst: Coordinates, events: &mut Vec<Event>) {
+    // A desktop or monitor selector names no node: the desktop's own focused
+    // node stays (bspwm: `focus_node(m, d, d->focus)`).
+    let dst = Coordinates {
+        node: dst.node.or(tree(ctx.wm, dst).focus),
+        ..dst
+    };
     do_activate(ctx, dst, events);
     let monitor_changed = ctx.wm.focused_monitor != Some(dst.monitor);
     // The effectively-focused desktop changes either because a different
@@ -847,7 +863,7 @@ fn do_transfer<A: Adapter>(
 
 /// `-s`/`--swap`. Same-tree swaps use `Tree::swap_nodes` directly;
 /// cross-desktop/monitor swaps are not implemented yet (see
-/// `docs/bsp-ipc.md`, scope — bspwm's cross-tree swap relies on
+/// `docs/bsp-ipc.md`, IPC scope — bspwm's cross-tree swap relies on
 /// node identity surviving a tree change, which `bsp-core`'s per-tree
 /// `NodeId` does not, and reproducing it via two transplants would need
 /// `insert_node`'s exact-slot-replacement semantics, not its anchor-based
@@ -1549,10 +1565,9 @@ fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Ve
                 let report = build_report(ctx.wm);
                 return (Reply::Ok(report.to_string()), events);
             }
-            WmAction::RecordHistory(_) => {
-                // No-op: no focus history is tracked yet (`docs/bsp-ipc.md`,
-                // scope). Accepted rather than rejected, since it
-                // has no wrong effect to produce.
+            WmAction::RecordHistory(on) => {
+                // bspwm: `src/messages.c` `cmd_wm()`'s `-h`.
+                ctx.wm.history.record = *on;
             }
             WmAction::Restart => {
                 // Performing the actual restart (a compositor-only side
@@ -1692,7 +1707,7 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
     }
 }
 
-// ======================= output/input =======================
+// ======================= output/input (hardware backend) =======================
 
 /// `bspc output` — see `Command::Output`. Every case defers entirely to
 /// `Adapter`'s output methods, which default to "no known outputs"/
@@ -1840,6 +1855,18 @@ fn set_setting<A: Adapter>(
                 None => return Reply::Fail(format!("config: {name}: Invalid value: '{value}'.\n")),
             };
         }
+        "normal_border_color" | "active_border_color" | "focused_border_color" | "presel_feedback_color" => {
+            if !bsp_core::settings::is_hex_color(value) {
+                return Reply::Fail(format!("config: {name}: Invalid value: '{value}'.\n"));
+            }
+            let slot = match name {
+                "normal_border_color" => &mut ctx.wm.settings.normal_border_color,
+                "active_border_color" => &mut ctx.wm.settings.active_border_color,
+                "focused_border_color" => &mut ctx.wm.settings.focused_border_color,
+                _ => &mut ctx.wm.settings.presel_feedback_color,
+            };
+            *slot = value.to_string();
+        }
         "center_pseudo_tiled" => {
             ctx.wm.settings.center_pseudo_tiled = match crate::value::parse_bool(value) {
                 Some(b) => b,
@@ -1940,6 +1967,10 @@ fn get_setting<A: Adapter>(ctx: &ExecCtx<A>, target: Option<Coordinates>, monito
         "single_monocle" => bool_str(s.single_monocle),
         "borderless_singleton" => bool_str(s.borderless_singleton),
         "center_pseudo_tiled" => bool_str(s.center_pseudo_tiled),
+        "normal_border_color" => s.normal_border_color.clone(),
+        "active_border_color" => s.active_border_color.clone(),
+        "focused_border_color" => s.focused_border_color.clone(),
+        "presel_feedback_color" => s.presel_feedback_color.clone(),
         _ => return Reply::Fail(format!("config: Unknown setting: '{name}'.\n")),
     };
     Reply::Ok(format!("{out}\n"))
@@ -2354,7 +2385,7 @@ mod tests {
         // FakeAdapter never overrides `Adapter::output_names`, so this
         // exercises the trait's own default ("no known outputs") —
         // exactly what the nested winit backend gets until a real DRM
-        // backend overrides it.
+        // backend overrides it (hardware backend).
         let (mut wm, mut registry, mut adapter) = fixture();
         let (reply, events) = run(&mut wm, &mut registry, &mut adapter, "output");
         assert_eq!(reply, Reply::Ok(String::new()));
@@ -2493,7 +2524,7 @@ mod tests {
     fn wm_restart_succeeds_with_no_events() {
         // `bsp_ipc` itself never restarts anything — that's
         // `bsp-compositor`'s job, inspecting the original `Command`
-        // (`docs/bsp-compositor.md` Hotkeys progress) — this only checks
+        // (`docs/bsp-compositor.md` Hotkeys and config progress) — this only checks
         // that the action itself is accepted and produces no `Event`s to
         // broadcast.
         let (mut wm, mut registry, mut adapter) = fixture();
@@ -2543,6 +2574,76 @@ mod tests {
         assert_eq!(reply, Reply::Ok(String::new()));
         assert_eq!(wm.monitors[1].desktops[0].padding.left, 7);
         assert_eq!(wm.monitors[1].padding.left, 0);
+    }
+
+    #[test]
+    fn config_border_colors_are_validated_and_round_trip() {
+        // bspwm: `cmd_config()`'s `SET_COLOR`/`GET_COLOR`, `is_hex_color()`.
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "config focused_border_color");
+        assert_eq!(reply, Reply::Ok("#817f7f\n".to_string()));
+        for name in ["normal_border_color", "active_border_color", "focused_border_color", "presel_feedback_color"] {
+            let (reply, _) = run(&mut wm, &mut registry, &mut adapter, &format!("config {name} #93A1a1"));
+            assert_eq!(reply, Reply::Ok(String::new()), "{name}");
+            let (reply, _) = run(&mut wm, &mut registry, &mut adapter, &format!("config {name}"));
+            assert_eq!(reply, Reply::Ok("#93A1a1\n".to_string()), "{name}");
+            let (reply, _) = run(&mut wm, &mut registry, &mut adapter, &format!("config {name} 93a1a1"));
+            assert!(matches!(reply, Reply::Fail(_)), "{name}");
+        }
+        assert_eq!(wm.settings.normal_border_color, "#93A1a1");
+    }
+
+    #[test]
+    fn desktop_focus_keeps_the_desktops_focused_node() {
+        // bspwm: `cmd_desktop()`'s `-f` is `focus_node(m, d, d->focus)`; it used
+        // to clear the node focus, so coming back to a desktop focused its first window.
+        let (mut wm, mut registry, mut adapter) = fixture();
+        run(&mut wm, &mut registry, &mut adapter, "node -f east");
+        let before = wm.monitors[0].desktops[0].tree.focus;
+        assert!(before.is_some());
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "desktop -f focused");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert_eq!(wm.monitors[0].desktops[0].tree.focus, before);
+    }
+
+    #[test]
+    fn focus_history_drives_last_older_newer_and_newest() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let focus = |wm: &Wm| wm.monitors[0].desktops[0].tree.focus;
+        let left = focus(&wm);
+        run(&mut wm, &mut registry, &mut adapter, "node -f east");
+        let right = focus(&wm);
+        assert_ne!(left, right);
+
+        // `last` goes back to the previously focused node, and again.
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "node -f last");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        assert_eq!(focus(&wm), left);
+        run(&mut wm, &mut registry, &mut adapter, "node -f last");
+        assert_eq!(focus(&wm), right);
+
+        // `newest` is the most recently focused node, `older` the one before it.
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "query -N -n newest");
+        assert!(matches!(reply, Reply::Ok(ref s) if !s.is_empty()), "{reply:?}");
+
+        // desktops: focus the other monitor's desktop, then go `last` back
+        run(&mut wm, &mut registry, &mut adapter, "monitor -f HDMI-A-1");
+        assert_eq!(wm.focused_monitor, Some(1));
+        run(&mut wm, &mut registry, &mut adapter, "monitor -f last");
+        assert_eq!(wm.focused_monitor, Some(0));
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "wm -d");
+        assert!(matches!(&reply, Reply::Ok(s) if s.contains("\"focusHistory\":[{")), "{reply:?}");
+    }
+
+    #[test]
+    fn wm_record_history_off_stops_recording() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        run(&mut wm, &mut registry, &mut adapter, "wm -h off");
+        assert!(!wm.history.record);
+        run(&mut wm, &mut registry, &mut adapter, "node -f east");
+        assert!(wm.history.locations().all(|l| l.node != wm.monitors[0].desktops[0].tree.focus.and_then(|f| wm.monitors[0].desktops[0].tree.node(f).client.as_ref().map(|c| c.window))));
+        run(&mut wm, &mut registry, &mut adapter, "wm -h on");
+        assert!(wm.history.record);
     }
 
     #[test]

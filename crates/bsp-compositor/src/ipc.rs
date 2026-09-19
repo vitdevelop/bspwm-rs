@@ -142,7 +142,7 @@ fn on_readable<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot
         Command::Quit(_status) => {
             // The exit status argument is not threaded through to the
             // process's own exit code yet (`docs/bsp-compositor.md`,
-            // scope) — stopping the main loop is what matters for
+            // Nested compositor scope) — stopping the main loop is what matters for
             // a nested development backend.
             state.running = false;
             reply_and_close(slot, Reply::Ok(String::new()));
@@ -263,6 +263,22 @@ pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>
 /// `bspc monitor -g` takes); keyboard repeat on the seat, pointer accel
 /// on the backend's libinput device. Returns the first failure's message
 /// (later changes are still attempted).
+/// The Wayland transform for `t`.
+fn wl_transform(t: bsp_ipc::command::OutputTransform) -> smithay::utils::Transform {
+    use bsp_ipc::command::OutputTransform as T;
+    use smithay::utils::Transform;
+    match t {
+        T::Normal => Transform::Normal,
+        T::Rotate90 => Transform::_90,
+        T::Rotate180 => Transform::_180,
+        T::Rotate270 => Transform::_270,
+        T::Flipped => Transform::Flipped,
+        T::Flipped90 => Transform::Flipped90,
+        T::Flipped180 => Transform::Flipped180,
+        T::Flipped270 => Transform::Flipped270,
+    }
+}
+
 fn apply_hardware_changes<Bd: Backend + 'static>(
     state: &mut State<Bd>,
     events: &mut Vec<bsp_ipc::report::Event>,
@@ -292,6 +308,12 @@ fn apply_hardware_changes<Bd: Backend + 'static>(
             OutputAction::SetPosition(x, y) => {
                 output.change_current_state(None, None, None, Some((x, y).into()));
                 state.space.map_output(&output, (x, y));
+            }
+            OutputAction::SetTransform(transform) => {
+                output.change_current_state(None, Some(wl_transform(transform)), None, None);
+                // The frame is drawn rotated from now on: everything is stale.
+                state.backend_data.reset_buffers(&output);
+                state.backend_data.queue_redraw();
             }
         }
         // Mode and scale change the output's logical size; a moved output

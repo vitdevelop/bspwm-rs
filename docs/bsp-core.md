@@ -13,13 +13,14 @@ The pure-logic crate: it owns every piece of bspwm state and behavior and has no
 | `desktop` | Desktop name, layout (tiled or monocle), padding, window gap, the tree |
 | `monitor` | Monitor name, rectangle, padding, panel `struts` (compositor-owned reserved space, added to padding in `arrange`), desktop list, focused desktop, `arrange`, `adapt_geometry` |
 | `rules` | `bspc rule` entries matched on class, instance and name; `RuleConsequence` |
-| `settings` | Every `bspc config` key the tree engine reads, with bspwm's defaults |
-| `wm` | `Wm`: every monitor, the focused one, the global rule list and settings — bspwm's `mon_head`/`mon_tail`/`mon`/`rule_head` globals collected into one struct, for `bsp-ipc` to resolve selectors and run commands against |
+| `settings` | Every `bspc config` key the tree engine reads, with bspwm's defaults, including the four `*_color` settings |
+| `history` | Focus history: `History`, `Loc`, `Dir`; a port of bspwm's `history.c` list operations |
+| `wm` | `Wm`: every monitor, the focused one, the global rule list and settings — bspwm's `mon_head`/`mon_tail`/`mon`/`rule_head` globals collected into one struct, for `bsp-ipc` (IPC) to resolve selectors and run commands against |
 | `event` / `effect` (planned) | `Event` enum, `Effect` enum tying `bsp-core` to an adapter — not started; needs the nested compositor's compositor layer to have a shape worth committing to |
 
-## scope
+## Core scope
 
-Every function below is pure: it takes and mutates plain data and returns plain values, with no I/O. bspwm interleaves these structural operations with side effects that need a real display — drawing borders, EWMH, the input focus, the stacking list, `subscribe` reports, history. Those are left out; each function's doc comment says so and names the bspwm function it mirrors, so nothing was dropped silently. They land once `bsp-compositor` or `bsp-ipc` has an adapter to receive them.
+Every function below is pure: it takes and mutates plain data and returns plain values, with no I/O. bspwm interleaves these structural operations with side effects that need a real display — drawing borders, EWMH, the input focus, the stacking list, `subscribe` reports, history. Those are left out; each function's doc comment says so and names the bspwm function it mirrors, so nothing was dropped silently. They land once `bsp-compositor` (nested compositor) or `bsp-ipc` (IPC) has an adapter to receive them.
 
 Two structural simplifications, not bspwm behavior differences (so not entered in `docs/design.md`'s Deliberate deviations table — nothing here is user-visible or permanent):
 
@@ -95,7 +96,7 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Tree::get_handle` | `fn(&self, NodeId, (i32, i32), PointerAction) -> ResizeHandle` | `src/pointer.c` `get_handle()`. |
 | `Tree::move_floating` (**move**) | `fn(&mut self, NodeId, i32, i32) -> bool` | `src/window.c` `move_client()` (floating-rectangle translation only; see doc comment). |
 | `Tree::resize_node` (**resize**) | `fn(&mut self, NodeId, ResizeHandle, i32, i32, bool) -> bool` | `src/window.c` `resize_client()`. |
-| `Tree::swap_nodes` (**swap**) | `fn(&mut self, NodeId, NodeId) -> bool` | `src/tree.c` `swap_nodes()`, single-tree (see scope). |
+| `Tree::swap_nodes` (**swap**) | `fn(&mut self, NodeId, NodeId) -> bool` | `src/tree.c` `swap_nodes()`, single-tree (see Core scope). |
 | `Tree::transplant_to`/`transplant_within` (**transplant**) | `fn(&mut self, &Settings, NodeId, ..) -> NodeId`/`bool` | `src/tree.c` `transfer_node()` (minus focus/history/EWMH/`single_monocle`). |
 | `Tree::circulate_leaves` | `fn(&mut self, &Settings, Option<NodeId>, CirculateDir)` | `src/tree.c` `circulate_leaves()` (minus refocus). |
 | `Tree::apply_layout` | `fn(&mut self, Option<NodeId>, Rect, i32, Layout, Rect)` | `src/tree.c` `apply_layout()` (geometry only; see doc comment). |
@@ -128,3 +129,21 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 ## Testing
 
 Unit tests per operation (`crates/bsp-core/src/*.rs`, `#[cfg(test)] mod tests`), plus property tests (`crates/bsp-core/tests/property.rs`) that run random operation sequences and check: every leaf maps to one window, ratios stay in `[0, 1]`, no window is lost, and rectangles tile the desktop without overlap.
+
+## Focus history
+
+`history::History` is bspwm's `history.c`: a list from the oldest to the newest focus, where an entry stays `latest` until a newer entry names the same node (or, for an empty desktop, the same desktop), and a focus that lands on a monitor or desktop other than the focused one is inserted next to its own desktop's entries. Entries name a node by its client's `WindowId` (a tree slot is reused and changes when a node moves between trees). bspwm records from inside `focus_node()`, `activate_node()` and the unlink/transfer functions; focus is written directly in several crates here, so `Wm::sync_history()` observes the result instead and records what changed. Call it after every command and once per event-loop turn; two focus changes inside one call are recorded as one entry.
+
+| Function | Signature | Notes |
+| --- | --- | --- |
+| `Wm::sync_history` | `fn(&mut self)` | Adds the focus changes since the last call (`history_add()`), drops entries whose window, desktop or monitor is gone or moved (`history_remove()`) |
+| `History::add` | `fn(&mut self, Loc, focused: bool)` | `src/history.c` `history_add()`; does nothing while `record` is false |
+| `History::remove_matching` | `fn(&mut self, impl Fn(&Loc) -> bool)` | `history_remove()`, including collapsing the duplicates a removal leaves |
+| `History::find` | `fn(&self, Dir, impl Fn(&Loc) -> bool) -> Option<Loc>` | `history_find_node()`/`_desktop()`/`_monitor()`; the needle only moves while recording is off |
+| `History::find_newest` | `fn(&self, impl Fn(&Loc) -> bool) -> Option<Loc>` | `history_find_newest_*()` |
+| `History::last_node` / `last_desktop` / `last_monitor` | see `history.rs` | `history_last_*()` |
+| `History::rank` | `fn(&self, WindowId) -> u32` | `history_rank()`, the tie-break of directional focus |
+| `Wm::refocus_after_removal` | `fn(&mut self, monitor: usize, desktop: usize)` | Gives a desktop whose focused node was removed the most recently focused remaining window, else its first leaf; the compositor calls it after every unmap |
+| `History::locations` | `fn(&self) -> impl Iterator<Item = Loc>` | Oldest first, for `wm -d` |
+
+Settings gained `normal_border_color` (`#30302f`), `active_border_color` (`#474645`), `focused_border_color` (`#817f7f`) and `presel_feedback_color` (`#f4d775`), plus `settings::is_hex_color` and `parse_hex_color` (`src/helpers.c` `is_hex_color()`).

@@ -120,6 +120,7 @@ pub fn filter<Bd: Backend + 'static>(
         modifiers: resolve_modifiers(mods),
         pressed,
     };
+    tracing::trace!(?sym, modifiers = ?event.modifiers, pressed, "hotkey filter");
     match state.hotkey_matcher.feed(&event) {
         Outcome::Pass => FilterResult::Forward,
         Outcome::Continue => FilterResult::Intercept(()),
@@ -133,7 +134,7 @@ pub fn filter<Bd: Backend + 'static>(
 /// Maps Smithay's `ModifiersState` (the seat's live, resolved keyboard
 /// modifier state) to the symbolic set `bsp-hotkeys`' `Chord`s compare
 /// against — the live-held half of full modifier coverage
-/// (`docs/design.md`'s hotkeys row); [`canonicalize_virtual_modifiers`]
+/// (`docs/design.md`'s Hotkeys and config row); [`canonicalize_virtual_modifiers`]
 /// below is the other half.
 ///
 /// Only ever populates the eight *real* X11/xkb modifiers (`Shift`/
@@ -374,17 +375,19 @@ fn run_inline<Bd: Backend + 'static>(state: &mut State<Bd>, tokens: &[String]) {
 /// dance those use to fully detach from the parent — `std::process::
 /// Command::spawn` already returns without waiting, which is enough to
 /// not block the compositor; the child is simply left to `wait(2)` for
-/// itself. Not implemented: reaping the child when it exits (it becomes
-/// a zombie until this process exits or happens to check on it), a
-/// known simplification rather than adding `SIGCHLD`-ignoring `unsafe`
-/// FFI for this first pass.
+/// itself; a helper thread waits on it so it never stays a zombie.
+/// Waits for `child` on a helper thread so it is reaped when it exits.
+pub fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 fn run_shell(command: &str) {
-    match std::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .spawn()
-    {
-        Ok(_child) => {}
+    let mut sh = std::process::Command::new("sh");
+    sh.arg("-c").arg(command);
+    match crate::spawn::clean_signal_mask(&mut sh).spawn() {
+        Ok(child) => reap(child),
         Err(err) => tracing::warn!(command, "failed to spawn hotkey command: {err}"),
     }
 }

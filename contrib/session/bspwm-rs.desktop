@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=bspwm-rs
+Comment=A Wayland compositor that behaves like bspwm
+Exec=systemd-cat -t bspwm-rs bspwm-rs-session
+TryExec=bspwm-rs-session
+Type=Application
+DesktopNames=bspwm-rs

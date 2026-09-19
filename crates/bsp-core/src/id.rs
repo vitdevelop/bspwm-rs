@@ -12,7 +12,7 @@
 //! - [`WindowId`] names one client window for the lifetime of that client;
 //!   chosen by the adapter, never reused.
 //! - [`DesktopId`] and [`MonitorId`] name a desktop or monitor for as long
-//!   as it exists, for `bsp-ipc` to reference in queries.
+//!   as it exists, for `bsp-ipc` (IPC) to reference in queries.
 
 use core::fmt;
 
@@ -29,7 +29,7 @@ impl NodeId {
 /// Identifier of a client window, chosen by the adapter.
 ///
 /// bspwm prints window ids in hex (`0x00C00003`); that formatting is
-/// `bsp-ipc`'s job. Native Wayland windows get ids from a range
+/// `bsp-ipc`'s job (IPC). Native Wayland windows get ids from a range
 /// XWayland never uses (see `docs/design.md`, Compatibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u32);

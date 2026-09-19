@@ -1,6 +1,6 @@
 [package]
 name = "bsp-hotkeys"
-description = "Bundled sxhkdrc-compatible parser and chord matcher."
+description = "Bundled sxhkdrc-compatible parser and chord matcher (hotkeys and config)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

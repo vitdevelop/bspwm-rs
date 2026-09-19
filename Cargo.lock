@@ -148,6 +148,7 @@ dependencies = [
  "bsp-ipc",
  "calloop 0.14.4",
  "drm-ffi",
+ "libc",
  "rustix 1.1.5",
  "smithay",
  "smithay-drm-extras",

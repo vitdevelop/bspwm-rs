@@ -648,7 +648,7 @@ impl From<bsp_core::tree::Presel> for JsonPresel {
 
 /// bspwm: `src/query.c` `query_client()`. `className`/`instanceName` are
 /// supplied by the caller (the adapter's window metadata, `bsp-core` does
-/// not store them — see `docs/bsp-ipc.md`, scope).
+/// not store them — see `docs/bsp-ipc.md`, IPC scope).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JsonClient {
     #[serde(rename = "className")]
@@ -724,7 +724,7 @@ impl JsonNode {
     /// its wire-stable id (the executor looks this up in
     /// `crate::registry::NodeRegistry`); `client_names` supplies a leaf's
     /// class/instance name, which `bsp-core` does not store (the
-    /// adapter's window metadata, `docs/bsp-ipc.md` scope).
+    /// adapter's window metadata, `docs/bsp-ipc.md` IPC scope).
     pub fn from_tree(
         tree: &bsp_core::tree::Tree,
         desktop: bsp_core::id::DesktopId,
@@ -860,7 +860,7 @@ impl JsonMonitor {
 /// (present only when a primary monitor is set) and `eventSubscribers`
 /// (present only with active `subscribe` connections) are left out: this
 /// build tracks neither a primary monitor nor a queryable subscriber list
-/// yet (`docs/bsp-ipc.md`, scope).
+/// yet (`docs/bsp-ipc.md`, IPC scope).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JsonState {
     #[serde(rename = "focusedMonitorId")]
@@ -878,8 +878,8 @@ impl JsonState {
     /// Builds the JSON shape for `wm -d`. `focused_monitor_id` is `0` if
     /// no monitor is focused (bspwm never reaches this state — `mon` is
     /// always valid once a monitor exists — but an empty `Wm` can appear
-    /// in tests). `focusHistory`/`stackingList` are always empty (see this
-    /// struct's own doc comment).
+    /// in tests). `focusHistory` lists `wm.history` oldest first;
+    /// `stackingList` is always empty (see this struct's own doc comment).
     pub fn new(
         wm: &bsp_core::wm::Wm,
         clients_count: i32,
@@ -894,7 +894,29 @@ impl JsonState {
                 .iter()
                 .map(|m| JsonMonitor::from_monitor(m, node_id, client_names))
                 .collect(),
-            focus_history: Vec::new(),
+            focus_history: wm
+                .history
+                .locations()
+                .map(|l| {
+                    let node = wm
+                        .monitors
+                        .iter()
+                        .flat_map(|m| m.desktops.iter())
+                        .find(|d| d.id == l.desktop)
+                        .and_then(|d| {
+                            let mut f = d.tree.first_extrema(d.tree.root);
+                            while let Some(n) = f {
+                                if d.tree.node(n).client.as_ref().is_some_and(|c| Some(c.window) == l.node) {
+                                    return Some(node_id(d.id, n));
+                                }
+                                f = d.tree.next_leaf(Some(n), d.tree.root);
+                            }
+                            None
+                        })
+                        .unwrap_or(0);
+                    serde_json::json!({"monitorId": l.monitor.0, "desktopId": l.desktop.0, "nodeId": node})
+                })
+                .collect(),
             stacking_list: Vec::new(),
         }
     }

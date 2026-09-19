@@ -581,6 +581,7 @@ fn main() {
     let mut exit_after: Option<u64> = None;
     let (mut modal, mut want_fifo, mut want_timing, mut want_bell, mut want_export, mut want_drag) = (false, false, false, false, false, false);
     let (mut want_gestures, mut want_tablet) = (false, false);
+    let mut want_fullscreen = false;
     let (mut alpha, mut tag, mut icon): (Option<u32>, Option<String>, Option<String>) = (None, None, None);
     START.with(|_| ());
     while let Some(arg) = args.next() {
@@ -603,6 +604,7 @@ fn main() {
             "--lock-pointer" => want_lock = true,
             "--exit-after" => exit_after = args.next().and_then(|v| v.parse().ok()),
             "--modal" => modal = true,
+            "--fullscreen" => want_fullscreen = true,
             "--alpha" => alpha = args.next().and_then(|v| v.parse().ok()),
             "--fifo" => want_fifo = true,
             "--commit-timing" => want_timing = true,
@@ -690,6 +692,9 @@ fn main() {
     }
     toplevel.set_title(title.clone());
     toplevel.set_app_id(title.clone());
+    if want_fullscreen {
+        toplevel.set_fullscreen(None);
+    }
     if modal {
         match &app.dialog {
             Some(manager) => {

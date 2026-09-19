@@ -6,7 +6,7 @@
 //! it only ever produces a [`RuleConsequence`], not a mutated window.
 //! Applying that consequence to a real window (inserting a tree node,
 //! configuring a `Window`) needs an adapter, so it belongs to
-//! `bsp-compositor`; `_apply_class`/`_apply_hints`/the
+//! `bsp-compositor` (nested compositor); `_apply_class`/`_apply_hints`/the
 //! `external_rules_command` hook (populating `class`/`instance`/`title`
 //! from the window itself before matching) belong there too.
 
@@ -98,7 +98,7 @@ pub fn match_rules(
 ///
 /// bspwm: `src/types.h` `rule_consequence_t`. `monitor_desc`/
 /// `desktop_desc`/`node_desc` (raw selector strings) and `honor_size_hints`
-/// are left for `bsp-ipc`, which owns selector parsing;
+/// are left for `bsp-ipc` (IPC), which owns selector parsing;
 /// `manage`/`focus`/`border`/`center`/`follow` (all plain bools in bspwm)
 /// are included since they need no parsing.
 ///

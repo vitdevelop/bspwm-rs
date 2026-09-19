@@ -21,7 +21,7 @@ const DEFAULT_MON_NAME: &str = "MONITOR";
 /// (RandR bookkeeping) are left for the hardware backend.
 #[derive(Debug, Clone)]
 pub struct Monitor {
-    /// Stable identifier for `bsp-ipc` to reference.
+    /// Stable identifier for `bsp-ipc` (IPC) to reference.
     pub id: MonitorId,
     /// Display name; on real hardware, the DRM connector name
     /// (`docs/design.md`, Compatibility).

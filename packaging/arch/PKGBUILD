@@ -1,0 +1,82 @@
+# Maintainer: vitdevelop
+#
+# Builds bspwm-rs from the working tree this file lives in (not from a git
+# clone), so uncommitted changes are packaged too:
+#
+#   cd packaging/arch && makepkg -si
+#
+pkgname=bspwm-rs-git
+pkgver=0.1.0.r19.g6e944cd
+pkgrel=1
+pkgdesc='A Wayland compositor that behaves like bspwm (Rust, Smithay)'
+arch=(x86_64)
+license=(BSD-2-Clause)
+depends=(libinput libxkbcommon seatd systemd-libs libdrm mesa pixman wayland)
+makedepends=(cargo git)
+optdepends=(
+  'xorg-xwayland: run X11 applications'
+  'waybar: the bar used by the default session config'
+  'rofi: launcher used by the default hotkeys'
+  'alacritty: terminal used by the default hotkeys'
+  'swaybg: wallpaper'
+  'kanshi: output profiles'
+  'gammastep: night light'
+  'dunst: notifications'
+  'cliphist: clipboard history'
+  'wl-clipboard: clipboard commands'
+  'grim: screenshots'
+  'slurp: screenshot region selection'
+  'swaylock: screen lock'
+  'brightnessctl: display brightness keys'
+  'playerctl: media keys'
+  'xdg-desktop-portal-wlr: screen capture portal'
+  'xdg-desktop-portal-gtk: file chooser portal'
+)
+provides=(bspwm-rs)
+conflicts=(bspwm-rs)
+options=(!lto)
+
+_root() { cd "$startdir/../.." && pwd; }
+
+pkgver() {
+  cd "$(_root)"
+  local v
+  v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+  printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+}
+
+build() {
+  cd "$(_root)"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked --no-default-features --features real -p bsp-compositor -p bspc-rs
+}
+
+check() {
+  cd "$(_root)"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --release --locked -p bsp-core -p bsp-ipc -p bsp-hotkeys
+}
+
+package() {
+  local root; root=$(_root)
+  install -Dm755 "$srcdir/target/release/bspwm-rs" "$pkgdir/usr/bin/bspwm-rs"
+  install -Dm755 "$srcdir/target/release/bspc-rs" "$pkgdir/usr/bin/bspc-rs"
+
+  # the session launcher (binaries live in /usr/bin) and its first-run setup
+  sed 's|@REPO@/target/release|/usr/bin|' "$root/contrib/session/bspwm-rs-session" > "$srcdir/bspwm-rs-session"
+  install -Dm755 "$srcdir/bspwm-rs-session" "$pkgdir/usr/bin/bspwm-rs-session"
+  install -Dm755 "$root/contrib/session/install.sh" "$pkgdir/usr/bin/bspwm-rs-setup"
+
+  # default config, copied into ~/.config on first run (never overwriting)
+  local s="$pkgdir/usr/share/bspwm-rs/session"
+  install -Dm755 "$root/contrib/session/bspwmrc" "$s/bspwmrc"
+  install -Dm644 "$root/contrib/session/waybar/config.jsonc" "$s/waybar/config.jsonc"
+  install -Dm644 "$root/contrib/session/waybar/style.css" "$s/waybar/style.css"
+
+  # greetd, regreet, gdm, sddm: any greeter that lists /usr/share/wayland-sessions
+  install -Dm644 "$root/contrib/session/bspwm-rs.desktop" "$pkgdir/usr/share/wayland-sessions/bspwm-rs.desktop"
+  install -Dm644 "$root/contrib/portals/bspwm-rs-portals.conf" "$pkgdir/usr/share/xdg-desktop-portal/bspwm-rs-portals.conf"
+
+  install -Dm644 "$root/README.md" "$pkgdir/usr/share/doc/bspwm-rs/README.md"
+  install -Dm644 "$root/docs/migrating.md" "$pkgdir/usr/share/doc/bspwm-rs/migrating.md"
+}

@@ -1,0 +1,38 @@
+#!/bin/sh
+# Starts bspwm-rs. Used both as the greetd/regreet session (see bspwm-rs.desktop)
+# and by hand from a text console (Ctrl+Alt+F3, log in, run this).
+# Emergency quit: Ctrl+Alt+Shift+Escape. Back to another VT: Ctrl+Alt+F<n>.
+
+BIN_DIR="${BSPWM_RS_BIN:-@REPO@/target/release}"
+
+[ -x "$BIN_DIR/bspwm-rs" ] || { echo "no $BIN_DIR/bspwm-rs; build with: cargo build --release -p bsp-compositor --no-default-features --features real" >&2; exit 1; }
+[ -z "$WAYLAND_DISPLAY$DISPLAY" ] || { echo "already inside a graphical session; run this from a text console" >&2; exit 1; }
+
+# First run: seed ~/.config with the default bspwmrc and waybar config
+# (never overwrites anything).
+if [ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/bspwm/bspwmrc" ] && command -v bspwm-rs-setup >/dev/null 2>&1; then
+	bspwm-rs-setup >/dev/null 2>&1
+fi
+
+# `bspc` for bspwmrc, sxhkdrc and stock bspwm scripts.
+SHIM="${XDG_RUNTIME_DIR:-/tmp}/bspwm-rs-bin"
+mkdir -p "$SHIM" && ln -sf "$BIN_DIR/bspc-rs" "$SHIM/bspc"
+export PATH="$SHIM:$BIN_DIR:$HOME/.local/bin:$PATH"
+
+# Keyboard: the compositor reads the standard XKB_DEFAULT_* variables.
+# Set them before starting (or in ~/.config/bspwm-rs/session.env) to change them.
+[ -r "${XDG_CONFIG_HOME:-$HOME/.config}/bspwm-rs/session.env" ] && . "${XDG_CONFIG_HOME:-$HOME/.config}/bspwm-rs/session.env"
+export XKB_DEFAULT_LAYOUT="${XKB_DEFAULT_LAYOUT-us,ru}"
+export XKB_DEFAULT_OPTIONS="${XKB_DEFAULT_OPTIONS-grp:ralt_rshift_toggle,caps:escape,altwin:swap_alt_win}"
+
+export MOZ_ENABLE_WAYLAND=1 _JAVA_AWT_WM_NONREPARENTING=1
+export XDG_CURRENT_DESKTOP=bspwm-rs XDG_SESSION_TYPE=wayland
+
+# From a console, log to a file; under greetd stdout is already the journal
+# (`journalctl -t bspwm-rs`).
+if [ -t 1 ]; then
+	LOG="${XDG_STATE_HOME:-$HOME/.local/state}/bspwm-rs.log"
+	mkdir -p "$(dirname "$LOG")"
+	exec >"$LOG" 2>&1
+fi
+BSPWM_LOG="${BSPWM_LOG:-info}" exec "$BIN_DIR/bspwm-rs"

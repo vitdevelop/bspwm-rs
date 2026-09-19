@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     // as it comes rather than buffered). bspc.c additionally polls
     // standard output for `POLLHUP` so a `subscribe | head -1` pipeline
     // exits promptly when the reader goes away; that refinement is not
-    // implemented here (`docs/bsp-ipc.md`, scope) — this client
+    // implemented here (`docs/bsp-ipc.md`, IPC scope) — this client
     // instead exits once its own write to a closed pipe fails.
     let mut had_failure = false;
     let mut buf = [0u8; 8192];

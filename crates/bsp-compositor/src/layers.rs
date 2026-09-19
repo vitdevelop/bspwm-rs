@@ -31,6 +31,10 @@ impl<Bd: Backend + 'static> WlrLayerShellHandler for State<Bd> {
         &mut self.protocols.layer_shell
     }
 
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: smithay::wayland::shell::xdg::PopupSurface) {
+        crate::shell::unconstrain_popup(self, &popup);
+    }
+
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
@@ -71,6 +75,19 @@ impl<Bd: Backend + 'static> WlrLayerShellHandler for State<Bd> {
             tracing::debug!(namespace = layer.namespace(), output = output.name(), "layer surface destroyed");
             layer_map_for_output(&output).unmap_layer(&layer);
             self.rearrange_layers(&output);
+            // A launcher (rofi) closing while it held the keyboard: hand the
+            // keyboard back to the focused window, else input goes to a dead
+            // surface and never returns.
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let held = keyboard
+                    .current_focus()
+                    .and_then(|t| t.wl_surface().map(|s| s.into_owned()))
+                    .is_some_and(|s| &s == layer.wl_surface());
+                if held {
+                    keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                    crate::input::sync_keyboard_focus(self);
+                }
+            }
             self.backend_data.queue_redraw();
         }
     }
@@ -179,6 +196,28 @@ pub fn on_commit<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &WlSurfa
             }
         }
     }
+}
+
+/// The namespace (`waybar`, `wallpaper`, `rofi`) of the layer surface `surface`
+/// belongs to, for logging.
+pub fn namespace_of<Bd: Backend + 'static>(state: &State<Bd>, surface: &WlSurface) -> Option<String> {
+    state.space.outputs().find_map(|output| {
+        layer_map_for_output(output)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .map(|l| l.namespace().to_string())
+    })
+}
+
+/// Whether `surface` is a layer surface that asked for exclusive keyboard
+/// focus (a launcher, a lock prompt). An `on_demand` panel that got focus by
+/// a click does not count: it must give the keyboard back when the tree's
+/// focus changes.
+pub fn holds_exclusive_focus<Bd: Backend + 'static>(state: &State<Bd>, surface: &WlSurface) -> bool {
+    state.space.outputs().any(|output| {
+        layer_map_for_output(output)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .is_some_and(|l| l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive)
+    })
 }
 
 /// A click landed on `surface`: if it is a layer surface that accepts

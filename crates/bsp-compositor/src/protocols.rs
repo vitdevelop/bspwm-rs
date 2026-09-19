@@ -1,5 +1,5 @@
 //! Wayland protocols beyond the core shell (`docs/design.md` roadmap,
-//! The protocols), grouped so `State` carries one field for them all.
+//! the protocols), grouped so `State` carries one field for them all.
 //!
 //! bspwm needs none of these itself — X11 has selections, RandR and the
 //! rest built in — so each protocol here has a stated reason: it is what
@@ -42,7 +42,7 @@ use smithay::{delegate_data_control, delegate_data_device, delegate_primary_sele
 
 use crate::state::{Backend, State};
 
-/// The state of every protocol global.
+/// The state of every the protocols protocol global.
 pub struct Protocols<Bd: Backend + 'static> {
     /// `wl_data_device_manager`: the clipboard and drag-and-drop.
     pub data_device: DataDeviceState,

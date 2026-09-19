@@ -47,7 +47,7 @@ struct Change {
     mode: Option<OutputMode>,
     position: Option<(i32, i32)>,
     scale: Option<f64>,
-    bad_transform: bool,
+    transform: Option<bsp_ipc::command::OutputTransform>,
 }
 
 /// User data of a configuration object.
@@ -139,9 +139,38 @@ fn make_head<Bd: Backend + 'static>(
         head.current_mode(&current);
     }
     head.position(hw.position.0, hw.position.1);
-    head.transform(wl_output::Transform::Normal);
+    head.transform(wl_transform_of(hw.transform));
     head.scale(hw.scale);
     entry.heads.insert(hw.name.clone(), HeadEntry { head, modes, last: hw.clone() });
+}
+
+fn wl_transform_of(t: bsp_ipc::command::OutputTransform) -> wl_output::Transform {
+    use bsp_ipc::command::OutputTransform as T;
+    match t {
+        T::Normal => wl_output::Transform::Normal,
+        T::Rotate90 => wl_output::Transform::_90,
+        T::Rotate180 => wl_output::Transform::_180,
+        T::Rotate270 => wl_output::Transform::_270,
+        T::Flipped => wl_output::Transform::Flipped,
+        T::Flipped90 => wl_output::Transform::Flipped90,
+        T::Flipped180 => wl_output::Transform::Flipped180,
+        T::Flipped270 => wl_output::Transform::Flipped270,
+    }
+}
+
+fn transform_of_wl(t: wl_output::Transform) -> Option<bsp_ipc::command::OutputTransform> {
+    use bsp_ipc::command::OutputTransform as T;
+    Some(match t {
+        wl_output::Transform::Normal => T::Normal,
+        wl_output::Transform::_90 => T::Rotate90,
+        wl_output::Transform::_180 => T::Rotate180,
+        wl_output::Transform::_270 => T::Rotate270,
+        wl_output::Transform::Flipped => T::Flipped,
+        wl_output::Transform::Flipped90 => T::Flipped90,
+        wl_output::Transform::Flipped180 => T::Flipped180,
+        wl_output::Transform::Flipped270 => T::Flipped270,
+        _ => return None,
+    })
 }
 
 /// Brings every output-management client up to date with the current outputs.
@@ -189,6 +218,10 @@ pub fn sync<Bd: Backend + 'static>(state: &mut State<Bd>) {
                     }
                     if head.last.position != hw.position {
                         head.head.position(hw.position.0, hw.position.1);
+                        entry_changed = true;
+                    }
+                    if head.last.transform != hw.transform {
+                        head.head.transform(wl_transform_of(hw.transform));
                         entry_changed = true;
                     }
                     if head.last.scale != hw.scale {
@@ -307,8 +340,10 @@ fn evaluate<Bd: Backend + 'static>(state: &mut State<Bd>, config: &Config, apply
         let Some(hw) = outputs.iter().find(|o| &o.name == name) else {
             return Err(format!("unknown output '{name}'"));
         };
-        if change.bad_transform {
-            return Err("output transforms are not supported".into());
+        if let Some(transform) = change.transform {
+            if transform != hw.transform {
+                actions.push((name.clone(), OutputAction::SetTransform(transform)));
+            }
         }
         if let Some(mode) = change.mode {
             if mode != hw.mode {
@@ -446,9 +481,7 @@ impl<Bd: Backend + 'static> Dispatch<ZwlrOutputConfigurationHeadV1, ConfigHeadDa
                 }
             }
             Request::SetPosition { x, y } => change.position = Some((x, y)),
-            Request::SetTransform { transform } => {
-                change.bad_transform = !matches!(transform, WEnum::Value(wl_output::Transform::Normal));
-            }
+            Request::SetTransform { transform: WEnum::Value(t) } => change.transform = transform_of_wl(t),
             Request::SetScale { scale } => change.scale = Some(scale),
             _ => {}
         }

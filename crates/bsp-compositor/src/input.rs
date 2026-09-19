@@ -26,7 +26,7 @@ use crate::state::{Backend, State};
 /// Handles one winit-sourced input event.
 ///
 /// `nested`-only in practice (`crate::udev_backend::process_input_event`
-/// is the `real`-backend sibling, `docs/bsp-compositor.md` the hardware backend
+/// is the `real`-backend sibling, `docs/bsp-compositor.md` The hardware backend
 /// progress) — this module itself stays unconditionally compiled, since
 /// its `on_pointer_button`/`on_pointer_axis` are shared by both
 /// backends, so a `real`-only build would otherwise warn on this
@@ -176,7 +176,7 @@ pub(crate) fn deliver_button<Bd: Backend + 'static>(
 ) {
     let serial = SERIAL_COUNTER.next_serial();
     let locked = state.protocols.session_lock.locked;
-    tracing::debug!(button, ?button_state, "pointer button");
+    tracing::debug!(button, ?button_state, layer = ?state.pointer.current_focus().and_then(|s| crate::layers::namespace_of(state, &s)), "pointer button");
 
     // `crate::pointer_action::on_button_press` covers both click-to-focus
     // and `pointer_modifier`-held drag bindings, and decides whether
@@ -184,6 +184,10 @@ pub(crate) fn deliver_button<Bd: Backend + 'static>(
     // doc comment for why a press matching neither is always forwarded
     // untouched, same as bspwm's un-grabbed default.
     let pressed = button_state == wl_pointer::ButtonState::Pressed && !locked;
+    if pressed {
+        let hit = state.pointer.current_focus();
+        crate::shell::dismiss_grabbed_popups(state, hit.as_ref());
+    }
     let on_layer = pressed
         && state
             .pointer
@@ -261,14 +265,28 @@ pub(crate) fn sync_keyboard_focus<Bd: Backend + 'static>(state: &mut State<Bd>) 
     };
     let current = keyboard.current_focus();
     if let Some(surface) = current.as_ref().and_then(|t| t.wl_surface()) {
-        if state.window_for_surface(&surface).is_none() {
-            // Not a tiled window: a layer surface (or something else) owns focus.
+        // A destroyed surface owns nothing: without the `alive()` check a
+        // closed launcher kept the keyboard for good.
+        if smithay::reexports::wayland_server::Resource::is_alive(&*surface)
+            && crate::layers::holds_exclusive_focus(state, &surface)
+        {
+            // An exclusive layer surface owns focus. A clicked `on_demand` panel such as
+            // waybar does not keep it: focus returns to the tree's.
             return;
         }
     }
     if state.protocols.session_lock.locked {
         // Locked: the lock surface owns the keyboard (set when it was made).
         return;
+    }
+    // A desktop with windows but no focused node (its focus was cleared)
+    // gets its most recent window back.
+    if let Some((mi, di)) = state
+        .wm
+        .focused_monitor
+        .and_then(|mi| state.wm.monitors.get(mi).and_then(|m| m.focused).map(|di| (mi, di)))
+    {
+        state.wm.refocus_after_removal(mi, di);
     }
     let wanted = state
         .wm

@@ -24,7 +24,7 @@
 //! vocabulary (`src/parse.c` `parse_modifier_mask()`): every one of
 //! those raw X11 bit names is fully supported too (`cleaned_modifiers`
 //! resolves `Mod1`..`Mod5` from the live keymap, full modifier coverage,
-//! `docs/design.md`'s hotkeys row), this crate's vocabulary is simply a
+//! `docs/design.md`'s Hotkeys and config row), this crate's vocabulary is simply a
 //! deliberate superset — it also accepts `hyper`/`meta`/`mode_switch`,
 //! which `parse_modifier_mask()` itself does not, the same wider
 //! grammar `bsp-hotkeys` already parses for sxhkdrc chords
@@ -321,7 +321,7 @@ fn format_click_to_focus(c: ClickToFocus) -> String {
 /// `crate::hotkeys::resolve_modifiers`, which needs it for `Mod2`
 /// coverage).
 ///
-/// Full modifier coverage (`docs/design.md`'s hotkeys row): resolves
+/// Full modifier coverage (`docs/design.md`'s Hotkeys and config row): resolves
 /// `Mod1`/`Mod3`/`Mod4`/`Mod5` from `ModifiersState`'s own fields for
 /// the same reason `crate::hotkeys::resolve_modifiers` does — see that
 /// function's doc comment, including why `Hyper`/`Meta` are

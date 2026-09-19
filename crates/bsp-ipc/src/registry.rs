@@ -8,7 +8,7 @@
 //!
 //! `bsp-core`'s [`bsp_core::id::NodeId`] cannot serve this role directly:
 //! it is an arena index, recycled from a free list once a node is freed
-//! (`docs/bsp-core.md`, scope), and reassigned to a *different*
+//! (`docs/bsp-core.md`, Core scope), and reassigned to a *different*
 //! node entirely once [`bsp_core::tree::Tree::transplant_to`] moves a node
 //! into another desktop's tree. This registry sits between the two: it
 //! mints a stable `u32` the first time a node is seen, and the executor

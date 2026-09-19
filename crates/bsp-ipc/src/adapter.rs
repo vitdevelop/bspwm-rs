@@ -35,7 +35,7 @@ pub trait Adapter {
     /// "no known outputs"/"not supported", so a backend that hasn't
     /// implemented real hardware output config yet (the nested winit
     /// backend today) needs no changes to keep compiling; the eventual
-    /// DRM backend overrides them for real.
+    /// DRM backend (hardware backend) overrides them for real.
     ///
     /// Every known output's name, in display order.
     fn output_names(&self) -> Vec<String> {

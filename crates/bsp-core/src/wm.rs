@@ -3,10 +3,13 @@
 //!
 //! bspwm keeps this as global variables — `src/bspwm.h` `mon_head`/
 //! `mon_tail`/`mon` (focused), `rule_head`/`rule_tail` — rather than a
-//! struct. `bsp-core` collects them into one so `bsp-ipc` has a
+//! struct. `bsp-core` collects them into one so `bsp-ipc` (IPC) has a
 //! single root to resolve selectors and run commands against.
 
-use crate::id::MonitorId;
+use std::collections::HashMap;
+
+use crate::history::{History, Loc};
+use crate::id::{DesktopId, MonitorId, NodeId, WindowId};
 use crate::monitor::Monitor;
 use crate::rules::Rule;
 use crate::settings::Settings;
@@ -85,6 +88,9 @@ pub struct Wm {
     /// Settings every new monitor/desktop/node inherits, and the defaults
     /// `bspc config` reads and writes.
     pub settings: Settings,
+    /// Which node, desktop and monitor were focused, in order
+    /// (`crate::history`).
+    pub history: History,
 }
 
 impl Wm {
@@ -95,7 +101,105 @@ impl Wm {
             focused_monitor: None,
             rules: Vec::new(),
             settings,
+            history: History::default(),
         }
+    }
+
+    /// Gives a desktop whose focused node was just removed a new one: the
+    /// most recently focused node still on it, else its first focusable leaf.
+    /// Does nothing if the desktop still has a focused node or is empty.
+    /// Call it right after removing a node; entries of nodes that are gone are
+    /// skipped, so it need not wait for [`sync_history`](Self::sync_history).
+    ///
+    /// bspwm: `src/tree.c` `remove_node()`/`unlink_node()` and
+    /// `history_last_node()`: closing the focused window moves focus to the
+    /// window focused before it.
+    pub fn refocus_after_removal(&mut self, monitor: usize, desktop: usize) {
+        let d = &self.monitors[monitor].desktops[desktop];
+        if d.tree.focus.is_some() || d.tree.root.is_none() {
+            return;
+        }
+        let mut usable: HashMap<WindowId, NodeId> = HashMap::new();
+        let mut first = None;
+        let mut n = d.tree.first_extrema(d.tree.root);
+        while let Some(id) = n {
+            let node = d.tree.node(id);
+            if let (Some(c), false) = (&node.client, node.hidden) {
+                usable.insert(c.window, id);
+                first.get_or_insert(id);
+            }
+            n = d.tree.next_leaf(Some(id), d.tree.root);
+        }
+        let by_history = self.history.last_node(d.id, |w| usable.contains_key(&w)).and_then(|w| usable.get(&w).copied());
+        self.monitors[monitor].desktops[desktop].tree.focus = by_history.or(first);
+    }
+
+    /// Records whatever focus change happened since the last call into
+    /// [`history`](Self::history), and drops entries whose node, desktop or
+    /// monitor is gone or has moved. Call it after every command and once per
+    /// event-loop turn (see `crate::history` for why this observes state
+    /// instead of hooking each focus change).
+    ///
+    /// bspwm: the `history_add()` calls in `focus_node()`, `activate_node()`
+    /// and `add_desktop()`, and the `history_remove()` calls in
+    /// `unlink_node()`, `remove_node()`, `transfer_node()` and
+    /// `remove_desktop()`.
+    pub fn sync_history(&mut self) {
+        let mut windows: HashMap<WindowId, (MonitorId, DesktopId)> = HashMap::new();
+        let mut desktops: HashMap<DesktopId, MonitorId> = HashMap::new();
+        let mut focus: Vec<(MonitorId, DesktopId, Option<WindowId>)> = Vec::new();
+        for m in &self.monitors {
+            for d in &m.desktops {
+                desktops.insert(d.id, m.id);
+                let mut n = d.tree.first_extrema(d.tree.root);
+                while let Some(id) = n {
+                    if let Some(c) = &d.tree.node(id).client {
+                        windows.insert(c.window, (m.id, d.id));
+                    }
+                    n = d.tree.next_leaf(Some(id), d.tree.root);
+                }
+                let f = d.tree.focus.filter(|&f| d.tree.contains(f)).and_then(|f| d.tree.node(f).client.as_ref().map(|c| c.window));
+                focus.push((m.id, d.id, f));
+            }
+        }
+        let global = self.focused_monitor.and_then(|mi| {
+            let m = &self.monitors[mi];
+            let d = &m.desktops[m.focused?];
+            let node = d.tree.focus.filter(|&f| d.tree.contains(f)).and_then(|f| d.tree.node(f).client.as_ref().map(|c| c.window));
+            Some(Loc { monitor: m.id, desktop: d.id, node })
+        });
+
+        self.history.remove_matching(|l| match l.node {
+            Some(w) => windows.get(&w) != Some(&(l.monitor, l.desktop)),
+            None => desktops.get(&l.desktop) != Some(&l.monitor),
+        });
+
+        let mut snapshot = std::mem::take(&mut self.history.snapshot);
+        snapshot.desk_focus.retain(|d, _| desktops.contains_key(d));
+        for (m, d, f) in focus {
+            let is_global = global.is_some_and(|g| g.monitor == m && g.desktop == d);
+            match snapshot.desk_focus.insert(d, f) {
+                None => {
+                    self.history.add(Loc { monitor: m, desktop: d, node: None }, false);
+                    if let (Some(w), false) = (f, is_global) {
+                        self.history.add(Loc { monitor: m, desktop: d, node: Some(w) }, false);
+                    }
+                }
+                Some(prev) if prev != f && !is_global => {
+                    if let Some(w) = f {
+                        self.history.add(Loc { monitor: m, desktop: d, node: Some(w) }, false);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(g) = global {
+            if snapshot.global != Some(g) {
+                self.history.add(g, true);
+            }
+        }
+        snapshot.global = global;
+        self.history.snapshot = snapshot;
     }
 
     /// Appends a monitor, then walks it into on-screen-position order
@@ -479,5 +583,106 @@ mod tests {
     fn struts_need_exactly_twelve_cardinals() {
         assert!(EwmhStruts::from_cardinals(&[0; 11]).is_none());
         assert_eq!(EwmhStruts::from_cardinals(&[1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]).map(|s| (s.left, s.right, s.top, s.bottom)), Some((1, 2, 3, 4)));
+    }
+
+    // ---- focus history ---------------------------------------------------
+
+    /// One monitor with two desktops, each holding two windows (1, 2 / 3, 4).
+    fn history_fixture() -> Wm {
+        use crate::desktop::Desktop;
+        use crate::node::Client;
+        let s = settings();
+        let mut wm = Wm::new(s.clone());
+        let mut m = monitor(1);
+        for (di, ws) in [(1u32, [1u32, 2]), (2, [3, 4])] {
+            let mut d = Desktop::new(DesktopId(di), None, &s);
+            let mut prev = None;
+            for w in ws {
+                let n = d.tree.new_client_node(&s, Client::new(WindowId(w), 1));
+                d.tree.insert_node(&s, n, prev);
+                d.tree.focus = Some(n);
+                prev = Some(n);
+            }
+            m.add_desktop(d);
+        }
+        wm.add_monitor(m);
+        wm
+    }
+
+    fn focus_window(wm: &mut Wm, desktop: usize, w: u32) {
+        let d = &mut wm.monitors[0].desktops[desktop];
+        let mut n = d.tree.first_extrema(d.tree.root);
+        while let Some(id) = n {
+            if d.tree.node(id).client.as_ref().is_some_and(|c| c.window == WindowId(w)) {
+                d.tree.focus = Some(id);
+            }
+            n = d.tree.next_leaf(Some(id), d.tree.root);
+        }
+        wm.monitors[0].focused = Some(desktop);
+    }
+
+    fn windows(wm: &Wm) -> Vec<Option<u32>> {
+        wm.history.locations().map(|l| l.node.map(|w| w.0)).collect()
+    }
+
+    #[test]
+    fn sync_history_records_focus_changes_and_a_repeat_adds_nothing() {
+        let mut wm = history_fixture();
+        wm.sync_history();
+        let first = windows(&wm);
+        assert_eq!(first.last(), Some(&Some(2)), "the focused window is the newest entry: {first:?}");
+        wm.sync_history();
+        assert_eq!(windows(&wm), first);
+
+        focus_window(&mut wm, 1, 4);
+        wm.sync_history();
+        assert_eq!(windows(&wm).last(), Some(&Some(4)));
+        assert_eq!(
+            wm.history.last_desktop(MonitorId(1), DesktopId(2)),
+            Some(DesktopId(1)),
+            "`desktop -f last` from desktop 2 goes back to desktop 1"
+        );
+    }
+
+    #[test]
+    fn refocus_after_removal_picks_the_previously_focused_window() {
+        let mut wm = history_fixture();
+        wm.sync_history();
+        // desktop 0 holds windows 1 and 2; 2 is focused and 1 was focused before it
+        focus_window(&mut wm, 0, 1);
+        wm.sync_history();
+        focus_window(&mut wm, 0, 2);
+        wm.sync_history();
+        let settings = settings();
+        let d = &mut wm.monitors[0].desktops[0];
+        let two = d.tree.focus.expect("2 is focused");
+        d.tree.remove_node(&settings, two);
+        assert_eq!(d.tree.focus, None, "the core alone leaves the desktop without a focus");
+        wm.refocus_after_removal(0, 0);
+        let d = &wm.monitors[0].desktops[0];
+        let f = d.tree.focus.expect("refocused");
+        assert_eq!(d.tree.node(f).client.as_ref().map(|c| c.window), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn sync_history_forgets_a_window_that_is_gone() {
+        let mut wm = history_fixture();
+        wm.sync_history();
+        focus_window(&mut wm, 0, 1);
+        wm.sync_history();
+        // window 2 closes
+        let d = &mut wm.monitors[0].desktops[0];
+        let mut n = d.tree.first_extrema(d.tree.root);
+        let mut victim = None;
+        while let Some(id) = n {
+            if d.tree.node(id).client.as_ref().is_some_and(|c| c.window == WindowId(2)) {
+                victim = Some(id);
+            }
+            n = d.tree.next_leaf(Some(id), d.tree.root);
+        }
+        let settings = settings();
+        d.tree.remove_node(&settings, victim.expect("window 2 exists"));
+        wm.sync_history();
+        assert!(!windows(&wm).contains(&Some(2)), "{:?}", windows(&wm));
     }
 }

@@ -7,7 +7,7 @@
 //! stacking list, `subscribe` reports) are left out: those are
 //! `bsp-compositor`'s job once an adapter exists to receive the
 //! [`crate::desktop::Desktop`]-level effects this crate will grow in a
-//! later step. What remains here is the part bspwm itself calls "the
+//! later. What remains here is the part bspwm itself calls "the
 //! tree": parent/child links, split ratios, vacancy, and the rectangles
 //! that come out of them.
 //!
@@ -102,7 +102,7 @@ pub enum ResizeHandle {
 /// What a pointer button (held with `pointer_modifier`) does when
 /// pressed on a node and dragged — bspwm's `bspc config pointer_action1`/
 /// `pointer_action2`/`pointer_action3`, one per `BUTTONS[]` slot
-/// (`docs/bsp-compositor.md`'s Hotkeys progress: this is a
+/// (`docs/bsp-compositor.md`'s Hotkeys and config progress: this is a
 /// compositor-local setting, not a `Settings` field, same reasoning as
 /// `hotkeys_inline_bspc`).
 ///

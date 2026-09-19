@@ -1,6 +1,6 @@
 [package]
 name = "bsp-ipc"
-description = "bspwm-compatible control socket protocol."
+description = "bspwm-compatible control socket protocol (IPC)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

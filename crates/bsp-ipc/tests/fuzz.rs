@@ -1,5 +1,5 @@
 //! Property-based "fuzzing" of the untrusted IPC surface (design.md,
-//! Hardening): whatever bytes or argument vectors a local client sends,
+//! The hardening): whatever bytes or argument vectors a local client sends,
 //! decoding, parsing and executing must never panic and must always
 //! produce a reply.
 

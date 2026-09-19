@@ -1,6 +1,6 @@
 //! `bsp-hotkeys`: the bundled sxhkdrc-compatible parser and chord matcher.
 //!
-//! Hotkeys (`docs/design.md` roadmap) is in progress. Done so far: the
+//! The hotkeys and config (`docs/design.md` roadmap) is in progress. Done so far: the
 //! pure grammar and matcher, matching sxhkd's own
 //! (`github.com/baskerville/sxhkd`, tag `0.6.2`) `src/parse.c`/
 //! `src/types.c` byte for byte — line grouping ([`lexer`]), `{}`/range

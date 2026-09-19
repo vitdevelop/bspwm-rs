@@ -107,7 +107,7 @@ pub enum Command {
     Config(ConfigCommand),
     /// `output [<name> [COMMANDS]]` — bspwm-rs's own extension (not
     /// bspwm), replacing `xrandr` (`docs/design.md`'s "Configuration
-    /// beyond bspwm"). Real hardware: a no-op `Adapter`
+    /// beyond bspwm"). The hardware backend (real hardware): a no-op `Adapter`
     /// default answers this grammar today; `docs/bsp-compositor.md`
     /// tracks when the DRM backend implements it for real.
     Output {
@@ -120,7 +120,7 @@ pub enum Command {
     },
     /// `input [<device> [COMMANDS]]` — bspwm-rs's own extension (not
     /// bspwm), replacing `setxkbmap`/`xset r rate`/`xinput`
-    /// (`docs/design.md`'s "Configuration beyond bspwm"). Same step-5
+    /// (`docs/design.md`'s "Configuration beyond bspwm"). Same the hardware backend
     /// status as `Output` above.
     Input {
         /// `"keyboard"` or a specific pointer/device name, or `None` to
@@ -827,6 +827,64 @@ pub enum OutputAction {
     SetScale(f64),
     /// `-p`, `--position X Y`.
     SetPosition(i32, i32),
+    /// `-t`, `--transform NAME`: rotation and/or flip.
+    SetTransform(OutputTransform),
+}
+
+/// An output's rotation (counter-clockwise, as in Wayland's `wl_output`) and
+/// optional flip. Names on the command line: `normal`, `90`, `180`, `270`,
+/// `flipped`, `flipped-90`, `flipped-180`, `flipped-270`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputTransform {
+    /// No rotation.
+    #[default]
+    Normal,
+    /// Rotated 90 degrees.
+    Rotate90,
+    /// Rotated 180 degrees.
+    Rotate180,
+    /// Rotated 270 degrees.
+    Rotate270,
+    /// Flipped horizontally.
+    Flipped,
+    /// Flipped, then rotated 90 degrees.
+    Flipped90,
+    /// Flipped, then rotated 180 degrees.
+    Flipped180,
+    /// Flipped, then rotated 270 degrees.
+    Flipped270,
+}
+
+impl OutputTransform {
+    /// The command-line name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Rotate90 => "90",
+            Self::Rotate180 => "180",
+            Self::Rotate270 => "270",
+            Self::Flipped => "flipped",
+            Self::Flipped90 => "flipped-90",
+            Self::Flipped180 => "flipped-180",
+            Self::Flipped270 => "flipped-270",
+        }
+    }
+
+    /// The transform named `s`, if it is one.
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Normal,
+            Self::Rotate90,
+            Self::Rotate180,
+            Self::Rotate270,
+            Self::Flipped,
+            Self::Flipped90,
+            Self::Flipped180,
+            Self::Flipped270,
+        ]
+        .into_iter()
+        .find(|t| t.name() == s)
+    }
 }
 
 /// A display mode: pixel size and refresh rate.
@@ -904,6 +962,12 @@ pub fn parse_output(args: &[String]) -> Result<Command, ParseError> {
                     .map_err(|_| ParseError::invalid_argument("output", flag, &args[i + 1]))?;
                 i += 2;
                 OutputAction::SetPosition(x, y)
+            }
+            "-t" | "--transform" => {
+                let raw = take_str(args, &mut i, "output", flag)?;
+                let transform = OutputTransform::parse(&raw)
+                    .ok_or_else(|| ParseError::invalid_argument("output", flag, &raw))?;
+                OutputAction::SetTransform(transform)
             }
             other => return Err(ParseError::unknown_command("output", other)),
         };
@@ -1767,6 +1831,20 @@ mod tests {
             }
             other => panic!("expected Desktop, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn output_transform_parses_every_name_and_rejects_others() {
+        for name in ["normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270"] {
+            let cmd = parse(&args(&format!("output HDMI-A-1 -t {name}"))).unwrap();
+            match cmd {
+                Command::Output { actions, .. } => {
+                    assert_eq!(actions, vec![OutputAction::SetTransform(OutputTransform::parse(name).unwrap())]);
+                }
+                other => panic!("expected Output, got {other:?}"),
+            }
+        }
+        assert!(parse(&args("output HDMI-A-1 -t sideways")).is_err());
     }
 
     #[test]

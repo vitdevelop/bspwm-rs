@@ -49,14 +49,13 @@ smithay::backend::renderer::element::render_elements! {
     Border = SolidColorRenderElement,
 }
 
-/// The color a window's border is drawn with: focused if `focused`.
-///
-/// bspwm's default `focused_border_color`/`normal_border_color`
-/// (`src/settings.c`) are both shades of grey; `bsp-core::Settings` does
-/// not carry colors yet (`docs/bsp-core.md`: colors are an X11/pointer
-/// concern left to `bsp-compositor`), so these are hardcoded for now.
-const FOCUSED_BORDER_COLOR: Color32F = Color32F::new(0.29, 0.55, 0.86, 1.0);
-const NORMAL_BORDER_COLOR: Color32F = Color32F::new(0.35, 0.35, 0.35, 1.0);
+/// A `#rrggbb` setting as a render color; `fallback` if it does not parse.
+fn setting_color(hex: &str, fallback: Color32F) -> Color32F {
+    match bsp_core::settings::parse_hex_color(hex) {
+        Some([r, g, b]) => Color32F::new(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0),
+        None => fallback,
+    }
+}
 
 /// Background clear color (bspwm has no desktop background of its own).
 pub const CLEAR_COLOR: Color32F = Color32F::new(0.08, 0.08, 0.08, 1.0);
@@ -73,9 +72,19 @@ fn strip(geo: Rectangle<i32, Physical>, color: Color32F) -> SolidColorRenderElem
 
 /// Builds four border strips (top, bottom, left, right) per tiled client,
 /// framing its content rectangle without overlapping it.
+///
+/// A desktop's focused node is drawn with `focused_border_color` on the
+/// focused monitor and `active_border_color` on any other; everything else
+/// with `normal_border_color`.
+///
+/// bspwm: `src/window.c` `get_border_color()`.
 fn border_elements(wm: &Wm, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
+    let black = Color32F::new(0.0, 0.0, 0.0, 1.0);
+    let normal = setting_color(&wm.settings.normal_border_color, black);
+    let active = setting_color(&wm.settings.active_border_color, black);
+    let focused = setting_color(&wm.settings.focused_border_color, black);
     let mut elements = Vec::new();
-    for m in &wm.monitors {
+    for (mi, m) in wm.monitors.iter().enumerate() {
         for (di, d) in m.desktops.iter().enumerate() {
             // Only a monitor's focused desktop is on screen.
             if m.focused != Some(di) {
@@ -88,10 +97,12 @@ fn border_elements(wm: &Wm, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
                     let bw = client.border_width;
                     if bw > 0 && !node.hidden {
                         let r = client.tiled_rectangle;
-                        let color = if d.tree.focus == Some(id) {
-                            FOCUSED_BORDER_COLOR
+                        let color = if d.tree.focus != Some(id) {
+                            normal
+                        } else if wm.focused_monitor == Some(mi) {
+                            focused
                         } else {
-                            NORMAL_BORDER_COLOR
+                            active
                         };
                         let to_physical = |x: i32,
                                            y: i32,
@@ -157,6 +168,34 @@ where
     elements
 }
 
+/// Whether an unmanaged X11 window (override-redirect, which is what many games
+/// and Wine use for fullscreen) covers all of `output`.
+fn unmanaged_covers(space: &Space<Window>, output: &Output) -> bool {
+    let Some(screen) = space.output_geometry(output) else {
+        return false;
+    };
+    space.elements().any(|w| {
+        w.x11_surface().is_some_and(|x| x.is_override_redirect())
+            && space.element_geometry(w).is_some_and(|g| g.contains_rect(screen))
+    })
+}
+
+/// Whether the focused desktop of the focused monitor shows a fullscreen window.
+fn has_fullscreen(wm: &Wm) -> bool {
+    let Some(d) = wm.focused_monitor.and_then(|mi| wm.monitors.get(mi)).and_then(|m| m.focused.and_then(|di| m.desktops.get(di))) else {
+        return false;
+    };
+    let mut n = d.tree.first_extrema(d.tree.root);
+    while let Some(id) = n {
+        let node = d.tree.node(id);
+        if !node.hidden && node.client.as_ref().is_some_and(|c| c.state == bsp_core::node::ClientState::Fullscreen) {
+            return true;
+        }
+        n = d.tree.next_leaf(Some(id), d.tree.root);
+    }
+    false
+}
+
 /// Builds one frame's full render element list for `output`: border
 /// strips (always on top, see this module's doc comment for why) plus
 /// every window's own elements — the backend-agnostic half of
@@ -205,21 +244,42 @@ where
     // The cursor goes first: earlier elements are topmost.
     let mut elements: Vec<OutputRenderElements<R, _>> =
         cursor.into_iter().map(OutputRenderElements::Cursor).collect();
-    // Overlay and top layers, above windows and their borders.
-    elements.extend(layer_elements(output, renderer, scale, &[Layer::Overlay, Layer::Top]));
-    elements.extend(border_elements(wm, scale).into_iter().map(OutputRenderElements::Border));
-    let space_elements =
-        match smithay::desktop::space::space_render_elements::<_, Window, _>(renderer, [space], output, 1.0)
-        {
-            Ok(elements) => elements,
-            Err(err) => {
-                tracing::warn!("skipping a frame: {err}");
-                return None;
-            }
-        };
-    elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+    // Overlay and top layers, above windows and their borders; the top layer
+    // (a bar) goes under a fullscreen window, as in wlroots compositors.
+    let fullscreen = has_fullscreen(wm) || unmanaged_covers(space, output);
+    {
+        static LAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if LAST.swap(fullscreen, std::sync::atomic::Ordering::Relaxed) != fullscreen {
+            tracing::debug!(fullscreen, "fullscreen layering changed");
+        }
+    }
+    let above: &[Layer] = if fullscreen { &[Layer::Overlay] } else { &[Layer::Overlay, Layer::Top] };
+    elements.extend(layer_elements(output, renderer, scale, above));
+    // No borders over a fullscreen window: a fullscreen window has none, and the
+    // borders of the windows behind it would be drawn on top of it.
+    if !fullscreen {
+        elements.extend(border_elements(wm, scale).into_iter().map(OutputRenderElements::Border));
+    }
+    // The windows only: `space_render_elements` would draw the output's layer
+    // surfaces too (bars above every window, whatever the order below), which
+    // `layer_elements` already does with its own stacking.
+    let Some(output_geo) = space.output_geometry(output) else {
+        tracing::debug!("skipping a frame: the output has no mode yet");
+        return None;
+    };
+    let space_elements = space.render_elements_for_region(renderer, &output_geo, scale, 1.0);
+    elements.extend(
+        space_elements
+            .into_iter()
+            .map(|e| OutputRenderElements::Space(SpaceRenderElements::Element(smithay::backend::renderer::element::Wrap::from(e)))),
+    );
     // Bottom and background layers, under everything.
-    elements.extend(layer_elements(output, renderer, scale, &[Layer::Bottom, Layer::Background]));
+    let below: &[Layer] = if fullscreen {
+        &[Layer::Top, Layer::Bottom, Layer::Background]
+    } else {
+        &[Layer::Bottom, Layer::Background]
+    };
+    elements.extend(layer_elements(output, renderer, scale, below));
     Some(elements)
 }
 

@@ -184,7 +184,7 @@ pub fn run() {
     tracing::info!(socket = socket_name, "listening on Wayland socket");
     // SAFETY: `WAYLAND_DISPLAY` is process environment, set once here
     // before any client (including our own future `bspwmrc` launcher,
-    // Hotkeys) could read it; nothing else in this process touches the
+    // the hotkeys and config) could read it; nothing else in this process touches the
     // environment concurrently at this point in startup.
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &socket_name);
@@ -317,6 +317,7 @@ pub fn run() {
             crate::screencopy::fulfill(&mut state);
             crate::ext_capture::fulfill(&mut state);
             crate::export_dmabuf::fulfill(&mut state);
+            state.wm.sync_history();
             crate::extras::arm_commit_timers(&mut state);
             crate::session_lock::poll(&mut state);
             state.popups.cleanup();

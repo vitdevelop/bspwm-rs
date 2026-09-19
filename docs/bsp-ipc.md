@@ -20,7 +20,7 @@ The control socket: it speaks bspwm's wire protocol so the stock `bspc` binary, 
 | `command` | `bspc` argument grammar into a `Command` for every domain: node, desktop, monitor, query, rule, wm, config, subscribe, quit |
 | `registry` | `NodeRegistry`: stable, never-reused wire node ids over `bsp-core`'s reused arena `NodeId`s |
 | `report` | `subscribe report` line, `subscribe` events, and the `query -T`/`wm -d` JSON shape |
-| `adapter` | `Adapter` trait (window class/instance lookup, close/kill) and `FakeAdapter`, the the IPC roadmap's "fake adapter" |
+| `adapter` | `Adapter` trait (window class/instance lookup, close/kill) and `FakeAdapter`, the IPC roadmap's "fake adapter" |
 | `exec` | Executes a parsed `Command` against a `Wm` + `NodeRegistry` + `Adapter`, producing a `Reply` and the `Event`s to broadcast |
 | `server` | `Listener`/`Connection` (non-blocking Unix socket) and `Subscribers` (mask-matched event/report delivery) |
 
@@ -30,9 +30,9 @@ Everything is implemented and tested end to end: wire framing, the full `bspc` a
 
 `server::Listener`/`Connection` are also now wired into `bsp-compositor`'s real `calloop` event loop (`crates/bsp-compositor/src/ipc.rs`) and confirmed against a live, running compositor and a real client — see `docs/bsp-compositor.md`, Nested compositor progress. A few executor operations are still deliberately deferred rather than guessed at:
 
-- **Cross-desktop/cross-monitor `node --swap`**: bspwm's cross-tree swap relies on a node keeping its identity across trees; `bsp-core`'s per-tree arena `NodeId` does not (`docs/bsp-core.md`, scope), and reproducing the swap via two transplants would need `insert_node`'s exact-slot-replacement semantics rather than its anchor-based splitting. Same-tree swap (the common case) works.
+- **Cross-desktop/cross-monitor `node --swap`**: bspwm's cross-tree swap relies on a node keeping its identity across trees; `bsp-core`'s per-tree arena `NodeId` does not (`docs/bsp-core.md`, Core scope), and reproducing the swap via two transplants would need `insert_node`'s exact-slot-replacement semantics rather than its anchor-based splitting. Same-tree swap (the common case) works.
 - **`wm --load-state`, `wm --adopt-orphans`**: no saved-state format or orphan-window concept exists yet.
-- **`rule --add`'s `monitor=`/`desktop=`/`node=`/`rectangle=`/`honor_size_hints=` targets** (`command::RuleTarget`): parsed for validation and folded into `effect_raw` for a correct `rule --list` (bspwm: `src/rule.c` `list_rules()`, `"%s:%s:%s %c> %s\n"`), but not retained in structured form — only `bsp_core::rules::Rule`'s `consequence`/`one_shot` are stored. No rule is matched against a real window at all yet (`docs/bsp-compositor.md`, scope: every mapped window lands tiled, unconditionally), so there is nothing yet to apply a resolved target to; storing it structurally is deferred to when that wiring happens, since where it should live depends on how that matching step is designed (see `docs/bsp-compositor.md`'s Nested compositor progress).
+- **`rule --add`'s `monitor=`/`desktop=`/`node=`/`rectangle=`/`honor_size_hints=` targets** (`command::RuleTarget`): parsed for validation and folded into `effect_raw` for a correct `rule --list` (bspwm: `src/rule.c` `list_rules()`, `"%s:%s:%s %c> %s\n"`), but not retained in structured form — only `bsp_core::rules::Rule`'s `consequence`/`one_shot` are stored. No rule is matched against a real window at all yet (`docs/bsp-compositor.md`, Nested compositor scope: every mapped window lands tiled, unconditionally), so there is nothing yet to apply a resolved target to; storing it structurally is deferred to when that wiring happens, since where it should live depends on how that matching step is designed (see `docs/bsp-compositor.md`'s Nested compositor progress).
 - Every `subscribe --fifo` request is parsed but the FIFO itself is never created (`mkfifo` has no safe `std` wrapper); a subscriber always gets its report/events over the request connection itself.
 - The executor reports back whether a command changed anything and leaves *when* to push a fresh `report` line to `report`-subscribed connections to the caller, rather than replicating bspwm's `put_status(SBSC_MASK_REPORT)` call site by call site throughout `src/tree.c`/`src/desktop.c`/`src/monitor.c`.
 
@@ -42,15 +42,15 @@ Everything is implemented and tested end to end: wire framing, the full `bspc` a
 
 **`bspc config -m MON` targets the monitor** (found live, testing X11 struts): `top_padding`/`right_padding`/`bottom_padding`/`left_padding` and `window_gap` with `-m` now read and write the monitor's own values, as bspwm's `cmd_config()` does (it leaves the desktop out of the coordinates, so `SET_DEF_MON_DESK` lands on `loc.monitor`); `-d` still targets the desktop and no selector still sets the default. Covered by `config_padding_with_m_targets_the_monitor_and_with_d_the_desktop`. `border_width` per target and the other per-monitor/-desktop settings are still global-only.
 
+**Focus history is implemented** (`bsp_core::history`, `docs/bsp-core.md`): `last`, `older`, `newer` and `newest` resolve on nodes, desktops and monitors as in bspwm's `history_find_*()`, directional selection breaks distance ties with `history_rank`, `bspc wm -h on|off` toggles recording, and `wm -d`'s `focusHistory` lists the entries oldest first. `exec::execute` calls `Wm::sync_history()` before and after every command. `bspc config` also handles `normal_border_color`, `active_border_color`, `focused_border_color` and `presel_feedback_color` (`#rrggbb` only, `is_hex_color()`).
+
 Selector *resolution* (not parsing, which is complete) has its own known gaps, each returning `ResolveError::Unsupported` rather than a wrong answer:
 
-- **Focus history** (`last`, `newest`, `older`, `newer` on any selector, and `wm -d`'s `focusHistory` JSON array, always empty here): bspwm's `history.c` has no `bsp-core` counterpart yet.
 - **The stacking list** (`node_stack` event, `wm -d`'s `stackingList` JSON array, always empty here): bspwm's `stack.c` has no `bsp-core` counterpart yet.
-- **`pointed`** (node/monitor) and **`primary`** (monitor): need live pointer/EWMH state from `bsp-compositor`, which does not exist before the nested compositor/5.
+- **`pointed`** (node/monitor) and **`primary`** (monitor): need live pointer/EWMH state from `bsp-compositor`, which does not exist before the nested compositor and hardware backend.
 - **`same_class`**: needs a window's class/instance name, which `bsp-core::node::Client` does not store (that belongs to the adapter's window map, `docs/design.md` Architecture) — always fails to match rather than ignoring the constraint.
-- **`next`/`prev` node cycling** stays within the reference node's own desktop tree; bspwm's cross-desktop scope for these two descriptors was not confirmed from source in this step.
+- **`next`/`prev` node cycling** stays within the reference node's own desktop tree; bspwm's cross-desktop scope for these two descriptors was not confirmed from source in this work.
 - **Directional selection** (`node`/`monitor` `north`/`west`/`south`/`east`) always uses bspwm's `TIGHTNESS_HIGH` default (`src/geometry.c` `on_dir_side()`); `directional_focus_tightness` is not yet a `bsp-core`/`config` setting.
-- Tie-breaks in directional selection use iteration order rather than bspwm's `history_rank` (which needs focus history, above).
 
 None of these silently produce a wrong answer: every gap above is either a `ResolveError::Unsupported` (distinct from `ResolveError::NoMatch`) or an explicit `Reply::Fail` naming what is missing, so a caller can tell "no such node"/"command failed" from "not implemented yet" apart.
 
@@ -120,7 +120,7 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | Function | Signature | Behavior |
 | --- | --- | --- |
 | `Adapter` (trait) | `window_class`/`close_window`/`kill_window` | What `exec` needs from the real window system: class/instance lookup, close, kill |
-| `Adapter`'s output/input methods | `output_names`/`output_settings`/`set_output`, `input_names`/`input_settings`/`set_input` | Default-implemented as "no known outputs/devices"/"not supported"; a real hardware backend overrides them |
+| `Adapter`'s output/input methods | `output_names`/`output_settings`/`set_output`, `input_names`/`input_settings`/`set_input` | Default-implemented as "no known outputs/devices"/"not supported"; a real hardware backend overrides them (hardware backend) |
 | `FakeAdapter` | `new`/`set_class` + `Adapter` impl | An in-memory adapter for tests: a lookup table plus a record of what was closed/killed; uses every output/input default as-is |
 
 ### `exec`

@@ -1,6 +1,6 @@
 //! XWayland: running X11 programs (`xterm`, Steam, old toolkits) inside the
 //! Wayland compositor, with `bspc` treating their windows like any other
-//! (`docs/design.md`, roadmap XWayland).
+//! (`docs/design.md`, roadmap the XWayland).
 //!
 //! bspwm *is* an X11 window manager, so X11 windows are its home turf —
 //! including the `WM_CLASS` class/instance names its rules match on, which
@@ -136,6 +136,23 @@ pub fn run_shim_if_invoked() {
         return;
     }
     let args: Vec<std::ffi::OsString> = args.collect();
+    // Die with the compositor (`KILL`: the compositor blocks `TERM` for its signal
+    // handling and children inherit that mask, so `TERM` never arrived): the dormant shim polls forever and the real
+    // server (which keeps the setting across `exec`) would otherwise outlive a
+    // crashed or killed compositor, as stray `Xwayland` processes did.
+    crate::spawn::unblock_signals();
+    let parent = smithay::reexports::rustix::process::getppid();
+    if smithay::reexports::rustix::process::set_parent_process_death_signal(Some(
+        smithay::reexports::rustix::process::Signal::KILL,
+    ))
+    .is_err()
+        || smithay::reexports::rustix::process::getppid() != parent
+    {
+        // No death signal, or the compositor is already gone.
+        if smithay::reexports::rustix::process::getppid() != parent {
+            std::process::exit(0);
+        }
+    }
     let listen_fds: Vec<RawFd> = args
         .windows(2)
         .filter(|w| w[0] == "-listenfd")
@@ -387,6 +404,10 @@ fn read_extra(display: u32, window: u32) -> X11Extra {
 fn type_defaults(window: &X11Surface, extra: &X11Extra) -> bsp_core::rules::RuleConsequence {
     use bsp_core::node::ClientState;
     let mut consequence = bsp_core::rules::RuleConsequence::default();
+    // A game that maps already fullscreen (`_NET_WM_STATE_FULLSCREEN` in its initial state).
+    if window.is_fullscreen() {
+        consequence.state = Some(ClientState::Fullscreen);
+    }
     if extra.dock || extra.desktop {
         consequence.manage = Some(false);
         return consequence;
@@ -688,6 +709,7 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
 impl<Bd: Backend + 'static> State<Bd> {
     /// Runs `bspc node ID -t STATE` for a managed X11 window's request.
     fn x11_state_request(&mut self, window: &X11Surface, node_state: &str) {
+        tracing::debug!(class = window.class(), node_state, "X11 window state request");
         let Some(id) = window_of(self, window).and_then(|el| self.adapter.id_of(&el)) else {
             return;
         };

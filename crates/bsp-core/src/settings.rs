@@ -66,6 +66,41 @@ pub struct Settings {
     /// Center a pseudo-tiled client's floating-sized rectangle within its
     /// tiled slot. Default: `true` (`CENTER_PSEUDO_TILED`).
     pub center_pseudo_tiled: bool,
+    /// Border color of an unfocused node, `#rrggbb`. Default `#30302f`
+    /// (`NORMAL_BORDER_COLOR`, `src/settings.h`).
+    pub normal_border_color: String,
+    /// Border color of a desktop's focused node when its monitor is not
+    /// the focused one. Default `#474645` (`ACTIVE_BORDER_COLOR`).
+    pub active_border_color: String,
+    /// Border color of the focused node on the focused monitor. Default
+    /// `#817f7f` (`FOCUSED_BORDER_COLOR`).
+    pub focused_border_color: String,
+    /// Color of the preselection feedback. Default `#f4d775`
+    /// (`PRESEL_FEEDBACK_COLOR`). Stored and reported, but the compositor
+    /// does not draw preselection feedback yet.
+    pub presel_feedback_color: String,
+}
+
+/// Whether `s` is a valid color value for a `*_color` setting: `#` plus six
+/// hex digits, nothing else.
+///
+/// bspwm: `src/helpers.c` `is_hex_color()`.
+#[must_use]
+pub fn is_hex_color(s: &str) -> bool {
+    s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parses a `#rrggbb` color into 8-bit channels; `None` if it is not one.
+///
+/// bspwm: `src/bspwm.c` `get_color_pixel()` (which falls back to black
+/// for anything it cannot read; callers here choose their own fallback).
+#[must_use]
+pub fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+    if !is_hex_color(s) {
+        return None;
+    }
+    let ch = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    Some([ch(1)?, ch(3)?, ch(5)?])
 }
 
 impl Default for Settings {
@@ -84,6 +119,10 @@ impl Default for Settings {
             borderless_singleton: false,
             single_monocle: false,
             center_pseudo_tiled: true,
+            normal_border_color: "#30302f".to_string(),
+            active_border_color: "#474645".to_string(),
+            focused_border_color: "#817f7f".to_string(),
+            presel_feedback_color: "#f4d775".to_string(),
         }
     }
 }
@@ -106,5 +145,20 @@ mod tests {
         assert!(!s.gapless_monocle);
         assert!(!s.borderless_monocle);
         assert!(!s.borderless_singleton);
+        assert_eq!(s.normal_border_color, "#30302f");
+        assert_eq!(s.active_border_color, "#474645");
+        assert_eq!(s.focused_border_color, "#817f7f");
+        assert_eq!(s.presel_feedback_color, "#f4d775");
+    }
+
+    #[test]
+    fn hex_colors_need_a_hash_and_six_hex_digits() {
+        assert!(is_hex_color("#93a1A1"));
+        assert!(!is_hex_color("93a1a1"));
+        assert!(!is_hex_color("#93a1a"));
+        assert!(!is_hex_color("#93a1a1f"));
+        assert!(!is_hex_color("#93a1g1"));
+        assert_eq!(parse_hex_color("#0080ff"), Some([0, 128, 255]));
+        assert_eq!(parse_hex_color("red"), None);
     }
 }

@@ -1,0 +1,191 @@
+// -*- mode: jsonc -*-
+{
+  "layer": "top", // waybar defaults to "bottom", which puts its popup menus behind windows
+  // "position": "bottom", // Waybar position (top|bottom|left|right)
+  // "height": 30, // Waybar height (to be removed for auto height)
+  // "width": 1280, // Waybar width
+  "spacing": 4, // Gaps between modules (4px)
+  // Choose the order of the modules
+  "modules-left": [
+    "ext/workspaces",
+    "disk#root",
+    "disk#home"
+  ],
+  /* "modules-center": [ */
+  /* // "hyprland/window" */
+  /* ], */
+  "modules-right": [
+    "mpris",
+    // "idle_inhibitor",
+    "pulseaudio",
+    "network",
+    "power-profiles-daemon",
+    "cpu",
+    "memory",
+    "temperature",
+    "backlight",
+    "custom/nvidia",
+    "battery",
+    // "battery#bat2",
+    "clock",
+    "tray"
+  ],
+  // Modules configuration
+  "ext/workspaces": {
+    "format": "{icon}",
+    "sort-by-id": true,
+    "on-click": "activate",
+    "format-icons": {"1": "\ue07a", "2": "\uf120", "3": "\ue745", "4": "\uf120", "5": "\uf013", "6": "\uf268", "7": "\uf121", "8": "\uf1b6", "9": "\uf2c6", "10": "\uf1bc"}
+  },
+  "mpris": {
+    "format": "{status_icon} <i>{artist} - {title} [{position}/{length}]</i>",
+    "format-paused": "{status_icon} <i>{artist} - {title} [{position}/{length}]</i>",
+    "interval": 2,
+    "title-len": 32,
+    "player-icons": {
+      "default": "▶",
+      "mpv": "🎵"
+    },
+    "status-icons": {
+      "playing": "⏸",
+      "paused": "▶"
+      // "stopped": ""
+    }
+    // "ignored-players": ["firefox"]
+  },
+  "tray": {
+    // "icon-size": 21,
+    "spacing": 5
+    // "icons": {
+    //   "blueman": "bluetooth",
+    //   "TelegramDesktop": "$HOME/.local/share/icons/hicolor/16x16/apps/telegram.png"
+    // }
+  },
+  "clock": {
+    // "timezone": "America/New_York",
+    "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+    "format-alt": "{:%Y-%m-%d}"
+  },
+  "cpu": {
+    "format": "\uf2db {usage}% ",
+    "tooltip": false,
+    "interval": 1
+  },
+  "disk#root": {
+    "path": "/",
+    "format": "\uf0a0 / {used}/{total}",
+    "interval": 30
+  },
+  "disk#home": {
+    "path": "/home",
+    "format": "\uf0a0 ~ {used}/{total}",
+    "interval": 30
+  },
+  "memory": {
+    "format": "\uf538 {}% ",
+    "interval": 1
+  },
+  "temperature": {
+    "thermal-zone": 2,
+    // "hwmon-path": "/sys/class/hwmon/hwmon2/temp1_input",
+    "critical-threshold": 80,
+    "interval": 2,
+    // "format-critical": "{temperatureC}°C {icon}",
+    "format": "{temperatureC}°C {icon}",
+    "format-icons": [
+      "\uf2cb",
+      "\uf2c9",
+      "\uf2c7"
+    ]
+  },
+/*  "backlight": {*/
+    /*// "device": "acpi_video1",*/
+    /*"format": "{percent}% {icon}",*/
+    /*"format-icons": [*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*""*/
+    /*]*/
+  /*},*/
+  /*"battery": {*/
+    /*"states": {*/
+      /*// "good": 95,*/
+      /*"warning": 30,*/
+      /*"critical": 15*/
+    /*},*/
+    /*"format": "{capacity}% {icon}",*/
+    /*"format-full": "{capacity}% {icon}",*/
+    /*"format-charging": "{capacity}% ",*/
+    /*"format-plugged": "{capacity}% ",*/
+    /*"format-alt": "{time} {icon}",*/
+    /*// "format-good": "", // An empty format will hide the module*/
+    /*// "format-full": "",*/
+    /*"format-icons": [*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*"",*/
+      /*""*/
+    /*]*/
+  /*},*/
+  /*"battery#bat2": {*/
+    /*"bat": "BAT2"*/
+  /*},*/
+  "power-profiles-daemon": {
+    "format": "{icon}",
+    "tooltip-format": "Power profile: {profile}\nDriver: {driver}",
+    "tooltip": true,
+    "format-icons": {
+      "default": "\uf624",
+      "performance": "\uf0e7",
+      "balanced": "\uf24e",
+      "power-saver": "\uf06c"
+    }
+  },
+  "network": {
+    // "interface": "wlp2*", // (Optional) To force the use of this interface
+    "interval": 2,
+    "format-wifi": "\uf1eb {essid} ({signalStrength}%)",
+    "format-ethernet": "\uf796  \uf019 {bandwidthDownBytes}  \uf093 {bandwidthUpBytes}",
+    "tooltip-format": "{ifname} via {gwaddr} ",
+    "format-linked": "\uf1eb {ifname} (No IP)",
+    "format-disconnected": "Disconnected ⚠",
+    "format-alt": "{ifname}: {ipaddr}/{cidr}"
+  },
+  "pulseaudio": {
+    // "scroll-step": 1, // %, can be a float
+    "format": "{volume}% {icon} {format_source}",
+    "format-bluetooth": "{volume}% {icon} {format_source}",
+    "format-bluetooth-muted": " {icon} {format_source}",
+    "format-muted": " {format_source}",
+    "format-source": "\uf130 {volume}%",
+    "format-source-muted": "\uf131",
+    "format-icons": {
+      "headphone": "\uf025",
+      "hands-free": "\uf590",
+      "headset": "\uf590",
+      "phone": "\uf3ce",
+      "portable": "\uf3ce",
+      "car": "\uf1b9",
+      "default": [
+        "\uf026",
+        "\uf027",
+        "\uf028"
+      ]
+    },
+    "on-click": "pavucontrol"
+  },
+  "custom/nvidia": {
+      "exec": "sh $HOME/.config/waybar/nvidia-data.sh",
+    "format": "{}",
+    "return-type": "json",
+    "restart-interval": 2,
+    "hide-empty-text": true
+  }
+}

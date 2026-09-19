@@ -11,6 +11,7 @@ name = "bspwm-rs"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 bsp-core = { path = "../bsp-core" }
 bsp-ipc = { path = "../bsp-ipc" }
 bsp-hotkeys = { path = "../bsp-hotkeys" }
@@ -30,7 +31,7 @@ calloop = { version = "0.14", default-features = false, features = [
     "signals",
 ] }
 # Server-side bindings for the protocols Smithay does not implement itself
-#: the wlr family (foreign-toplevel-management, screencopy,
+# (protocols): the wlr family (foreign-toplevel-management, screencopy,
 # output-management, gamma-control, virtual-pointer) and the staging
 # `ext-workspace-v1`. Both use the same `wayland-server` as Smithay.
 wayland-protocols = { version = "0.32", features = ["server", "staging"] }
@@ -67,7 +68,7 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
-rustix = { version = "1", features = ["fs", "time"] }
+rustix = { version = "1", features = ["fs", "time", "process"] }
 
 [[example]]
 name = "capture_probe"

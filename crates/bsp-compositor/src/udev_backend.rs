@@ -94,6 +94,27 @@ enum CaptureTarget<'a> {
 }
 
 impl DrmData {
+    /// Disables every plane and CRTC we use. Run while we still hold DRM master,
+    /// i.e. right before asking for a VT switch: the next session's compositor
+    /// only resets the planes it knows, and an overlay or cursor plane of ours
+    /// stayed on screen (a ghost of the last window in Hyprland).
+    fn clear_outputs(&mut self) {
+        for device in self.backends.values_mut() {
+            device.drm_output_manager.with_compositors(|compositors| {
+                for compositor in compositors.values() {
+                    match compositor.lock() {
+                        Ok(mut compositor) => {
+                            if let Err(err) = compositor.clear() {
+                                tracing::warn!("failed to clear an output before a VT switch: {err}");
+                            }
+                        }
+                        Err(_) => tracing::warn!("an output's compositor lock is poisoned; not cleared"),
+                    }
+                }
+            });
+        }
+    }
+
     /// The render node captures run on: the primary GPU's.
     fn capture_render_node(&self) -> DrmNode {
         self.backends.get(&self.primary_gpu).and_then(|d| d.render_node).unwrap_or(self.primary_gpu)
@@ -334,36 +355,19 @@ impl Backend for DrmData {
     }
 
     fn set_gamma(&mut self, output: &Output, ramp: Option<&[u16]>) -> Result<(), String> {
-        use smithay::reexports::drm::control::Device as ControlDevice;
-        use std::os::fd::AsFd;
         let (drm, crtc) = self
             .crtc_of(output)
             .ok_or_else(|| "output is not a hardware output".to_string())?;
-        let (lut_prop, _) = crtc_property(drm, crtc, "GAMMA_LUT").ok_or_else(|| "no GAMMA_LUT property".to_string())?;
-        let (_, size) = crtc_property(drm, crtc, "GAMMA_LUT_SIZE").ok_or_else(|| "no GAMMA_LUT_SIZE".to_string())?;
-        let size = size as usize;
-        let value = match ramp {
-            None => 0, // no blob: the kernel restores the identity ramp
-            Some(ramp) => {
-                if ramp.len() != size * 3 {
-                    return Err(format!("expected {} ramp values, got {}", size * 3, ramp.len()));
-                }
-                // `struct drm_color_lut { u16 red, green, blue, reserved; }` per entry.
-                let mut blob = Vec::with_capacity(size * 8);
-                for i in 0..size {
-                    for channel in 0..3 {
-                        blob.extend_from_slice(&ramp[channel * size + i].to_ne_bytes());
-                    }
-                    blob.extend_from_slice(&0u16.to_ne_bytes());
-                }
-                drm_ffi::mode::create_property_blob(drm.as_fd(), &mut blob)
-                    .map_err(|err| format!("creating the LUT blob failed: {err}"))?
-                    .blob_id as u64
+        let written = write_gamma_lut(drm, crtc, ramp);
+        // Remembered even when the write failed (a client updates its ramp while
+        // another session owns the display): it is written again after the resume.
+        if let Some(id) = output.user_data().get::<UdevOutputId>() {
+            if let Some(surface) = self.backends.get_mut(&id.device_id).and_then(|d| d.surfaces.get_mut(&id.crtc)) {
+                surface.gamma = ramp.map(<[u16]>::to_vec);
+                surface.regamma = written.is_err() && ramp.is_some();
             }
-        };
-        tracing::debug!(output = output.name(), size, reset = ramp.is_none(), "writing the gamma LUT");
-        drm.set_property(crtc, lut_prop, value)
-            .map_err(|err| format!("setting GAMMA_LUT failed: {err}"))
+        }
+        written
     }
 
     fn queue_redraw(&mut self) {
@@ -489,6 +493,38 @@ impl DrmData {
         let device = self.backends.get(&id.device_id)?;
         Some((device.drm_output_manager.device(), id.crtc))
     }
+}
+
+/// Writes `ramp` (red, green and blue tables back to back) into `crtc`'s
+/// `GAMMA_LUT`, or restores the identity ramp for `None`.
+fn write_gamma_lut(drm: &DrmDevice, crtc: crtc::Handle, ramp: Option<&[u16]>) -> Result<(), String> {
+    use smithay::reexports::drm::control::Device as ControlDevice;
+    use std::os::fd::AsFd;
+    let (lut_prop, _) = crtc_property(drm, crtc, "GAMMA_LUT").ok_or_else(|| "no GAMMA_LUT property".to_string())?;
+    let (_, size) = crtc_property(drm, crtc, "GAMMA_LUT_SIZE").ok_or_else(|| "no GAMMA_LUT_SIZE".to_string())?;
+    let size = size as usize;
+    let value = match ramp {
+        None => 0, // no blob: the kernel restores the identity ramp
+        Some(ramp) => {
+            if ramp.len() != size * 3 {
+                return Err(format!("expected {} ramp values, got {}", size * 3, ramp.len()));
+            }
+            // `struct drm_color_lut { u16 red, green, blue, reserved; }` per entry.
+            let mut blob = Vec::with_capacity(size * 8);
+            for i in 0..size {
+                for channel in 0..3 {
+                    blob.extend_from_slice(&ramp[channel * size + i].to_ne_bytes());
+                }
+                blob.extend_from_slice(&0u16.to_ne_bytes());
+            }
+            drm_ffi::mode::create_property_blob(drm.as_fd(), &mut blob)
+                .map_err(|err| format!("creating the LUT blob failed: {err}"))?
+                .blob_id as u64
+        }
+    };
+    tracing::debug!(size, reset = ramp.is_none(), "writing the gamma LUT");
+    drm.set_property(crtc, lut_prop, value)
+        .map_err(|err| format!("setting GAMMA_LUT failed: {err}"))
 }
 
 /// A DRM mode as `bsp-ipc`'s [`OutputMode`] (pixel size, millihertz).
@@ -634,6 +670,11 @@ struct SurfaceData {
     modes: Vec<smithay::reexports::drm::control::Mode>,
     drm_output: GbmDrmOutput,
     monitor_id: MonitorId,
+    /// The ramp a gamma client (`gammastep`) last set, kept to write it again
+    /// after a VT round trip (the other session resets the LUT).
+    gamma: Option<Vec<u16>>,
+    /// Write `gamma` again once the first frame after a resume has scanned out.
+    regamma: bool,
 }
 
 impl State<DrmData> {
@@ -961,6 +1002,8 @@ impl State<DrmData> {
                 modes: connector.modes().to_vec(),
                 drm_output,
                 monitor_id,
+                gamma: None,
+                regamma: false,
             },
         );
         self.adapter.hw.outputs.push(crate::hardware::HwOutput {
@@ -969,6 +1012,7 @@ impl State<DrmData> {
             mode: output_mode_of(drm_mode),
             scale: 1.0,
             position: (position.x, position.y),
+            transform: Default::default(),
         });
 
         // The surface starts dirty, so the main loop's `render_dirty`
@@ -1068,6 +1112,7 @@ impl State<DrmData> {
         };
         tracing::debug!(?crtc, "vblank");
         surface.frame_pending = false;
+        let regamma = if std::mem::take(&mut surface.regamma) { surface.gamma.clone() } else { None };
         match surface.drm_output.frame_submitted() {
             Ok(Some(Some(mut feedback))) => {
                 // `wp_presentation`: the frame reached the screen. The
@@ -1086,6 +1131,11 @@ impl State<DrmData> {
             }
             Ok(_) => {}
             Err(err) => tracing::warn!(?crtc, "failed to mark a frame submitted: {err}"),
+        }
+        if let (Some(ramp), Some(device)) = (regamma, self.backend_data.backends.get(&node)) {
+            if let Err(err) = write_gamma_lut(device.drm_output_manager.device(), crtc, Some(&ramp)) {
+                tracing::warn!(?crtc, "failed to restore the gamma ramp after a resume: {err}");
+            }
         }
     }
 
@@ -1317,8 +1367,10 @@ fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInp
                     return FilterResult::Intercept(());
                 }
                 if let Some(vt) = crate::input::vt_switch_target(mods, &sym, pressed) {
+                    data.backend_data.clear_outputs();
                     if let Err(err) = data.backend_data.session.change_vt(vt) {
                         tracing::warn!(vt, "failed to switch VT: {err}");
+                        data.backend_data.queue_redraw();
                     }
                     return FilterResult::Intercept(());
                 }
@@ -1509,6 +1561,10 @@ pub fn run() {
     for device in initial_devices {
         process_input_event(&mut state, InputEvent::DeviceAdded { device });
     }
+    // Kept for the session notifier below: libinput must be suspended when the
+    // session is paused (VT switch away) and resumed when it is active again,
+    // or every input device stays closed after the way back.
+    let mut libinput_session = libinput_context.clone();
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
     let handle: LoopHandle<'static, State<DrmData>> = event_loop.handle();
@@ -1520,18 +1576,35 @@ pub fn run() {
         return;
     }
 
-    if let Err(err) = handle.insert_source(notifier, |event, (), state| match event {
+    if let Err(err) = handle.insert_source(notifier, move |event, (), state| match event {
         SessionEvent::PauseSession => {
             tracing::info!("session paused");
+            libinput_session.suspend();
             for device in state.backend_data.backends.values_mut() {
+                // Too late to clear anything here (the kernel already took DRM master away on
+                // the switch); `DrmData::clear_outputs` runs before we ask for a switch.
                 device.drm_output_manager.pause();
             }
         }
         SessionEvent::ActivateSession => {
             tracing::info!("session resumed");
+            if libinput_session.resume().is_err() {
+                tracing::warn!("failed to resume libinput: input devices stay closed");
+            }
             for (node, device) in &mut state.backend_data.backends {
                 if let Err(err) = device.drm_output_manager.device_mut().activate(false) {
                     tracing::warn!(%node, "failed to reactivate a DRM device: {err}");
+                }
+            }
+            // Put the gamma ramps back before the first frame: the other session left
+            // its own LUT, and waiting for that frame showed the wrong colours for a moment.
+            for (node, device) in &state.backend_data.backends {
+                for (crtc, surface) in &device.surfaces {
+                    if let Some(ramp) = &surface.gamma {
+                        if let Err(err) = write_gamma_lut(device.drm_output_manager.device(), *crtc, Some(ramp)) {
+                            tracing::debug!(%node, "gamma ramp not restored at the resume: {err}");
+                        }
+                    }
                 }
             }
             let crtcs: Vec<(DrmNode, crtc::Handle)> = state
@@ -1562,6 +1635,7 @@ pub fn run() {
                 {
                     surface.frame_pending = false;
                     surface.dirty = true;
+                    surface.regamma = surface.gamma.is_some();
                 }
             }
         }
@@ -1694,6 +1768,7 @@ pub fn run() {
             crate::screencopy::fulfill(&mut state);
             crate::ext_capture::fulfill(&mut state);
             crate::export_dmabuf::fulfill(&mut state);
+            state.wm.sync_history();
             crate::extras::arm_commit_timers(&mut state);
             crate::session_lock::poll(&mut state);
             state.render_dirty();

@@ -14,7 +14,7 @@
 //! types with no event loop of their own: `bsp-ipc` stays free of
 //! `calloop` (`docs/design.md`, Architecture), so wiring a `Listener`'s
 //! and every open `Connection`'s file descriptor into the compositor's
-//! actual event loop is `bsp-compositor`'s job, which does not
+//! actual event loop is `bsp-compositor`'s job (nested compositor), which does not
 //! exist yet. What is here is fully usable and tested against real Unix
 //! sockets today.
 
@@ -138,7 +138,7 @@ impl AsRawFd for Connection {
 /// A `subscribe`d connection's state.
 ///
 /// bspwm: `src/types.h` `subscriber_list_t` (`field`/`count`; `fifo_path`
-/// is not implemented yet — `docs/bsp-ipc.md`, scope).
+/// is not implemented yet — `docs/bsp-ipc.md`, IPC scope).
 pub struct Subscriber {
     connection: Connection,
     masks: Vec<SubscriberMask>,
@@ -279,7 +279,7 @@ impl Subscribers {
     /// bspwm calls `put_status(SBSC_MASK_REPORT)` after most state
     /// changes; the executor instead reports back whether anything
     /// changed and leaves the call site to the caller (`docs/bsp-ipc.md`,
-    /// scope: exact per-call-site triggers were not replicated
+    /// IPC scope: exact per-call-site triggers were not replicated
     /// one by one).
     pub fn broadcast_report(&mut self, report: &crate::report::Report) {
         let line = report.to_string();

@@ -4,7 +4,7 @@
 //! bspwm: `src/types.h` `desktop_t`, `src/desktop.c`. Functions tied to
 //! history, EWMH, the stacking list, or focusing a different monitor are
 //! left out of the core (see the note on each function below); they need
-//! the monitor/adapter layer later steps add.
+//! the monitor/adapter layer added later.
 
 use crate::geometry::Padding;
 use crate::id::DesktopId;
@@ -20,7 +20,7 @@ const DEFAULT_DESK_NAME: &str = "Desktop";
 /// bspwm: `src/types.h` `desktop_t`.
 #[derive(Debug, Clone)]
 pub struct Desktop {
-    /// Stable identifier for `bsp-ipc` to reference.
+    /// Stable identifier for `bsp-ipc` (IPC) to reference.
     pub id: DesktopId,
     /// Display name (`bspc desktop -n`).
     pub name: String,

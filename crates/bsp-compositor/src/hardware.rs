@@ -34,6 +34,8 @@ pub struct HwOutput {
     pub scale: f64,
     /// Position in the global (logical) layout.
     pub position: (i32, i32),
+    /// Rotation and flip.
+    pub transform: bsp_ipc::command::OutputTransform,
 }
 
 /// Seat keyboard repeat and per-pointer acceleration, plus queued changes.
@@ -78,9 +80,10 @@ impl HwModel {
         let o = self.outputs.iter().find(|o| o.name == name)?;
         let modes: Vec<String> = o.modes.iter().map(|m| format_mode(*m)).collect();
         Some(format!(
-            "mode {}\nscale {}\nposition {} {}\nmodes {}\n",
+            "mode {}\nscale {}\ntransform {}\nposition {} {}\nmodes {}\n",
             format_mode(o.mode),
             o.scale,
+            o.transform.name(),
             o.position.0,
             o.position.1,
             modes.join(" ")
@@ -119,6 +122,10 @@ impl HwModel {
             }
             OutputAction::SetPosition(x, y) => {
                 o.position = (*x, *y);
+                action.clone()
+            }
+            OutputAction::SetTransform(t) => {
+                o.transform = *t;
                 action.clone()
             }
         };
@@ -186,6 +193,7 @@ mod tests {
                 mode: m,
                 scale: 1.0,
                 position: (0, 0),
+                transform: Default::default(),
             }],
             pointers: vec![("mouse".into(), 0.0)],
             repeat: (25, 600),
