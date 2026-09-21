@@ -472,8 +472,25 @@ fn has_x11_windows<Bd: Backend + 'static>(state: &State<Bd>) -> bool {
     state.space.elements().any(|w| w.x11_surface().is_some())
 }
 
-/// Arms the lazy stop: if, [`IDLE_STOP_AFTER`] from now, no X11 window is shown
-/// and no X11 client owns a selection, `Xwayland` is shut down. Re-arming
+/// How many X11 clients other than this compositor are connected to display
+/// `display`, counted with the X Resource extension by client process id
+/// (`None` if the server does not answer, or does not have the extension).
+///
+/// A client can hold an X connection without ever mapping a window: Firefox
+/// opens one for WebRTC screen capture. Stopping Xwayland under such a client
+/// kills it with an XIO error.
+fn foreign_x_clients(display: u32) -> Option<usize> {
+    use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt};
+    let (conn, _) = x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}"))).ok()?;
+    let spec = ClientIdSpec { client: 0, mask: ClientIdMask::LOCAL_CLIENT_PID };
+    let reply = conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
+    let own = std::process::id();
+    // A client whose pid is unknown (not reported) counts as foreign.
+    Some(reply.ids.iter().filter(|id| id.value.first().copied() != Some(own)).count())
+}
+
+/// Arms the lazy stop: if, [`IDLE_STOP_AFTER`] from now, no X11 window is shown,
+/// no X11 client is connected and none owns a selection, `Xwayland` is shut down. Re-arming
 /// replaces a pending check.
 fn schedule_idle_stop<Bd: Backend + 'static>(state: &mut State<Bd>) {
     use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -495,9 +512,15 @@ fn schedule_idle_stop<Bd: Backend + 'static>(state: &mut State<Bd>) {
                 running = state.xwayland.xwm.is_some(),
                 "Xwayland idle check"
             );
+            let clients = state.xwayland.display.and_then(foreign_x_clients);
             if state.xwayland.xwm.is_some() && !has_x11_windows(state) && !state.xwayland.selection_owned {
-                tracing::info!("no X11 windows left; stopping Xwayland");
-                restart(state);
+                if clients.is_some_and(|n| n > 0) {
+                    tracing::debug!(clients, "X11 clients without windows are connected; keeping Xwayland");
+                    schedule_idle_stop(state);
+                } else {
+                    tracing::info!("no X11 windows or clients left; stopping Xwayland");
+                    restart(state);
+                }
             }
             TimeoutAction::Drop
         })

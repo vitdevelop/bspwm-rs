@@ -839,6 +839,10 @@ fn do_transfer<A: Adapter>(
         let new_node = src_tree.transplant_to(&settings, n, dst_tree, anchor);
         ctx.registry
             .relocate((src_desktop, n), (dst_desktop, new_node));
+        // bspwm: `transfer_node()` arranges both desktops. The caller only
+        // arranges the destination, so the windows left behind on the source
+        // would keep the rectangles they had around the departed one.
+        arrange(ctx, src);
         new_node
     };
 
@@ -2125,6 +2129,24 @@ mod tests {
         assert!(dst_tree.root.is_some());
         let dst_desktop_id = wm.monitors[1].desktops[0].id;
         assert_eq!(registry.lookup(left_id).unwrap().0, dst_desktop_id);
+    }
+
+    #[test]
+    fn node_transfer_to_desktop_rearranges_the_source_desktop() {
+        let (mut wm, mut registry, mut adapter) = fixture();
+        let before = {
+            let t = &wm.monitors[0].desktops[0].tree;
+            let leaf = t.first_extrema(t.root).unwrap();
+            t.node(leaf).client.as_ref().unwrap().tiled_rectangle
+        };
+        let (reply, _) = run(&mut wm, &mut registry, &mut adapter, "node -d II");
+        assert_eq!(reply, Reply::Ok(String::new()));
+        // The window left behind grows into the freed space.
+        let t = &wm.monitors[0].desktops[0].tree;
+        let leaf = t.first_extrema(t.root).unwrap();
+        let after = t.node(leaf).client.as_ref().unwrap().tiled_rectangle;
+        assert_ne!(after, before);
+        assert_eq!(after.width, wm.monitors[0].rectangle.width - 2 * wm.settings.window_gap.max(0) - 2 * wm.settings.border_width);
     }
 
     #[test]

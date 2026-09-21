@@ -36,9 +36,10 @@ calloop = { version = "0.14", default-features = false, features = [
 # `ext-workspace-v1`. Both use the same `wayland-server` as Smithay.
 wayland-protocols = { version = "0.32", features = ["server", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
-# Reads a panel's `_NET_WM_STRUT_PARTIAL` from Xwayland (`crate::xwayland`); the
-# same version Smithay's own X11 window manager uses.
-x11rb = "0.13"
+# Reads a panel's `_NET_WM_STRUT_PARTIAL` and counts the X clients (`res`) from
+# Xwayland (`crate::xwayland`); the same version Smithay's own X11 window
+# manager uses.
+x11rb = { version = "0.13", features = ["res"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xkbcommon = "0.8"

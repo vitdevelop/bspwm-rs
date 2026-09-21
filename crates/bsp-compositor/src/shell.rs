@@ -148,12 +148,15 @@ fn toplevel_title(surface: &ToplevelSurface) -> String {
 smithay::delegate_xdg_shell!(@<Bd: Backend + 'static> State<Bd>);
 
 impl<Bd: Backend + 'static> State<Bd> {
-    /// The mapped `Window` showing `surface`, if any.
+    /// The managed `Window` of `surface`, if any: one shown in the space, or
+    /// one on a desktop that is not shown (which is out of the space but still
+    /// in the tree, and must still be found when its client closes it or dies).
     pub fn window_for_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
             .find(|w| w.wl_surface().as_deref() == Some(surface))
             .cloned()
+            .or_else(|| self.adapter.window_of_surface(surface))
     }
 
     /// Finds which desktop (by monitor/desktop index) and node currently
