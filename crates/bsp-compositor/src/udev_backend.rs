@@ -83,6 +83,13 @@ pub struct DrmData {
     pointers: Vec<smithay::reexports::input::Device>,
     /// The default cursor image (`crate::cursor`).
     cursor_images: crate::cursor::CursorImages,
+    /// When the session was last resumed, until its first frame is on screen
+    /// (logged, to time VT switches).
+    resumed_at: Option<std::time::Instant>,
+    /// A VT switch was asked for and the screen handed over: nothing more is
+    /// drawn until the session is resumed (a frame queued in between failed,
+    /// DRM master being on its way out).
+    handed_over: bool,
 }
 
 /// Where a capture is rendered to.
@@ -94,25 +101,22 @@ enum CaptureTarget<'a> {
 }
 
 impl DrmData {
-    /// Disables every plane and CRTC we use. Run while we still hold DRM master,
-    /// i.e. right before asking for a VT switch: the next session's compositor
-    /// only resets the planes it knows, and an overlay or cursor plane of ours
-    /// stayed on screen (a ghost of the last window in Hyprland).
-    fn clear_outputs(&mut self) {
-        for device in self.backends.values_mut() {
-            device.drm_output_manager.with_compositors(|compositors| {
-                for compositor in compositors.values() {
-                    match compositor.lock() {
-                        Ok(mut compositor) => {
-                            if let Err(err) = compositor.clear() {
-                                tracing::warn!("failed to clear an output before a VT switch: {err}");
-                            }
-                        }
-                        Err(_) => tracing::warn!("an output's compositor lock is poisoned; not cleared"),
-                    }
+    /// Disables our cursor and overlay planes on `crtc`: the fallback of
+    /// `State::switch_vt` when no final frame could be committed. Run while we
+    /// still hold DRM master: the next session's compositor only resets the
+    /// planes it knows, and an overlay or cursor plane of ours stayed on screen
+    /// (a ghost of the last window in Hyprland). The CRTC stays on.
+    fn clear_planes(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        let Some(device) = self.backends.get_mut(&node) else { return };
+        let Some(surface) = device.surfaces.get(&crtc) else { return };
+        surface.drm_output.with_compositor(|compositor| {
+            let surface = compositor.surface();
+            for plane in surface.planes().cursor.iter().chain(surface.planes().overlay.iter()) {
+                if let Err(err) = surface.clear_plane(plane.handle) {
+                    tracing::info!(plane = ?plane.handle, "failed to clear a plane before a VT switch: {err}");
                 }
-            });
-        }
+            }
+        });
     }
 
     /// The render node captures run on: the primary GPU's.
@@ -669,7 +673,6 @@ struct SurfaceData {
     /// The connector's DRM modes, for `bspc output -m`.
     modes: Vec<smithay::reexports::drm::control::Mode>,
     drm_output: GbmDrmOutput,
-    monitor_id: MonitorId,
     /// The ramp a gamma client (`gammastep`) last set, kept to write it again
     /// after a VT round trip (the other session resets the LUT).
     gamma: Option<Vec<u16>>,
@@ -934,7 +937,8 @@ impl State<DrmData> {
                 model,
             },
         );
-        output.create_global::<State<DrmData>>(&self.display_handle);
+        let global = output.create_global::<State<DrmData>>(&self.display_handle);
+        output.user_data().insert_if_missing(|| crate::lifecycle::OutputGlobal(global));
         // bspwm: monitors are laid out however RandR reports them;
         // there is no RandR here yet (`bspc output`'s `-p`/`--position`,
         // `docs/bsp-ipc.md` Hardware backend progress, is parsed but not wired to
@@ -950,30 +954,37 @@ impl State<DrmData> {
         self.space.map_output(&output, position);
         output.user_data().insert_if_missing(|| UdevOutputId { crtc, device_id: node });
 
-        let settings = self.wm.settings.clone();
-        let monitor_id = MonitorId(self.wm.monitors.iter().map(|m| m.id.0).max().unwrap_or(0) + 1);
-        let mut monitor = CoreMonitor::new(
-            monitor_id,
-            Some(&output_name),
-            Rect::new(position.x, position.y, wl_mode.size.w, wl_mode.size.h),
-            &settings,
-        );
-        let next_desktop_id = self
-            .wm
-            .monitors
-            .iter()
-            .flat_map(|m| m.desktops.iter().map(|d| d.id.0))
-            .max()
-            .unwrap_or(0)
-            + 1;
-        monitor.add_desktop(bsp_core::desktop::Desktop::new(
-            bsp_core::id::DesktopId(next_desktop_id),
-            Some("I"),
-            &settings,
-        ));
-        self.wm.add_monitor(monitor);
-        if self.wm.focused_monitor.is_none() {
-            self.wm.focus_monitor(self.wm.monitors.len() - 1);
+        let rect = Rect::new(position.x, position.y, wl_mode.size.w, wl_mode.size.h);
+        // bspwm: an output that comes back shows its old (unwired) monitor again.
+        let rewired = crate::lifecycle::rewire(&mut self.wm, &output_name);
+        let mut added = None;
+        if rewired.is_none() {
+            let settings = self.wm.settings.clone();
+            let monitor_id = MonitorId(self.wm.monitors.iter().map(|m| m.id.0).max().unwrap_or(0) + 1);
+            let mut monitor = CoreMonitor::new(
+                monitor_id,
+                Some(&output_name),
+                Rect::new(position.x, position.y, wl_mode.size.w, wl_mode.size.h),
+                &settings,
+            );
+            let next_desktop_id = self
+                .wm
+                .monitors
+                .iter()
+                .flat_map(|m| m.desktops.iter().map(|d| d.id.0))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            monitor.add_desktop(bsp_core::desktop::Desktop::new(
+                bsp_core::id::DesktopId(next_desktop_id),
+                Some("I"),
+                &settings,
+            ));
+            self.wm.add_monitor(monitor);
+            if self.wm.focused_monitor.is_none() {
+                self.wm.focus_monitor(self.wm.monitors.len() - 1);
+            }
+            added = Some(bsp_ipc::report::Event::MonitorAdd { id: monitor_id.0, name: output_name.clone(), geometry: rect });
         }
 
         let drm_output = match device.drm_output_manager.initialize_output::<_, DrmRenderElements<'_>>(
@@ -1001,7 +1012,6 @@ impl State<DrmData> {
                 frame_pending: false,
                 modes: connector.modes().to_vec(),
                 drm_output,
-                monitor_id,
                 gamma: None,
                 regamma: false,
             },
@@ -1014,6 +1024,13 @@ impl State<DrmData> {
             position: (position.x, position.y),
             transform: Default::default(),
         });
+        if let Some(id) = rewired {
+            crate::lifecycle::rewired(self, id, rect);
+        }
+        // bspwm: `add_monitor()` reports `monitor_add`.
+        if let Some(event) = added {
+            crate::ipc::broadcast_events(self, &[event]);
+        }
 
         // The surface starts dirty, so the main loop's `render_dirty`
         // draws its first frame.
@@ -1024,26 +1041,21 @@ impl State<DrmData> {
         let Some(device) = self.backend_data.backends.get_mut(&node) else {
             return;
         };
-        let Some(surface) = device.surfaces.remove(&crtc) else {
+        let Some(_surface) = device.surfaces.remove(&crtc) else {
             return;
         };
-        if let Some(index) = self.wm.monitor_index(surface.monitor_id) {
-            let removed = self.wm.remove_monitor(index);
-            let output = self
-                .space
-                .outputs()
-                .find(|o| {
-                    o.user_data()
-                        .get::<UdevOutputId>()
-                        .is_some_and(|id| *id == UdevOutputId { device_id: node, crtc })
-                })
-                .cloned();
-            if let Some(output) = output {
-                crate::layers::close_all(&output);
-                self.space.unmap_output(&output);
-            }
-            self.adapter.hw.outputs.retain(|o| o.name != removed.name);
-            tracing::info!(name = removed.name, "connector disconnected");
+        let output = self
+            .space
+            .outputs()
+            .find(|o| {
+                o.user_data()
+                    .get::<UdevOutputId>()
+                    .is_some_and(|id| *id == UdevOutputId { device_id: node, crtc })
+            })
+            .cloned();
+        if let Some(output) = output {
+            tracing::info!(name = output.name(), "connector disconnected");
+            crate::lifecycle::output_removed(self, &output, false);
         }
     }
 
@@ -1056,11 +1068,7 @@ impl State<DrmData> {
             %node, render_node = ?device.render_node, outputs = device.surfaces.len(),
             "DRM device removed; dropping its outputs and its renderer"
         );
-        for (crtc, surface) in device.surfaces {
-            if let Some(index) = self.wm.monitor_index(surface.monitor_id) {
-                let removed = self.wm.remove_monitor(index);
-                self.adapter.hw.outputs.retain(|o| o.name != removed.name);
-            }
+        for (crtc, _surface) in device.surfaces {
             let output = self
                 .space
                 .outputs()
@@ -1071,8 +1079,7 @@ impl State<DrmData> {
                 })
                 .cloned();
             if let Some(output) = output {
-                crate::layers::close_all(&output);
-                self.space.unmap_output(&output);
+                crate::lifecycle::output_removed(self, &output, false);
             }
         }
         self.handle.remove(device.registration_token);
@@ -1084,6 +1091,129 @@ impl State<DrmData> {
 }
 
 impl State<DrmData> {
+    /// `Ctrl+Alt+F<vt>`: leaves the screen in a state the next session can take
+    /// over at once, then asks logind for the switch.
+    ///
+    /// Each output gets one last frame composited entirely on its primary plane
+    /// (no overlay or cursor plane), committed synchronously while we still hold
+    /// DRM master. That commit turns our other planes off, so nothing of ours is
+    /// left over the next session's picture, and the CRTC stays on at its mode:
+    /// the monitor keeps its signal and the next session needs no full modeset.
+    /// Clearing the planes alone made a window shown on an overlay plane (direct
+    /// scan-out) vanish for the moment before the switch, leaving its border.
+    fn switch_vt(&mut self, vt: i32) {
+        let started = std::time::Instant::now();
+        tracing::info!(vt, "VT switch requested");
+        self.hand_over_screen();
+        tracing::info!(vt, elapsed = ?started.elapsed(), "screen handed over; switching VT");
+        match self.backend_data.session.change_vt(vt) {
+            Ok(()) => {
+                self.backend_data.handed_over = true;
+                // A switch that never happens (logind refused it quietly) must not
+                // leave the screen frozen: draw again after a second.
+                use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+                let _ = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(1)), |_, _, state| {
+                    if state.backend_data.handed_over && state.backend_data.session.is_active() {
+                        tracing::warn!("the VT switch did not happen; drawing again");
+                        state.backend_data.handed_over = false;
+                        state.backend_data.queue_redraw();
+                    }
+                    TimeoutAction::Drop
+                });
+            }
+            Err(err) => {
+                tracing::warn!(vt, "failed to switch VT: {err}");
+                self.backend_data.queue_redraw();
+            }
+        }
+    }
+
+    /// Leaves every output so the next DRM master (another session, the
+    /// console after an exit) can take it over at once: one final frame
+    /// composited on the primary plane, our cursor and overlay planes off, and
+    /// the gamma table back to identity (a gamma client's ramp, gammastep's,
+    /// would otherwise stay on the next session; it is written again on
+    /// resume). Must run while we still hold DRM master.
+    pub(crate) fn hand_over_screen(&mut self) {
+        let targets: Vec<(DrmNode, crtc::Handle)> = self
+            .backend_data
+            .backends
+            .iter()
+            .flat_map(|(node, device)| device.surfaces.keys().map(|crtc| (*node, *crtc)))
+            .collect();
+        for (node, crtc) in targets {
+            let composited = self.composite_final_frame(node, crtc);
+            // Also after a composited frame: any plane still bound to the CRTC is
+            // pulled into the next session's first commit by nvidia-drm when that
+            // commit changes the HDR infoframe (Hyprland's restore does), and one
+            // left from us made that commit fail with EINVAL.
+            self.backend_data.clear_planes(node, crtc);
+            let mut gamma_reset = false;
+            if let Some(device) = self.backend_data.backends.get(&node) {
+                if device.surfaces.get(&crtc).is_some_and(|s| s.gamma.is_some()) {
+                    match write_gamma_lut(device.drm_output_manager.device(), crtc, None) {
+                        Ok(()) => gamma_reset = true,
+                        Err(err) => tracing::info!(?crtc, "gamma table not reset before the hand-over: {err}"),
+                    }
+                }
+            }
+            tracing::info!(?crtc, composited, gamma_reset, "screen handed over");
+        }
+    }
+
+    /// Renders the output on `crtc` with everything on the primary plane and
+    /// commits it at once. `false` if that could not be done.
+    fn composite_final_frame(&mut self, node: DrmNode, crtc: crtc::Handle) -> bool {
+        let Some(output) = self
+            .space
+            .outputs()
+            .find(|o| o.user_data().get::<UdevOutputId>().is_some_and(|id| *id == UdevOutputId { device_id: node, crtc }))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(device) = self.backend_data.backends.get_mut(&node) else { return false };
+        let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
+        let Some(surface) = device.surfaces.get_mut(&crtc) else { return false };
+        let Ok(mut renderer) = renderer_for(
+            &mut self.backend_data.gpus,
+            self.backend_data.primary_gpu,
+            render_node,
+            surface.drm_output.format(),
+            surface.copy_route_failed,
+        ) else {
+            return false;
+        };
+        // No cursor: it would stay drawn over the next session's picture.
+        let Some(elements) = crate::render::output_elements(&output, &self.space, &self.wm, &mut renderer, Vec::new()) else {
+            return false;
+        };
+        let result = match surface.drm_output.render_frame(&mut renderer, &elements, crate::render::CLEAR_COLOR, FrameFlags::empty()) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::info!(?crtc, "final frame not rendered: {err}");
+                return false;
+            }
+        };
+        if result.needs_sync() {
+            if let smithay::backend::drm::compositor::PrimaryPlaneElement::Swapchain(element) = &result.primary_element {
+                if let Err(err) = element.sync.wait() {
+                    tracing::debug!(?crtc, "waiting for the final frame was interrupted: {err:?}");
+                }
+            }
+        }
+        if result.is_empty {
+            return false;
+        }
+        match surface.drm_output.commit_frame() {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::info!(?crtc, "final frame not committed: {err}");
+                false
+            }
+        }
+    }
+
     /// `DrmEvent::VBlank`: the previously queued frame finished scanning
     /// out — marks it submitted (releasing its swapchain buffer) and lets
     /// a waiting redraw proceed (`render_dirty`, run by the main loop
@@ -1096,6 +1226,9 @@ impl State<DrmData> {
         crtc: crtc::Handle,
         metadata: &mut Option<smithay::backend::drm::DrmEventMetadata>,
     ) {
+        if let Some(resumed) = self.backend_data.resumed_at.take() {
+            tracing::info!(?crtc, elapsed = ?resumed.elapsed(), "first frame on screen after the session resumed");
+        }
         let refresh = self
             .space
             .outputs()
@@ -1144,7 +1277,7 @@ impl State<DrmData> {
     /// surface whose frame is still pending is picked up on the turn
     /// after its vblank.
     fn render_dirty(&mut self) {
-        if !self.backend_data.session.is_active() {
+        if !self.backend_data.session.is_active() || self.backend_data.handed_over {
             return;
         }
         let mut due = Vec::new();
@@ -1174,7 +1307,7 @@ impl State<DrmData> {
         // Paused (switched to another VT): the DRM device is not ours to
         // touch, and rescheduling would only spin on "device paused"
         // errors — the session's resume handler re-kicks rendering.
-        if !self.backend_data.session.is_active() {
+        if !self.backend_data.session.is_active() || self.backend_data.handed_over {
             return;
         }
         let Some(output) = self
@@ -1298,7 +1431,16 @@ impl State<DrmData> {
     /// rather than waiting for a vblank that will never come (nothing
     /// was queued, so `frame_finish` has nothing to fire from).
     fn reschedule(&mut self, node: DrmNode, crtc: crtc::Handle, frame_target: smithay::utils::Time<smithay::utils::Monotonic>) {
-        let frame_duration = Duration::from_millis(16);
+        // One refresh interval of the output (60 Hz when it does not say).
+        let refresh_mhz = self
+            .space
+            .outputs()
+            .find(|o| o.user_data().get::<UdevOutputId>().is_some_and(|id| *id == UdevOutputId { device_id: node, crtc }))
+            .and_then(|o| o.current_mode())
+            .map(|mode| mode.refresh)
+            .filter(|&mhz| mhz > 0)
+            .unwrap_or(60_000);
+        let frame_duration = Duration::from_secs_f64(1000.0 / f64::from(refresh_mhz));
         let next_frame_target = frame_target + frame_duration;
         if let Err(err) = self.handle.insert_source(Timer::from_duration(frame_duration), move |_, _, data| {
             data.render_surface(node, crtc, next_frame_target);
@@ -1361,21 +1503,22 @@ fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInp
             let Some(keyboard) = state.seat.get_keyboard() else {
                 return;
             };
+            let mut switch_to = None;
             keyboard.input::<(), _>(state, keycode, key_state, serial, time, |data, mods, sym| {
                 if crate::input::is_emergency_quit(mods, &sym, pressed) {
                     data.running = false;
                     return FilterResult::Intercept(());
                 }
                 if let Some(vt) = crate::input::vt_switch_target(mods, &sym, pressed) {
-                    data.backend_data.clear_outputs();
-                    if let Err(err) = data.backend_data.session.change_vt(vt) {
-                        tracing::warn!(vt, "failed to switch VT: {err}");
-                        data.backend_data.queue_redraw();
-                    }
+                    switch_to = Some(vt);
                     return FilterResult::Intercept(());
                 }
                 crate::hotkeys::filter(data, mods, sym, pressed)
             });
+            // Outside the keyboard's own handling: this renders and commits.
+            if let Some(vt) = switch_to {
+                state.switch_vt(vt);
+            }
         }
         InputEvent::PointerMotion { event } => {
             use smithay::backend::input::PointerMotionEvent;
@@ -1469,6 +1612,8 @@ pub fn run() {
         keyboards: Vec::new(),
         pointers: Vec::new(),
         cursor_images: crate::cursor::CursorImages::load(),
+        resumed_at: None,
+        handed_over: false,
     };
 
     let hotkeys = crate::hotkeys::init();
@@ -1588,11 +1733,15 @@ pub fn run() {
         }
         SessionEvent::ActivateSession => {
             tracing::info!("session resumed");
+            state.backend_data.resumed_at = Some(std::time::Instant::now());
+            state.backend_data.handed_over = false;
             if libinput_session.resume().is_err() {
                 tracing::warn!("failed to resume libinput: input devices stay closed");
             }
             for (node, device) in &mut state.backend_data.backends {
-                if let Err(err) = device.drm_output_manager.device_mut().activate(false) {
+                // The manager also resets each output's view of its planes, which
+                // `clear_outputs` changed behind its back before the switch.
+                if let Err(err) = device.drm_output_manager.activate(false) {
                     tracing::warn!(%node, "failed to reactivate a DRM device: {err}");
                 }
             }
@@ -1759,12 +1908,12 @@ pub fn run() {
         if event_loop.dispatch(None, &mut state).is_err() {
             state.running = false;
         } else {
+            // The one reconcile of this turn, before anything reads the space.
+            crate::shell::run_deferred_sync(&mut state);
             state.space.refresh();
             state.popups.cleanup();
             crate::protocols::refresh_idle_inhibit(&mut state);
-            crate::taskbar::sync(&mut state);
-            crate::workspaces::sync(&mut state);
-            crate::output_management::sync(&mut state);
+            crate::extras::periodic_syncs(&mut state);
             crate::screencopy::fulfill(&mut state);
             crate::ext_capture::fulfill(&mut state);
             crate::export_dmabuf::fulfill(&mut state);
@@ -1774,5 +1923,11 @@ pub fn run() {
             state.render_dirty();
             let _ = display_handle.clone().flush_clients();
         }
+    }
+    // Leave the screen to the console or the next session as a VT switch does
+    // (Smithay's own restore of the start-up state fails on NVIDIA: the
+    // framebuffer it captured is gone by now).
+    if state.backend_data.session.is_active() {
+        state.hand_over_screen();
     }
 }

@@ -56,6 +56,15 @@ impl<Bd: Backend + 'static> XdgShellHandler for State<Bd> {
         }
     }
 
+    /// Not supported (see the capabilities in `State::new`); answered with the
+    /// current configure so the client does not wait for one (Smithay already
+    /// does this for `maximize_request`).
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
+    }
+
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
         xdg_fullscreen_request(self, &surface, true);
     }
@@ -159,6 +168,24 @@ impl<Bd: Backend + 'static> State<Bd> {
             .or_else(|| self.adapter.window_of_surface(surface))
     }
 
+    /// Gives the `Activated` state to the toplevel that holds keyboard focus
+    /// (`focused`) and takes it from every other shown one, sending a configure
+    /// where it changed: clients draw a focused window differently (GTK's
+    /// headerbars, caret blinking) and would keep whatever they mapped with.
+    pub fn update_activated(&mut self, focused: Option<&WlSurface>) {
+        // Every managed window, not just the shown ones: one that was focused
+        // when its desktop was switched away must lose `Activated` too.
+        for window in self.adapter.windows() {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            let active = focused == Some(toplevel.wl_surface());
+            if window.set_activated(active) && toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+        }
+    }
+
     /// Finds which desktop (by monitor/desktop index) and node currently
     /// hold the client for `window_id`, if any.
     fn locate_client(
@@ -215,15 +242,28 @@ fn map_new_toplevel<Bd: Backend + 'static>(state: &mut State<Bd>, toplevel: Topl
     });
     // A modal dialog (`xdg_dialog_v1`) floats centred, like an X11 dialog
     // (bspwm: `src/rule.c` `apply_rules()`, `_NET_WM_WINDOW_TYPE_DIALOG`).
+    // The same order bspwm applies a window's own hints in: type (a modal
+    // dialog), then state (fullscreen), then transient and fixed size (both
+    // float), then the rules on top.
     let mut defaults = bsp_core::rules::RuleConsequence::default();
+    if modal {
+        defaults.state = Some(bsp_core::node::ClientState::Floating);
+        defaults.center = Some(true);
+    }
     // A client that asked for fullscreen before its first commit (Qt does,
     // e.g. flameshot's capture overlay) starts fullscreen.
     if toplevel.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Fullscreen)) {
         defaults.state = Some(bsp_core::node::ClientState::Fullscreen);
     }
-    if modal {
+    // A dialog with a parent floats (`WM_TRANSIENT_FOR`), and so does a window
+    // whose minimum and maximum size are equal.
+    let (min_size, max_size) = with_states(toplevel.wl_surface(), |states| {
+        let mut cached = states.cached_state.get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+        let current = cached.current();
+        (Some(current.min_size), Some(current.max_size))
+    });
+    if toplevel.parent().is_some() || crate::xwayland::fixed_size(min_size, max_size) {
         defaults.state = Some(bsp_core::node::ClientState::Floating);
-        defaults.center = true;
     }
     // Native Wayland windows match `app_id` as both class and instance,
     // and the surface title as name (`docs/design.md` Compatibility).
@@ -248,18 +288,60 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
     title: String,
     defaults: bsp_core::rules::RuleConsequence,
 ) {
+    let mut consequence = defaults;
+    consequence.merge(&bsp_core::rules::match_rules(&mut state.wm.rules, &class, &instance, &title));
+    // `external_rules_command` may add effects; the window waits for it (the
+    // compositor does not, `spawn::start_external_rules`), as bspwm keeps a
+    // window pending while its rules command runs.
+    let command = state.wm.settings.external_rules_command.clone();
+    if command.is_empty() {
+        map_new_window_with(state, window, class, instance, title, consequence);
+        return;
+    }
+    let wid = window.x11_surface().map_or(0, |x| x.window_id());
+    let described = consequence.clone();
+    let (c, i) = (class.clone(), instance.clone());
+    crate::spawn::start_external_rules(
+        state,
+        &command,
+        wid,
+        &class,
+        &instance,
+        &described,
+        Box::new(move |state, extra| {
+            use smithay::utils::IsAlive;
+            let mut consequence = consequence;
+            if let Some(extra) = extra {
+                consequence.merge(&extra);
+            }
+            // Closed while the command ran: nothing to manage.
+            if window.alive() {
+                map_new_window_with(state, window, c, i, title, consequence);
+            }
+        }),
+    );
+}
+
+/// [`map_new_window`] once the rules, including the external command's, are
+/// merged into `consequence`.
+fn map_new_window_with<Bd: Backend + 'static>(
+    state: &mut State<Bd>,
+    window: Window,
+    class: String,
+    instance: String,
+    title: String,
+    consequence: bsp_core::rules::RuleConsequence,
+) {
     let app_id = class.clone();
-    let Some(mi) = state.wm.focused_monitor else {
+    let focus_before = crate::input::focus_key(state);
+    let Some(mut mi) = state.wm.focused_monitor else {
         tracing::warn!("no monitor to map a new window onto");
         return;
     };
-    let Some(di) = state.wm.monitors[mi].focused else {
+    let Some(mut di) = state.wm.monitors[mi].focused else {
         tracing::warn!("focused monitor has no desktop to map a new window onto");
         return;
     };
-
-    let mut consequence = defaults;
-    consequence.merge(&bsp_core::rules::match_rules(&mut state.wm.rules, &class, &instance, &title));
 
     // bspwm: `manage_window()`'s `!csq->manage` branch shows the window
     // where it is, outside the tree. Only an X11 window has a position of
@@ -274,13 +356,23 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
     state.toplevel_mapped(window_id, &title, &app_id);
 
     let settings = state.wm.settings.clone();
-    let desktop_id: DesktopId = state.wm.monitors[mi].desktops[di].id;
     // bspwm anchors a new node at the desktop's currently focused node
     // (`manage_window()`: `f = mon->desk->focus`), splitting its slot in
     // two — not always the tree root, which only coincides with focus
     // when the tree has at most one leaf.
-    let anchor = state.wm.monitors[mi].desktops[di].tree.focus;
+    let mut anchor = state.wm.monitors[mi].desktops[di].tree.focus;
+    // `monitor=`/`desktop=`/`node=` in a matched rule name where the window goes.
+    let placed = {
+        let ctx = bsp_ipc::exec::ExecCtx { wm: &mut state.wm, registry: &mut state.registry, adapter: &mut state.adapter };
+        bsp_ipc::exec::resolve_rule_target(&ctx, &consequence)
+    };
+    if let Some(t) = placed {
+        (mi, di, anchor) = (t.monitor, t.desktop, t.node);
+    }
+    let desktop_id: DesktopId = state.wm.monitors[mi].desktops[di].id;
 
+    let desktop_border_width = state.wm.monitors[mi].desktops[di].border_width;
+    let layouts = bsp_ipc::exec::layout_snapshot(&state.wm);
     let node = {
         let tree = &mut state.wm.monitors[mi].desktops[di].tree;
         if let Some(anchor) = anchor {
@@ -297,17 +389,29 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
                 tree.presel_ratio(anchor, ratio, Direction::East);
             }
         }
+        // bspwm: `c->border_width = csq->border ? d->border_width : 0`.
         let border_width = if consequence.should_border() {
-            settings.border_width
+            desktop_border_width
         } else {
             0
         };
         let core_client = CoreClient::new(window_id, border_width);
         let node = tree.new_client_node(&settings, core_client);
-        tree.insert_node(&settings, node, anchor);
-        node
+        let used_anchor = tree.insert_node(&settings, node, anchor);
+        (node, used_anchor)
     };
+    let (node, used_anchor) = node;
     state.registry.register(desktop_id, node);
+    // The split the insertion made needs an id too.
+    state.registry.sync_with(&state.wm);
+    // bspwm: `node_add <monitor> <desktop> <insertion anchor> <node>`.
+    let node_add = bsp_ipc::report::Event::NodeAdd {
+        monitor: state.wm.monitors[mi].id.0,
+        desktop: desktop_id.0,
+        ip_id: used_anchor.and_then(|a| state.registry.id_of(desktop_id, a)).unwrap_or(0),
+        node: state.registry.id_of(desktop_id, node).unwrap_or(0),
+    };
+    crate::ipc::broadcast_events(state, &[node_add]);
 
     if let Some(layer) = consequence.layer {
         state.wm.monitors[mi].desktops[di]
@@ -315,6 +419,12 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
             .set_layer(node, layer);
     }
 
+    refresh_size_hints(state, &window);
+    if let Some(honor) = consequence.honor_size_hints {
+        if let Some(client) = state.wm.monitors[mi].desktops[di].tree.node_mut(node).client.as_mut() {
+            client.honor_size_hints = honor;
+        }
+    }
     // A first `arrange()` here, before any state/vacancy change below,
     // computes a real tiled slot for this node — needed as the stand-in
     // `floating_rectangle` source just below. `state`/`hidden` are
@@ -350,6 +460,10 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
                 height: geometry.size.h,
             };
         }
+        // `rectangle=WxH+X+Y` in a rule.
+        if let Some(rect) = consequence.rect {
+            client.floating_rectangle = rect;
+        }
     }
 
     if let Some(cstate) = consequence.state {
@@ -368,7 +482,7 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
     // bspwm: `manage_window()`'s `if (csq->center && is_floating(...))
     // window_center()`: the floating rectangle centred in the monitor's
     // rectangle (`src/window.c` `window_center()`).
-    if consequence.center {
+    if consequence.should_center() {
         let monitor_rect = state.wm.monitors[mi].rectangle;
         if let Some(client) = state.wm.monitors[mi].desktops[di].tree.node_mut(node).client.as_mut() {
             if !client.state.is_tiled() {
@@ -382,6 +496,10 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
     // (bspwm: the single `arrange(m, d)` at the end of `manage_window()`,
     // split into two passes here only because of the seeding step above).
     state.wm.monitors[mi].arrange(di, &settings);
+    // `single_monocle` may have flipped the layout.
+    let mut flips = Vec::new();
+    bsp_ipc::exec::push_layout_changes(&state.wm, &layouts, &mut flips);
+    crate::ipc::broadcast_events(state, &flips);
 
     let fullscreen = state.wm.monitors[mi].desktops[di]
         .tree
@@ -428,22 +546,39 @@ pub(crate) fn map_new_window<Bd: Backend + 'static>(
         }
     }
 
-    state.space.map_element(window, (rect.x, rect.y), true);
+    // A window placed on a desktop that is not shown stays out of the space;
+    // it appears when its desktop does (`sync_wayland_from_core`).
+    let desktop_shown = state.wm.monitors[mi].focused == Some(di);
+    if desktop_shown {
+        state.space.map_element(window, (rect.x, rect.y), true);
+    }
 
-    // bspwm: `manage_window()`'s `if (!csq->hidden && csq->focus)` branch
-    // (simplified: always operating on the currently focused monitor and
-    // desktop, since no monitor=/desktop= targeting exists yet, so the
-    // `d == mon->desk || csq->follow` distinction never applies).
+    // bspwm: `manage_window()`'s `if (!csq->hidden && csq->focus)` branch:
+    // `focus_node()` on the shown desktop of the focused monitor (or with
+    // `follow=on`, which brings that desktop along), `activate_node()` elsewhere.
+    let dst = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
+    let on_focused_desktop = desktop_shown && state.wm.focused_monitor == Some(mi);
     if !hidden && consequence.should_focus() {
-        state.wm.monitors[mi].desktops[di].tree.focus = Some(node);
-        crate::input::focus_node(state, mi, di, node);
+        if on_focused_desktop || consequence.should_follow() {
+            // `focus_node()` also stacks the window on top of its level.
+            crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::focus_node(ctx, dst, events));
+            crate::input::focus_node(state, mi, di, node);
+        } else {
+            crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::activate_node(ctx, dst, events));
+        }
+    } else {
+        // bspwm: `manage_window()`'s `stack(d, n, false)`: a window that did
+        // not take focus goes to the bottom of its level.
+        crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::stack_node(ctx, dst, false, events));
     }
 
     // The new window split an existing one (or, for a floating or hidden one,
-    // changed nothing): resize the siblings whose rectangles just changed.
-    // Without this they keep their old size until something else (an IPC
-    // command, a pointer drag) happens to sync the tree to the surfaces.
-    sync_wayland_from_core(state);
+    // changed nothing): the siblings whose rectangles just changed are resized
+    // by the one sync at the end of this event-loop turn.
+    state.request_sync();
+
+    // bspwm: `focus_node()` centres the pointer on what it focuses.
+    crate::input::warp_pointer_for_focus(state, focus_before);
 
     tracing::info!(window = %window_id, ?rect, class = %app_id, fullscreen, "mapped a new window");
 }
@@ -466,9 +601,11 @@ pub(crate) fn unmap_window<Bd: Backend + 'static>(state: &mut State<Bd>, window:
     let Some(window_id) = state.adapter.id_of(&window) else {
         return;
     };
-    let Some((mi, di, node)) = state.locate_client(window_id) else {
-        return;
-    };
+    // A window whose node is already gone from the tree (`bspc node -k` removes
+    // it at once) still leaves the space, the adapter and the foreign-toplevel
+    // list when its surface dies.
+    let located = state.locate_client(window_id);
+    state.wm.stacking.remove(window_id);
 
     // The closing window must not keep the keyboard: once it is unmapped it no
     // longer counts as a window, and `sync_keyboard_focus` would take its
@@ -487,20 +624,49 @@ pub(crate) fn unmap_window<Bd: Backend + 'static>(state: &mut State<Bd>, window:
     state.adapter.remove(window_id);
     state.toplevel_unmapped(window_id);
 
+    let Some((mi, di, node)) = located else {
+        state.backend_data.queue_redraw();
+        return;
+    };
     let settings = state.wm.settings.clone();
+    let focus_before = crate::input::focus_key(state);
     let desktop_id = state.wm.monitors[mi].desktops[di].id;
+    // bspwm: `unmanage_window()` reports `node_remove` before `remove_node()`.
+    let node_remove = bsp_ipc::report::Event::NodeRemove {
+        monitor: state.wm.monitors[mi].id.0,
+        desktop: desktop_id.0,
+        node: state.registry.id_of(desktop_id, node).unwrap_or(0),
+    };
+    let layouts = bsp_ipc::exec::layout_snapshot(&state.wm);
     state.wm.monitors[mi].desktops[di]
         .tree
         .remove_node(&settings, node);
     state.registry.unregister(desktop_id, node);
+    state.registry.sync_with(&state.wm);
     // Closing the focused window leaves the tree without a focused node, and
     // then no directional focus command has a starting point: hand focus to
-    // the window focused before it.
-    state.wm.refocus_after_removal(mi, di);
+    // the window focused before it (bspwm: `remove_node()`'s
+    // `focus_node(m, d, NULL)` on the shown desktop, `activate_node()` elsewhere).
+    let shown = state.wm.focused_monitor == Some(mi) && state.wm.monitors[mi].focused == Some(di);
+    let desk = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: None };
+    crate::ipc::with_ops(state, |ctx, events| {
+        events.push(node_remove);
+        if ctx.wm.monitors[mi].desktops[di].tree.focus.is_none() {
+            if shown {
+                bsp_ipc::exec::focus_node(ctx, desk, events);
+            } else {
+                bsp_ipc::exec::activate_node(ctx, desk, events);
+            }
+        }
+    });
     state.wm.monitors[mi].arrange(di, &settings);
+    let mut flips = Vec::new();
+    bsp_ipc::exec::push_layout_changes(&state.wm, &layouts, &mut flips);
+    crate::ipc::broadcast_events(state, &flips);
     // The siblings grow into the freed space, and keyboard focus moves to
-    // the node the tree now focuses.
-    sync_wayland_from_core(state);
+    // the node the tree now focuses, at the end of this event-loop turn.
+    state.request_sync();
+    crate::input::warp_pointer_for_focus(state, focus_before);
 
     tracing::info!(window = %window_id, "unmapped a window");
 }
@@ -548,9 +714,17 @@ pub fn on_commit<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &WlSurfa
         return;
     };
     window.on_commit();
+    let recheck = with_states(surface, |states| states.data_map.get::<RecheckPointer>().is_some_and(|r| r.0.replace(false)));
+    if recheck {
+        crate::input::refresh_pointer_focus(state);
+    }
     let Some(toplevel) = window.toplevel() else {
         return;
     };
+    // A client that changed its min/max size is shown at the new limits.
+    if refresh_size_hints(state, &window) {
+        state.request_sync();
+    }
     let initial_configure_sent = with_states(surface, |states| {
         states
             .data_map
@@ -562,6 +736,159 @@ pub fn on_commit<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &WlSurfa
     if !initial_configure_sent {
         toplevel.send_configure();
     }
+}
+
+/// A window's size hints: xdg `set_min_size`/`set_max_size` (only those two
+/// exist on Wayland), or X11 `WM_NORMAL_HINTS` (min, max, base, increments,
+/// aspect), as Smithay keeps it current.
+///
+/// bspwm: `client_t.size_hints`, read in `src/window.c` `manage_window()` and
+/// on `PropertyNotify` of `WM_NORMAL_HINTS`.
+pub(crate) fn window_size_hints(window: &Window) -> bsp_core::node::SizeHints {
+    let positive = |(w, h): (i32, i32)| (w > 0 || h > 0).then_some((w.max(0), h.max(0)));
+    if let Some(toplevel) = window.toplevel() {
+        return with_states(toplevel.wl_surface(), |states| {
+            let mut cached = states.cached_state.get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+            let current = cached.current();
+            bsp_core::node::SizeHints {
+                min: positive((current.min_size.w, current.min_size.h)),
+                max: positive((current.max_size.w, current.max_size.h)),
+                ..Default::default()
+            }
+        });
+    }
+    if let Some(hints) = window.x11_surface().and_then(|x11| x11.size_hints()) {
+        return bsp_core::node::SizeHints {
+            min: hints.min_size.and_then(positive),
+            max: hints.max_size.and_then(positive),
+            base: hints.base_size.and_then(positive),
+            inc: hints.size_increment.filter(|&(w, h)| w > 0 && h > 0),
+            aspect: hints.aspect.map(|(min, max)| ((min.numerator, min.denominator), (max.numerator, max.denominator))),
+        };
+    }
+    bsp_core::node::SizeHints::default()
+}
+
+/// The hints last copied into the tree for a window, so a commit that did not
+/// change them costs no tree walk.
+struct KnownSizeHints(std::cell::Cell<Option<bsp_core::node::SizeHints>>);
+
+/// Copies the window's current size hints into its client when they changed.
+/// Returns whether they did (the window needs a new configure).
+pub(crate) fn refresh_size_hints<Bd: Backend + 'static>(state: &mut State<Bd>, window: &Window) -> bool {
+    let hints = window_size_hints(window);
+    let known = window.user_data().get_or_insert(|| KnownSizeHints(std::cell::Cell::new(None)));
+    if known.0.get() == Some(hints) {
+        return false;
+    }
+    let Some((mi, di, node)) = state.adapter.id_of(window).and_then(|id| state.locate_client(id)) else {
+        return false;
+    };
+    known.0.set(Some(hints));
+    let Some(client) = state.wm.monitors[mi].desktops[di].tree.node_mut(node).client.as_mut() else {
+        return false;
+    };
+    client.size_hints = hints;
+    true
+}
+
+/// Tells an `xdg_toplevel` whether it is suspended: on a desktop that is not
+/// shown, or hidden (xdg-shell v6 `suspended`, as cosmic-comp does), so
+/// browsers and games stop drawing frames nobody sees. Configured only when it
+/// changes.
+fn set_suspended(window: &Window, suspended: bool) {
+    let Some(toplevel) = window.toplevel() else { return };
+    let changed = toplevel.with_pending_state(|s| {
+        if s.states.contains(xdg_toplevel::State::Suspended) == suspended {
+            return false;
+        }
+        if suspended {
+            s.states.set(xdg_toplevel::State::Suspended);
+        } else {
+            s.states.unset(xdg_toplevel::State::Suspended);
+        }
+        true
+    });
+    if changed && toplevel.is_initial_configure_sent() {
+        toplevel.send_configure();
+    }
+}
+
+/// Set on a surface whose next commit should re-check what is under the pointer.
+struct RecheckPointer(std::cell::Cell<bool>);
+
+/// Makes the next commit of `surface` re-check the pointer focus
+/// ([`crate::input::refresh_pointer_focus`]).
+pub(crate) fn recheck_pointer_on_commit(surface: &WlSurface) {
+    with_states(surface, |states| {
+        states.data_map.insert_if_missing(|| RecheckPointer(std::cell::Cell::new(false)));
+        if let Some(r) = states.data_map.get::<RecheckPointer>() {
+            r.0.set(true);
+        }
+    });
+}
+
+/// Whether a managed X11 window was unmapped by [`set_x11_shown`].
+struct X11Hidden(std::cell::Cell<bool>);
+
+/// Maps or unmaps a managed X11 window in the X server as its node is shown
+/// or hidden (another desktop, `node -g hidden`).
+///
+/// bspwm: `show_node()`/`hide_node()` -> `window_show()`/`window_hide()`, which
+/// unmap the X window. Taking it out of the space alone is not enough: a game
+/// that holds an X pointer or keyboard grab (`XGrabPointer`) keeps it while
+/// its window stays viewable, and Xwayland then sends every click on the other
+/// X11 windows (Steam) to the game. Unmapping makes the window unviewable,
+/// which ends its grabs. Smithay unmaps the frame, not the client window, so
+/// this is not seen as the client withdrawing it, and the window is marked
+/// `IconicState`.
+fn set_x11_shown(window: &Window, shown: bool) {
+    let Some(x11) = window.x11_surface() else { return };
+    if x11.is_override_redirect() {
+        return;
+    }
+    let hidden = window.user_data().get_or_insert(|| X11Hidden(std::cell::Cell::new(false)));
+    if hidden.0.get() != shown {
+        return;
+    }
+    hidden.0.set(!shown);
+    if let Err(err) = x11.set_mapped(shown) {
+        tracing::debug!(shown, "cannot map or unmap an X11 window: {err}");
+    }
+}
+
+/// Runs the reconcile a pointer-grab callback asked for (`State::sync_pending`).
+/// Called once per event-loop turn, when no Smithay lock is held.
+pub fn run_deferred_sync<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    if std::mem::take(&mut state.sync_pending) {
+        sync_wayland_from_core(state);
+    }
+}
+
+/// Puts the shown windows in the space in `bsp-core`'s stacking order
+/// (`Wm::stacking`, bottom first). `Space::map_element` raises the window it
+/// touches, so without this a tiled window that is merely re-laid-out would end
+/// up above a floating one. Unmanaged X11 windows are raised over them again.
+pub(crate) fn apply_stacking<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    debug_assert!(!crate::pointer_action::in_grab_callback(), "stacking from a pointer grab callback; use `request_sync`");
+    let wanted: Vec<Window> = state
+        .wm
+        .stacking
+        .windows()
+        .iter()
+        .filter_map(|w| state.adapter.window(*w).cloned())
+        .filter(|w| state.space.element_location(w).is_some())
+        .collect();
+    let current: Vec<&Window> = state.space.elements().filter(|w| state.adapter.id_of(w).is_some()).collect();
+    if !current.iter().copied().eq(wanted.iter()) {
+        for window in &wanted {
+            state.space.raise_element(window, false);
+        }
+        state.backend_data.queue_redraw();
+    }
+    // Menus, tooltips and override-redirect (game) windows of X11 clients stay
+    // above the managed ones, whichever of them was just raised.
+    state.raise_unmanaged_x11();
 }
 
 /// Reconciles every mapped client's Wayland-visible position and size
@@ -576,6 +903,7 @@ pub fn on_commit<Bd: Backend + 'static>(state: &mut State<Bd>, surface: &WlSurfa
 /// `ack_configure` round trip means only the client can actually resize
 /// its own surface.
 pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    debug_assert!(!crate::pointer_action::in_grab_callback(), "sync inside a pointer grab callback deadlocks; set `sync_pending`");
     // Collected first, rather than acted on while borrowing `state.wm`,
     // since applying each one needs `&mut state.space`/`&mut state.adapter`.
     let mut updates = Vec::new();
@@ -584,8 +912,8 @@ pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
             // bspwm shows only a monitor's focused desktop
             // (`src/desktop.c` `show_desktop()`/`hide_desktop()`): windows
             // of every other desktop are unmapped, exactly like a hidden
-            // node (sticky nodes, which bspwm keeps visible across
-            // desktops, are not implemented in `bsp-core` yet).
+            // node (a sticky node is moved to the shown desktop by
+            // `exec::transfer_sticky_nodes` when the desktop changes).
             let on_shown_desktop = m.focused == Some(di);
             let mut n = d.tree.first_extrema(d.tree.root);
             while let Some(id) = n {
@@ -606,13 +934,21 @@ pub fn sync_wayland_from_core<Bd: Backend + 'static>(state: &mut State<Bd>) {
             if state.space.element_location(&window).is_some() {
                 state.space.unmap_elem(&window);
             }
+            set_x11_shown(&window, false);
+            set_suspended(&window, true);
             continue;
         }
+        set_x11_shown(&window, true);
+        set_suspended(&window, false);
         sync_one_window(state, &window, &client);
     }
+    apply_stacking(state);
     crate::input::sync_keyboard_focus(state);
+    let focused = state.seat.get_keyboard().and_then(|k| k.current_focus()).and_then(|t| t.wl_surface().map(|s| s.into_owned()));
+    state.update_activated(focused.as_ref());
+    crate::input::refresh_pointer_focus(state);
     crate::protocols::update_fractional_scales(state);
-    state.raise_unmanaged_x11();
+    crate::xwayland::publish_ewmh(state);
 }
 
 fn sync_one_window<Bd: Backend + 'static>(
@@ -620,10 +956,9 @@ fn sync_one_window<Bd: Backend + 'static>(
     window: &Window,
     client: &bsp_core::node::Client,
 ) {
-    let rect = match client.state {
-        bsp_core::node::ClientState::Floating => client.floating_rectangle,
-        _ => client.tiled_rectangle,
-    };
+    // bspwm: `apply_layout()` moves the window to the layout's rectangle
+    // after `apply_size_hints()`.
+    let rect = client.shown_rectangle();
     let want_fullscreen = client.state == bsp_core::node::ClientState::Fullscreen;
 
     let current_loc = state.space.element_location(window);
@@ -634,9 +969,11 @@ fn sync_one_window<Bd: Backend + 'static>(
 
     if let Some(toplevel) = window.toplevel() {
         let target = Size::from((rect.width.max(1), rect.height.max(1)));
-        let (current, is_fullscreen) =
-            toplevel.with_pending_state(|s| (s.size, s.states.contains(xdg_toplevel::State::Fullscreen)));
-        if current != Some(target) || is_fullscreen != want_fullscreen {
+        let want_tiled = client.state.is_tiled();
+        let (current, is_fullscreen, is_tiled) = toplevel.with_pending_state(|s| {
+            (s.size, s.states.contains(xdg_toplevel::State::Fullscreen), s.states.contains(xdg_toplevel::State::TiledLeft))
+        });
+        if current != Some(target) || is_fullscreen != want_fullscreen || is_tiled != want_tiled {
             toplevel.with_pending_state(|s| {
                 s.size = Some(target);
                 if want_fullscreen {
@@ -644,16 +981,40 @@ fn sync_one_window<Bd: Backend + 'static>(
                 } else {
                     s.states.unset(xdg_toplevel::State::Fullscreen);
                 }
+                // The tiled states follow the node's state (a window turned
+                // floating stops looking tiled, and back), so a client draws
+                // its corners and shadows accordingly.
+                for edge in [
+                    xdg_toplevel::State::TiledLeft,
+                    xdg_toplevel::State::TiledRight,
+                    xdg_toplevel::State::TiledTop,
+                    xdg_toplevel::State::TiledBottom,
+                ] {
+                    if want_tiled {
+                        s.states.set(edge);
+                    } else {
+                        s.states.unset(edge);
+                    }
+                }
             });
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_configure();
             }
         }
     } else if let Some(x11) = window.x11_surface() {
-        let target = smithay::utils::Rectangle::new(
+        let mut target = smithay::utils::Rectangle::new(
             (rect.x, rect.y).into(),
             (rect.width.max(1), rect.height.max(1)).into(),
         );
+        // A fullscreen game that changed the video mode keeps the size Xwayland
+        // emulates (and scales up itself) instead of being stretched.
+        if want_fullscreen && x11.geometry() != target {
+            let emulated = state.emulated_size_cached(x11.window_id());
+            tracing::debug!(class = x11.class(), geometry = ?x11.geometry(), ?target, ?emulated, "fullscreen X11 window differs from its slot");
+            if let Some((w, h)) = emulated.filter(|&(w, h)| w <= target.size.w && h <= target.size.h) {
+                target.size = (w, h).into();
+            }
+        }
         if x11.geometry() != target {
             if let Err(err) = x11.configure(target) {
                 tracing::debug!("cannot configure an X11 window: {err}");
@@ -738,6 +1099,12 @@ fn xdg_fullscreen_request<Bd: Backend + 'static>(state: &mut State<Bd>, surface:
         .window_for_surface(surface.wl_surface())
         .or_else(|| state.adapter.window_of_surface(surface.wl_surface()))
         .and_then(|w| state.adapter.id_of(&w));
+    // `ignore_ewmh_fullscreen`: the request is answered, with no change.
+    let ignored = state.wm.settings.ignore_ewmh_fullscreen;
+    if (on && ignored.enter) || (!on && ignored.exit) {
+        surface.send_configure();
+        return;
+    }
     let Some(id) = mapped else {
         surface.with_pending_state(|s| {
             if on {

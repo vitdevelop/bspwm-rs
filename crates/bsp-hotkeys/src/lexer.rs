@@ -65,10 +65,9 @@ pub fn parse(contents: &str) -> Vec<RawBinding> {
     let mut continuing = false;
 
     for line in contents.lines() {
-        if line.is_empty() {
+        let Some(first) = line.chars().next() else {
             continue;
-        }
-        let first = line.chars().next().expect("checked non-empty above");
+        };
         if first == '#' {
             continue;
         }

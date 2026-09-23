@@ -138,6 +138,24 @@ fn release_barriers<Bd: Backend + 'static>(state: &mut State<Bd>, fifo: bool) {
     }
 }
 
+/// The output showing most of `window` (the first on a tie), `None` while it is
+/// not in the space.
+fn primary_output<Bd: Backend + 'static>(state: &State<Bd>, window: &smithay::desktop::Window) -> Option<smithay::output::Output> {
+    let geometry = state.space.element_geometry(window)?;
+    let mut best: Option<(i64, smithay::output::Output)> = None;
+    for output in state.space.outputs_for_element(window) {
+        let area = state
+            .space
+            .output_geometry(&output)
+            .and_then(|g| g.intersection(geometry))
+            .map_or(0, |i| i64::from(i.size.w) * i64::from(i.size.h));
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            best = Some((area, output));
+        }
+    }
+    best.map(|(_, o)| o)
+}
+
 /// Ends a frame on `output`: sends frame callbacks to every window and
 /// layer surface, then releases their pacing barriers — the next FIFO
 /// commit of each may proceed, and commit-timed content due by now is
@@ -145,11 +163,92 @@ fn release_barriers<Bd: Backend + 'static>(state: &mut State<Bd>, fifo: bool) {
 /// visible damage still waits on the callback to draw its next frame.
 pub fn finish_frame<Bd: Backend + 'static>(state: &mut State<Bd>, output: &smithay::output::Output) {
     let now = state.start_time.elapsed();
-    for window in state.space.elements() {
-        window.send_frame(output, now, Some(std::time::Duration::from_secs(1)), |_, _| Some(output.clone()));
+    // A window on this output is paced by it: a callback every frame. Every other
+    // window, on another output or on a desktop that is not shown (out of the
+    // space), still gets one about once a second, so a client blocked waiting
+    // for a callback (an Xwayland one stalls the others) is not stuck for good.
+    // A window that lies on several outputs is paced by the one showing most
+    // of it, not by each of them. An Xwayland window is never throttled (as in
+    // cosmic-comp): Xwayland serializes presentation, so one slow callback
+    // would delay every other X11 window.
+    let windows: Vec<smithay::desktop::Window> = state
+        .space
+        .elements()
+        .chain(state.adapter.windows())
+        .fold(Vec::new(), |mut all, w| {
+            if !all.contains(w) {
+                all.push(w.clone());
+            }
+            all
+        });
+    for window in windows {
+        let here = primary_output(state, &window).as_ref() == Some(output);
+        let throttle = if window.x11_surface().is_some() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_millis(995)
+        };
+        window.send_frame(output, now, Some(throttle), |_, _| here.then(|| output.clone()));
     }
     crate::layers::send_frames(output, now);
     release_barriers(state, true);
+}
+
+/// How often the taskbar, workspace and output-management diffs run at most.
+/// They rebuild their view of every window and desktop and compare it with what
+/// clients were last told, which nothing needs a thousand times a second: an
+/// event loop turn per pointer-motion report would run them at the mouse's
+/// polling rate. A change waits at most this long (imperceptible for a bar).
+const PERIODIC_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// How much longer to wait before the periodic syncs may run again, or `None`
+/// if they are due now.
+fn periodic_wait(last: Option<std::time::Instant>, now: std::time::Instant) -> Option<std::time::Duration> {
+    let due = last? + PERIODIC_SYNC_EVERY;
+    due.checked_duration_since(now).filter(|d| !d.is_zero())
+}
+
+/// Runs the taskbar, workspace and output-management diffs, at most once per
+/// [`PERIODIC_SYNC_EVERY`]. A turn that comes too early arms one timer for the
+/// moment they are due, so the last change before a quiet spell is still
+/// reported on time (the timer's wake-up is a turn of its own).
+pub fn periodic_syncs<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    crate::ipc::flush_ipc(state);
+    crate::xwayland::reap_dead(state);
+    let now = std::time::Instant::now();
+    if let Some(wait) = periodic_wait(state.last_periodic_sync, now) {
+        if !state.periodic_timer_armed {
+            state.periodic_timer_armed = true;
+            let armed = state.handle.insert_source(Timer::from_duration(wait), |_, _, state| {
+                state.periodic_timer_armed = false;
+                TimeoutAction::Drop
+            });
+            if armed.is_err() {
+                state.periodic_timer_armed = false;
+            }
+        }
+        return;
+    }
+    state.last_periodic_sync = Some(now);
+    crate::taskbar::sync(state);
+    crate::workspaces::sync(state);
+    crate::output_management::sync(state);
+}
+
+#[cfg(test)]
+mod periodic_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_periodic_syncs_run_at_most_once_per_interval() {
+        let t0 = Instant::now();
+        assert_eq!(periodic_wait(None, t0), None, "the first turn runs");
+        assert_eq!(periodic_wait(Some(t0), t0 + Duration::from_millis(1)), Some(PERIODIC_SYNC_EVERY - Duration::from_millis(1)));
+        assert_eq!(periodic_wait(Some(t0), t0 + PERIODIC_SYNC_EVERY), None);
+        assert_eq!(periodic_wait(Some(t0), t0 + Duration::from_secs(1)), None);
+    }
 }
 
 /// Wakes the compositor when a commit-timed commit becomes due. Such a

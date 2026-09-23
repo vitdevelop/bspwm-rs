@@ -29,5 +29,6 @@ pub mod monitor;
 pub mod node;
 pub mod rules;
 pub mod settings;
+pub mod stack;
 pub mod tree;
 pub mod wm;

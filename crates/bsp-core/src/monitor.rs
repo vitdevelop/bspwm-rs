@@ -9,7 +9,7 @@ use crate::desktop::Desktop;
 use crate::geometry::{Padding, Rect};
 use crate::id::MonitorId;
 use crate::settings::Settings;
-use crate::tree::Layout;
+use crate::tree::{Layout, LayoutOptions};
 
 const DEFAULT_MON_NAME: &str = "MONITOR";
 
@@ -45,13 +45,30 @@ pub struct Monitor {
     /// Index into `desktops` of the focused desktop, or `None` if the
     /// monitor holds no desktops.
     pub focused: Option<usize>,
-    /// Number of sticky nodes across this monitor's focused desktop.
+    /// Whether this is the only monitor (kept up to date by `Wm::add_monitor`
+    /// and `Wm::remove_monitor`); `borderless_singleton` applies only then.
     ///
-    /// bspwm: `src/types.h` `monitor_t.sticky_count`.
-    pub sticky_count: u32,
+    /// bspwm: `apply_layout()`'s `!m->prev && !m->next`.
+    pub sole: bool,
+    /// Whether the monitor is a virtual (headless) output: it does not count
+    /// against `sole` on the real screens.
+    pub virtual_output: bool,
+    /// Whether an output shows this monitor. An unplugged output leaves its
+    /// monitor (desktops and windows included) in place, unwired, until the
+    /// output comes back, unless `remove_unplugged_monitors` is set.
+    ///
+    /// bspwm: `src/types.h` `monitor_t.wired`.
+    pub wired: bool,
 }
 
 impl Monitor {
+    /// The sticky nodes of the monitor (they are always on its shown desktop).
+    ///
+    /// bspwm: `monitor_t.sticky_count`, kept as a counter there.
+    pub fn sticky_count(&self) -> u32 {
+        self.desktops.iter().map(|d| d.tree.sticky_count(d.tree.root)).sum()
+    }
+
     /// Creates a monitor with no desktops.
     ///
     /// bspwm: `src/monitor.c` `make_monitor()`, minus the RandR/root
@@ -67,7 +84,9 @@ impl Monitor {
             border_width: settings.border_width,
             desktops: Vec::new(),
             focused: None,
-            sticky_count: 0,
+            sole: true,
+            virtual_output: false,
+            wired: true,
         }
     }
 
@@ -89,6 +108,16 @@ impl Monitor {
     pub fn add_desktop(&mut self, mut d: Desktop) {
         d.border_width = self.border_width;
         d.window_gap = self.window_gap;
+        self.insert_desktop(d);
+    }
+
+    /// Appends a desktop as it is, keeping its own gap and border width, and
+    /// focuses it if it is the monitor's first desktop. This is what moving an
+    /// existing desktop from another monitor uses.
+    ///
+    /// bspwm: `src/desktop.c` `insert_desktop()` (called by `transfer_desktop()`;
+    /// only `add_desktop()`, for a new desktop, overwrites the gap and border).
+    pub fn insert_desktop(&mut self, d: Desktop) {
         self.desktops.push(d);
         if self.focused.is_none() {
             self.focused = Some(0);
@@ -158,6 +187,8 @@ impl Monitor {
     ///
     /// bspwm: `src/tree.c` `arrange()`.
     pub fn arrange(&mut self, index: usize, settings: &Settings) {
+        let sole = self.sole;
+        self.desktops[index].apply_single_monocle(settings.single_monocle);
         let m_rect = self.rectangle;
         let m_padding = Padding {
             top: self.padding.top + self.struts.top,
@@ -191,8 +222,14 @@ impl Monitor {
             rect.height -= d.window_gap;
         }
 
+        let options = LayoutOptions {
+            gapless_monocle: settings.gapless_monocle,
+            borderless_monocle: settings.borderless_monocle,
+            borderless_singleton: settings.borderless_singleton && sole,
+            center_pseudo_tiled: settings.center_pseudo_tiled,
+        };
         d.tree
-            .apply_layout(d.tree.root, rect, d.window_gap, d.layout, m_rect);
+            .apply_layout(d.tree.root, rect, d.window_gap, d.layout, m_rect, options);
     }
 }
 
@@ -246,7 +283,9 @@ pub fn adapt_geometry(
             fr.x = rd.x + dx_d - left_adjust;
             fr.y = rd.y + dy_d - top_adjust;
 
-            tree.node_mut(n).client.as_mut().unwrap().floating_rectangle = fr;
+            if let Some(client) = tree.node_mut(n).client.as_mut() {
+                client.floating_rectangle = fr;
+            }
         }
         f = tree.next_leaf(Some(n), root);
     }
@@ -291,6 +330,51 @@ mod tests {
         m.add_desktop(Desktop::new(DesktopId(1), None, &settings));
         assert_eq!(m.desktops[0].window_gap, 99);
         assert_eq!(m.desktops[0].border_width, 4);
+    }
+
+    #[test]
+    fn insert_desktop_keeps_the_desktops_own_gap_and_border_width() {
+        // bspwm: `transfer_desktop()` calls `insert_desktop()`, which unlike
+        // `add_desktop()` leaves the desktop's own values alone.
+        let settings = settings();
+        let mut m = Monitor::new(MonitorId(1), None, Rect::new(0, 0, 1920, 1080), &settings);
+        m.window_gap = 99;
+        m.border_width = 4;
+        let mut d = Desktop::new(DesktopId(1), None, &settings);
+        d.window_gap = 7;
+        d.border_width = 2;
+        m.insert_desktop(d);
+        assert_eq!((m.desktops[0].window_gap, m.desktops[0].border_width), (7, 2));
+        assert_eq!(m.focused, Some(0));
+    }
+
+    #[test]
+    fn single_monocle_follows_the_tiled_window_count_when_arranging() {
+        // bspwm: `single_monocle` blocks in `manage_window()`/`remove_node()`/`set_state()`.
+        let mut settings = settings();
+        settings.single_monocle = true;
+        let mut m = Monitor::new(MonitorId(1), None, Rect::new(0, 0, 800, 600), &settings);
+        m.add_desktop(Desktop::new(DesktopId(1), None, &settings));
+        let insert = |m: &mut Monitor, w: u32, anchor| {
+            let t = &mut m.desktops[0].tree;
+            let n = t.new_client_node(&settings, crate::node::Client::new(crate::id::WindowId(w), 1));
+            t.insert_node(&settings, n, anchor);
+            n
+        };
+        let a = insert(&mut m, 1, None);
+        m.arrange(0, &settings);
+        assert_eq!(m.desktops[0].layout, Layout::Monocle);
+        let b = insert(&mut m, 2, Some(a));
+        m.arrange(0, &settings);
+        assert_eq!(m.desktops[0].layout, Layout::Tiled, "a second window restores the user's layout");
+        m.desktops[0].tree.remove_node(&settings, b);
+        m.arrange(0, &settings);
+        assert_eq!(m.desktops[0].layout, Layout::Monocle);
+        // Off: the layout is left alone.
+        settings.single_monocle = false;
+        m.desktops[0].layout = Layout::Tiled;
+        m.arrange(0, &settings);
+        assert_eq!(m.desktops[0].layout, Layout::Tiled);
     }
 
     #[test]

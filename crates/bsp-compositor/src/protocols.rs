@@ -232,11 +232,14 @@ impl<Bd: Backend + 'static> DataDeviceHandler for State<Bd> {
     }
 }
 impl<Bd: Backend + 'static> ClientDndGrabHandler for State<Bd> {
+    // Both run inside Smithay's DnD pointer grab.
     fn started(&mut self, source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>, _icon: Option<WlSurface>, _seat: Seat<Self>) {
+        let _guard = crate::pointer_action::GrabGuard::enter();
         crate::toplevel_drag::drag_started(self, source.as_ref());
     }
 
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        let _guard = crate::pointer_action::GrabGuard::enter();
         crate::toplevel_drag::drag_ended(self);
     }
 }
@@ -264,21 +267,41 @@ delegate_data_control!(@<Bd: Backend + 'static> State<Bd>);
 /// scheme exists precisely so a background client cannot steal focus).
 const ACTIVATION_TOKEN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Marks an activation token whose serial proved it came from a real event.
+struct FocusToken;
+
 impl<Bd: Backend + 'static> XdgActivationHandler for State<Bd> {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.protocols.activation
     }
 
-    /// A token is only worth creating if it carries the serial of a real
-    /// input event (a click or key that launched the app, or a focus
-    /// event); a client cannot mint one out of nothing.
+    /// Every token is created, but only one that carries the serial of a real
+    /// event on this seat (no older than the keyboard's last focus change) may
+    /// take focus; any other can only mark its window urgent. A client cannot
+    /// mint a focus-stealing token out of nothing (anvil's `token_created`,
+    /// cosmic-comp's urgent-only tokens).
     fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        let valid = data.serial.is_some();
+        let valid = data.serial.as_ref().is_some_and(|(serial, seat)| {
+            smithay::input::Seat::from_resource(seat).as_ref() == Some(&self.seat)
+                && self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|keyboard| keyboard.last_enter())
+                    .is_some_and(|last_enter| serial.is_no_older_than(&last_enter))
+        });
         tracing::debug!(token = token.as_str(), valid, app_id = ?data.app_id, "activation token requested");
-        valid
+        if valid {
+            data.user_data.insert_if_missing(|| FocusToken);
+        }
+        true
     }
 
     fn request_activation(&mut self, token: XdgActivationToken, token_data: XdgActivationTokenData, surface: WlSurface) {
+        // `ignore_ewmh_focus`: windows may not ask for focus.
+        if self.xwayland.ignore_focus {
+            self.protocols.activation.remove_token(&token);
+            return;
+        }
         let fresh = token_data.timestamp.elapsed() < ACTIVATION_TOKEN_LIFETIME;
         // One-shot: a used or stale token is dropped either way.
         self.protocols.activation.remove_token(&token);
@@ -296,6 +319,15 @@ impl<Bd: Backend + 'static> XdgActivationHandler for State<Bd> {
         let Some((mi, di, node)) = crate::input::locate_window(self, window_id) else {
             return;
         };
+        if token_data.user_data.get::<FocusToken>().is_none() {
+            // bspwm: an unfocused window that asks for attention is urgent
+            // (`_NET_WM_STATE_DEMANDS_ATTENTION`), shown as `u` in the report.
+            tracing::debug!(window = %window_id, "activation without a valid serial: marking the window urgent");
+            let trg = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
+            crate::ipc::with_ops(self, |ctx, events| bsp_ipc::exec::set_urgent(ctx, trg, true, events));
+            self.backend_data.queue_redraw();
+            return;
+        }
         // Same as bspwm's `_NET_ACTIVE_WINDOW`: focusing the node also
         // moves focus to its desktop and monitor.
         tracing::debug!(window = %window_id, "activating a window on request");

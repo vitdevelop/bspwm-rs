@@ -211,6 +211,42 @@ impl Default for Constraints {
     }
 }
 
+/// Where the preselection feedback of a node at `node_rect` is drawn: the
+/// part the next window will take, inside the node's rectangle less the
+/// window gap. North and West take `split_ratio` of the size, East and South
+/// the rest, against the far edge.
+///
+/// bspwm: `src/window.c` `draw_presel_feedback()`.
+pub fn presel_rect(node_rect: Rect, presel: Presel, gap: i32) -> Rect {
+    let width = (node_rect.width - gap).max(0);
+    let height = (node_rect.height - gap).max(0);
+    let ratio = presel.split_ratio;
+    let (mut x, mut y, mut w, mut h) = (0, 0, width, height);
+    match presel.split_dir {
+        Direction::North => h = (ratio * f64::from(height)) as i32,
+        Direction::East => {
+            w = ((1.0 - ratio) * f64::from(width)) as i32;
+            x = width - w;
+        }
+        Direction::South => {
+            h = ((1.0 - ratio) * f64::from(height)) as i32;
+            y = height - h;
+        }
+        Direction::West => w = (ratio * f64::from(width)) as i32,
+    }
+    Rect::new(node_rect.x + x, node_rect.y + y, w, h)
+}
+
+/// What [`Tree::swap_subtrees_with`] moved: for each direction the new root id
+/// and every `(old, new)` node id pair.
+#[derive(Debug, Clone)]
+pub struct SubtreeSwap {
+    /// The subtree that left `self` for `other`.
+    pub into_other: (NodeId, Vec<(NodeId, NodeId)>),
+    /// The subtree that left `other` for `self`.
+    pub into_self: (NodeId, Vec<(NodeId, NodeId)>),
+}
+
 /// One node in the tree: either an internal split node (`client` is
 /// `None`) or a leaf, which is either a receptacle (`client` is `None`,
 /// `first_child`/`second_child` are `None`) or a window (`client` is
@@ -320,6 +356,23 @@ pub struct Tree {
     pub focus: Option<NodeId>,
 }
 
+/// The settings `Tree::apply_layout` reads, gathered so a layout is one call.
+///
+/// bspwm: the globals `gapless_monocle`, `borderless_monocle`,
+/// `borderless_singleton` and `center_pseudo_tiled`, read by `apply_layout()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutOptions {
+    /// Drop the window gap in monocle layout.
+    pub gapless_monocle: bool,
+    /// No border on tiled windows in monocle layout.
+    pub borderless_monocle: bool,
+    /// No border on the only window: `borderless_singleton` is set and this is
+    /// the only monitor (the tree's root must also be a single window).
+    pub borderless_singleton: bool,
+    /// Centre a pseudo-tiled window in its slot.
+    pub center_pseudo_tiled: bool,
+}
+
 impl Tree {
     /// Creates an empty tree.
     pub fn new() -> Self {
@@ -337,6 +390,20 @@ impl Tree {
         }
     }
 
+    /// Every node reachable from the root (splits included), in pre-order.
+    pub fn node_ids(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.root.into_iter().collect();
+        while let Some(n) = stack.pop() {
+            out.push(n);
+            let node = self.node(n);
+            // Pushed second child first, so the first child is visited first.
+            stack.extend(node.second_child);
+            stack.extend(node.first_child);
+        }
+        out
+    }
+
     /// Creates a bare, parentless node (an empty receptacle once inserted).
     ///
     /// bspwm: `src/tree.c` `make_node()`.
@@ -345,8 +412,10 @@ impl Tree {
     }
 
     /// Creates a leaf node already holding `client`.
-    pub fn new_client_node(&mut self, settings: &Settings, client: Client) -> NodeId {
+    pub fn new_client_node(&mut self, settings: &Settings, mut client: Client) -> NodeId {
         let mut node = Node::new(settings);
+        // bspwm: `make_client()` takes the setting's value.
+        client.honor_size_hints = settings.honor_size_hints;
         node.client = Some(client);
         self.alloc(node)
     }
@@ -442,6 +511,42 @@ impl Tree {
             cur = c;
         }
         Some(cur)
+    }
+
+    /// bspwm: `src/tree.c` `next_node()`: the next node in in-order (a node's
+    /// first subtree, the node itself, its second subtree), internal nodes
+    /// included; `None` after the last.
+    pub fn next_node(&self, id: Option<NodeId>) -> Option<NodeId> {
+        let n = id?;
+        if let Some(second) = self.node(n).second_child {
+            return self.first_extrema(Some(second));
+        }
+        let mut p = n;
+        while self.is_second_child(p) {
+            p = self.node(p).parent?;
+        }
+        if self.is_first_child(p) {
+            self.node(p).parent
+        } else {
+            None
+        }
+    }
+
+    /// bspwm: `src/tree.c` `prev_node()`: the reverse of [`Tree::next_node`].
+    pub fn prev_node(&self, id: Option<NodeId>) -> Option<NodeId> {
+        let n = id?;
+        if let Some(first) = self.node(n).first_child {
+            return self.second_extrema(Some(first));
+        }
+        let mut p = n;
+        while self.is_first_child(p) {
+            p = self.node(p).parent?;
+        }
+        if self.is_second_child(p) {
+            self.node(p).parent
+        } else {
+            None
+        }
     }
 
     /// bspwm: `src/tree.c` `second_extrema()`.
@@ -574,7 +679,7 @@ impl Tree {
     /// bspwm: `src/tree.c` `get_rectangle()`. A client node instead
     /// reports whichever of `floating_rectangle`/`tiled_rectangle` its
     /// state selects.
-    pub fn get_rectangle(&self, id: NodeId, window_gap: i32, layout: Layout) -> Rect {
+    pub fn get_rectangle(&self, id: NodeId, window_gap: i32, layout: Layout, gapless_monocle: bool) -> Rect {
         let node = self.node(id);
         if let Some(c) = &node.client {
             return if c.state == ClientState::Floating {
@@ -583,7 +688,7 @@ impl Tree {
                 c.tiled_rectangle
             };
         }
-        let wg = if layout == Layout::Monocle {
+        let wg = if gapless_monocle && layout == Layout::Monocle {
             0
         } else {
             window_gap
@@ -672,15 +777,18 @@ impl Tree {
         self.propagate_vacant_downward(second, value);
     }
 
+    /// The two children of a split node; `None` for a leaf (or a corrupt split
+    /// that lacks one), where the callers just stop instead of panicking.
+    fn children(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
+        let n = self.node(id);
+        Some((n.first_child?, n.second_child?))
+    }
+
     fn propagate_vacant_upward(&mut self, id: Option<NodeId>) {
         let Some(id) = id else { return };
         let parent = self.node(id).parent;
         if let Some(p) = parent {
-            let both_vacant = {
-                let pn = self.node(p);
-                self.node(pn.first_child.unwrap()).vacant
-                    && self.node(pn.second_child.unwrap()).vacant
-            };
+            let both_vacant = self.children(p).is_some_and(|(a, b)| self.node(a).vacant && self.node(b).vacant);
             self.set_vacant_local(p, both_vacant);
         }
         self.propagate_vacant_upward(parent);
@@ -725,11 +833,7 @@ impl Tree {
         let Some(id) = id else { return };
         let parent = self.node(id).parent;
         if let Some(p) = parent {
-            let both_hidden = {
-                let pn = self.node(p);
-                self.node(pn.first_child.unwrap()).hidden
-                    && self.node(pn.second_child.unwrap()).hidden
-            };
+            let both_hidden = self.children(p).is_some_and(|(a, b)| self.node(a).hidden && self.node(b).hidden);
             self.set_hidden_local(p, both_hidden);
         }
         self.propagate_hidden_upward(parent);
@@ -751,14 +855,11 @@ impl Tree {
         if self.is_leaf(id) {
             return;
         }
-        let (first, second, split_type) = {
-            let n = self.node(id);
-            (
-                n.first_child.unwrap(),
-                n.second_child.unwrap(),
-                n.split_type,
-            )
+        let Some((first, second)) = self.children(id) else {
+            debug_assert!(false, "a split node without two children");
+            return;
         };
+        let split_type = self.node(id).split_type;
         let fc = self.node(first).constraints;
         let sc = self.node(second).constraints;
         let constraints = if split_type == SplitType::Vertical {
@@ -804,9 +905,9 @@ impl Tree {
         let Some(id) = id else { return };
         let parent = self.node(id).parent;
         if let Some(p) = parent {
-            let (fc, sc) = {
-                let pn = self.node(p);
-                (pn.first_child.unwrap(), pn.second_child.unwrap())
+            let Some((fc, sc)) = self.children(p) else {
+                debug_assert!(false, "a split node without two children");
+                return;
             };
             let vacant = self.node(fc).vacant && self.node(sc).vacant;
             self.set_vacant_local(p, vacant);
@@ -900,9 +1001,10 @@ impl Tree {
         }
 
         {
-            let c = self.node_mut(id).client.as_mut().unwrap();
-            c.last_state = last_state;
-            c.state = s;
+            if let Some(c) = self.node_mut(id).client.as_mut() {
+                c.last_state = last_state;
+                c.state = s;
+            }
         }
 
         match s {
@@ -928,7 +1030,9 @@ impl Tree {
         let mut f = self.first_extrema(root);
         while let Some(n) = f {
             let node = self.node(n);
-            if !node.vacant {
+            // bspwm starts both best areas at 0 and compares with `>`, so a
+            // leaf with no area is never picked.
+            if !node.vacant && self.node_area(n) > 0 {
                 let area = self.node_area(n);
                 if (node.presel.is_some() || !node.private)
                     && best_manual.is_none_or(|(_, a)| area > a)
@@ -1057,17 +1161,14 @@ impl Tree {
                         } else {
                             let mut q = p;
                             while let Some(q_id) = q {
-                                let node = self.node(q_id);
-                                let (fc, sc) =
-                                    (node.first_child.unwrap(), node.second_child.unwrap());
+                                let Some((fc, sc)) = self.children(q_id) else { break };
                                 if self.node(fc).vacant || self.node(sc).vacant {
                                     q = self.node(q_id).parent;
                                 } else {
                                     break;
                                 }
                             }
-                            let q = q.or(p).unwrap();
-                            if self.node(q).split_type == SplitType::Horizontal {
+                            if q.or(p).is_some_and(|q| self.node(q).split_type == SplitType::Horizontal) {
                                 SplitType::Vertical
                             } else {
                                 SplitType::Horizontal
@@ -1079,7 +1180,11 @@ impl Tree {
                         // the enclosing `if`'s condition (`p.is_none() || ...`)
                         // was false to reach this branch, so `p` is `Some`.
                         let Some(p_id) = p else {
-                            unreachable!("p is Some: see comment above")
+                            // Not reachable: the condition above holds for `None`.
+                            debug_assert!(false, "spiral insertion without a parent");
+                            self.free_slot(c);
+                            self.node_mut(n).parent = None;
+                            return None;
                         };
                         let g = self.node(p_id).parent;
                         self.node_mut(c).parent = g;
@@ -1118,7 +1223,12 @@ impl Tree {
                             self.node_mut(p_id).second_child = Some(c);
                         }
                     }
-                    let presel = self.node(f_id).presel.unwrap();
+                    let Some(presel) = self.node(f_id).presel else {
+                        debug_assert!(false, "the presel branch without a presel");
+                        self.free_slot(c);
+                        self.node_mut(n).parent = None;
+                        return None;
+                    };
                     self.node_mut(c).split_ratio = presel.split_ratio;
                     self.node_mut(c).parent = p;
                     self.node_mut(f_id).parent = Some(c);
@@ -1187,9 +1297,12 @@ impl Tree {
         }
         self.cancel_presel(p);
 
-        let b = self
-            .brother(n)
-            .expect("internal node always has two children");
+        let Some(b) = self.brother(n) else {
+            // A split always has two children; without one, just detach `n`.
+            debug_assert!(false, "a split node without two children");
+            self.node_mut(n).parent = None;
+            return;
+        };
         let g = self.node(p).parent;
         self.node_mut(b).parent = g;
 
@@ -1590,7 +1703,9 @@ impl Tree {
         if client.state.is_tiled() {
             return false;
         }
-        let client = self.node_mut(id).client.as_mut().unwrap();
+        let Some(client) = self.node_mut(id).client.as_mut() else {
+            return false;
+        };
         client.floating_rectangle.x += dx;
         client.floating_rectangle.y += dy;
         true
@@ -1677,7 +1792,9 @@ impl Tree {
             return true;
         }
 
-        let rect = self.client_rect(id).unwrap();
+        let Some(rect) = self.client_rect(id) else {
+            return false;
+        };
         let mut width = rect.width;
         let mut height = rect.height;
         if relative {
@@ -1711,6 +1828,7 @@ impl Tree {
         }
         width = width.max(1);
         height = height.max(1);
+        (width, height) = client.apply_size_hints(width, height);
         let mut x = rect.x;
         let mut y = rect.y;
         if handle.left() {
@@ -1719,11 +1837,10 @@ impl Tree {
         if handle.top() {
             y += rect.height - height;
         }
-        self.node_mut(id)
-            .client
-            .as_mut()
-            .unwrap()
-            .floating_rectangle = Rect::new(x, y, width, height);
+        let Some(client) = self.node_mut(id).client.as_mut() else {
+            return false;
+        };
+        client.floating_rectangle = Rect::new(x, y, width, height);
         true
     }
 
@@ -1781,13 +1898,62 @@ impl Tree {
         true
     }
 
+    /// Exchanges the subtree at `n1` of this tree with the subtree at `n2` of
+    /// `other`: each lands in the exact slot (same parent, same side, or as the
+    /// root) the other left. Returns, per side, `(new root id, (old, new) pairs)`:
+    /// first the subtree that went into `other`, then the one that came here.
+    /// A tree whose focus left gets the incoming subtree's root as its focus,
+    /// or, when both focuses moved, the focus that came with it.
+    ///
+    /// bspwm: `src/tree.c` `swap_nodes()`, the branch for two different desktops.
+    pub fn swap_subtrees_with(&mut self, n1: NodeId, other: &mut Tree, n2: NodeId) -> SubtreeSwap {
+        let slot1 = (self.node(n1).parent, self.is_first_child(n1));
+        let slot2 = (other.node(n2).parent, other.is_first_child(n2));
+        let focus1_left = self.is_descendant(self.focus, Some(n1));
+        let focus2_left = other.is_descendant(other.focus, Some(n2));
+        let (focus1, focus2) = (self.focus, other.focus);
+
+        let mut into_other = Vec::new();
+        let mut into_self = Vec::new();
+        let new1 = self.clone_subtree_into(n1, other, &mut into_other);
+        let new2 = other.clone_subtree_into(n2, self, &mut into_self);
+
+        let place = |tree: &mut Tree, new: NodeId, (parent, first): (Option<NodeId>, bool)| {
+            tree.node_mut(new).parent = parent;
+            match parent {
+                Some(p) if first => tree.node_mut(p).first_child = Some(new),
+                Some(p) => tree.node_mut(p).second_child = Some(new),
+                None => tree.root = Some(new),
+            }
+        };
+        place(self, new2, slot1);
+        place(other, new1, slot2);
+        self.free_node(n1);
+        other.free_node(n2);
+
+        // bspwm: `d1->focus = n2_held_focus ? last_d2_focus : n2`, and the same
+        // for `d2`: the incoming subtree's root, or the focus that came with it.
+        let map = |pairs: &[(NodeId, NodeId)], old: Option<NodeId>| old.and_then(|o| pairs.iter().find(|(from, _)| *from == o).map(|(_, to)| *to));
+        if focus1_left {
+            self.focus = Some(if focus2_left { map(&into_self, focus2).unwrap_or(new2) } else { new2 });
+        }
+        if focus2_left {
+            other.focus = Some(if focus1_left { map(&into_other, focus1).unwrap_or(new1) } else { new1 });
+        }
+        for (tree, node) in [(&mut *self, new2), (&mut *other, new1)] {
+            tree.propagate_flags_upward(Some(node));
+            tree.rebuild_constraints_towards_root(Some(node));
+        }
+        SubtreeSwap { into_other: (new1, into_other), into_self: (new2, into_self) }
+    }
+
     /// Clones the subtree rooted at `id` into `dest`'s arena (fresh
     /// `NodeId`s throughout: a `NodeId` is only ever meaningful within the
     /// `Tree` that issued it, see `crate::id`), preserving every field and
     /// the parent/child structure, and returns the new root's id in
     /// `dest`. `self` is left unchanged; callers that are moving rather
     /// than copying still need to unlink and free the original.
-    fn clone_subtree_into(&self, id: NodeId, dest: &mut Tree) -> NodeId {
+    fn clone_subtree_into(&self, id: NodeId, dest: &mut Tree, moved: &mut Vec<(NodeId, NodeId)>) -> NodeId {
         let node = self.node(id);
         let (first, second) = (node.first_child, node.second_child);
         let mut copy = node.clone();
@@ -1795,14 +1961,15 @@ impl Tree {
         copy.first_child = None;
         copy.second_child = None;
         let new_id = dest.alloc(copy);
+        moved.push((id, new_id));
 
         if let Some(f) = first {
-            let new_f = self.clone_subtree_into(f, dest);
+            let new_f = self.clone_subtree_into(f, dest, moved);
             dest.node_mut(new_f).parent = Some(new_id);
             dest.node_mut(new_id).first_child = Some(new_f);
         }
         if let Some(s) = second {
-            let new_s = self.clone_subtree_into(s, dest);
+            let new_s = self.clone_subtree_into(s, dest, moved);
             dest.node_mut(new_s).parent = Some(new_id);
             dest.node_mut(new_id).second_child = Some(new_s);
         }
@@ -1830,11 +1997,25 @@ impl Tree {
         dest: &mut Tree,
         anchor: Option<NodeId>,
     ) -> NodeId {
+        self.transplant_to_mapped(settings, n, dest, anchor).0
+    }
+
+    /// As [`Tree::transplant_to`], also returning every `(old, new)` node id
+    /// pair of the moved subtree (the root first), so a caller that keeps ids
+    /// of its own (`bsp-ipc`'s registry) can carry each of them over.
+    pub fn transplant_to_mapped(
+        &mut self,
+        settings: &Settings,
+        n: NodeId,
+        dest: &mut Tree,
+        anchor: Option<NodeId>,
+    ) -> (NodeId, Vec<(NodeId, NodeId)>) {
         self.unlink_node(settings, n);
-        let new_id = self.clone_subtree_into(n, dest);
+        let mut moved = Vec::new();
+        let new_id = self.clone_subtree_into(n, dest, &mut moved);
         self.free_node(n);
         dest.insert_node(settings, new_id, anchor);
-        new_id
+        (new_id, moved)
     }
 
     /// As [`Tree::transplant_to`], but within this same tree: removes `n`
@@ -1879,8 +2060,8 @@ impl Tree {
                 }
                 let mut s = e;
                 let mut f = s.and_then(|s| self.prev_tiled_leaf(Some(s), root));
-                while let Some(f_id) = f {
-                    self.swap_nodes(f_id, s.unwrap());
+                while let (Some(f_id), Some(s_id)) = (f, s) {
+                    self.swap_nodes(f_id, s_id);
                     // bspwm: src/tree.c circulate_leaves()'s for-loop update
                     // clause, `s = prev_tiled_leaf(f, n), f =
                     // prev_tiled_leaf(s, n)`: both are recomputed from
@@ -1900,8 +2081,8 @@ impl Tree {
                 }
                 let mut f = e;
                 let mut s = f.and_then(|f| self.next_tiled_leaf(Some(f), root));
-                while let Some(s_id) = s {
-                    self.swap_nodes(f.unwrap(), s_id);
+                while let (Some(f_id), Some(s_id)) = (f, s) {
+                    self.swap_nodes(f_id, s_id);
                     // Mirrors the fix in the `Forward` arm above, for
                     // `f = next_tiled_leaf(s, n), s = next_tiled_leaf(f, n)`.
                     f = self.next_tiled_leaf(Some(s_id), root);
@@ -1936,6 +2117,7 @@ impl Tree {
         window_gap: i32,
         layout: Layout,
         monitor_rect: Rect,
+        options: LayoutOptions,
     ) {
         let Some(id) = id else { return };
         self.node_mut(id).rect = rect;
@@ -1945,14 +2127,26 @@ impl Tree {
                 return;
             };
 
+            // bspwm: `bw = 0` for a fullscreen window, a tiled window in monocle
+            // with `borderless_monocle`, and the only window with
+            // `borderless_singleton`.
+            let the_only_window = options.borderless_singleton
+                && self.root.is_some_and(|r| self.node(r).client.is_some());
+            let bw = if (options.borderless_monocle && layout == Layout::Monocle && client.state.is_tiled())
+                || the_only_window
+                || client.state == ClientState::Fullscreen
+            {
+                0
+            } else {
+                client.border_width
+            };
             let r = match client.state {
                 ClientState::Tiled | ClientState::PseudoTiled => {
-                    let wg = if layout == Layout::Monocle {
+                    let wg = if options.gapless_monocle && layout == Layout::Monocle {
                         0
                     } else {
                         window_gap
                     };
-                    let bw = client.border_width;
                     let bleed = wg + 2 * bw;
                     let mut r = rect;
                     r.width = if bleed < r.width { r.width - bleed } else { 1 };
@@ -1965,6 +2159,10 @@ impl Tree {
                         let f = client.floating_rectangle;
                         r.width = r.width.min(f.width);
                         r.height = r.height.min(f.height);
+                        if options.center_pseudo_tiled {
+                            r.x = rect.x - bw + (rect.width - wg - r.width) / 2;
+                            r.y = rect.y - bw + (rect.height - wg - r.height) / 2;
+                        }
                     }
                     r
                 }
@@ -1973,15 +2171,24 @@ impl Tree {
             };
 
             if let Some(c) = &mut self.node_mut(id).client {
-                c.tiled_rectangle = r;
+                c.shown_border_width = bw;
+            }
+            // bspwm's `apply_layout()` leaves a floating client's
+            // `tiled_rectangle` alone: it keeps the slot it last had while tiled.
+            if client.state != ClientState::Floating {
+                if let Some(c) = &mut self.node_mut(id).client {
+                    c.tiled_rectangle = r;
+                }
             }
             return;
         }
 
         let (first, second, split_type, split_ratio, first_vacant, second_vacant) = {
+            let Some((first, second)) = self.children(id) else {
+                debug_assert!(false, "a split node without two children");
+                return;
+            };
             let n = self.node(id);
-            let first = n.first_child.unwrap();
-            let second = n.second_child.unwrap();
             (
                 first,
                 second,
@@ -2031,8 +2238,8 @@ impl Tree {
                 )
             };
 
-        self.apply_layout(Some(first), first_rect, window_gap, layout, monitor_rect);
-        self.apply_layout(Some(second), second_rect, window_gap, layout, monitor_rect);
+        self.apply_layout(Some(first), first_rect, window_gap, layout, monitor_rect, options);
+        self.apply_layout(Some(second), second_rect, window_gap, layout, monitor_rect, options);
     }
 }
 
@@ -2450,7 +2657,7 @@ mod tests {
         t.node_mut(root).split_type = SplitType::Vertical;
         t.node_mut(root).split_ratio = 0.5;
         let mrect = Rect::new(0, 0, 400, 200);
-        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect);
+        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
         (t, a, b)
     }
 
@@ -2900,6 +3107,17 @@ mod tests {
     // ---- apply_layout ---------------------------------------------------
 
     #[test]
+    fn presel_rect_follows_draw_presel_feedback() {
+        let r = Rect::new(100, 50, 406, 206);
+        let p = |split_dir, split_ratio| Presel { split_ratio, split_dir };
+        // A 400x200 area once the 6px gap is taken off.
+        assert_eq!(presel_rect(r, p(Direction::East, 0.3), 6), Rect::new(100 + 120, 50, 280, 200));
+        assert_eq!(presel_rect(r, p(Direction::West, 0.3), 6), Rect::new(100, 50, 120, 200));
+        assert_eq!(presel_rect(r, p(Direction::North, 0.25), 6), Rect::new(100, 50, 400, 50));
+        assert_eq!(presel_rect(r, p(Direction::South, 0.25), 6), Rect::new(100, 50 + 50, 400, 150));
+    }
+
+    #[test]
     fn apply_layout_splits_a_vertical_node_by_its_ratio() {
         let s = settings();
         let mut t = Tree::new();
@@ -2910,7 +3128,7 @@ mod tests {
         t.node_mut(root).split_ratio = 0.25;
 
         let mrect = Rect::new(0, 0, 400, 200);
-        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect);
+        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
 
         assert_eq!(t.node(a).rect, Rect::new(0, 0, 100, 200));
         assert_eq!(t.node(b).rect, Rect::new(100, 0, 300, 200));
@@ -2925,7 +3143,7 @@ mod tests {
         let root = t.root.unwrap();
 
         let mrect = Rect::new(0, 0, 400, 200);
-        t.apply_layout(Some(root), mrect, 0, Layout::Monocle, mrect);
+        t.apply_layout(Some(root), mrect, 0, Layout::Monocle, mrect, LayoutOptions::default());
 
         assert_eq!(t.node(a).rect, mrect);
         assert_eq!(t.node(b).rect, mrect);
@@ -2943,7 +3161,7 @@ mod tests {
         t.node_mut(a).constraints.min_width = 150;
 
         let mrect = Rect::new(0, 0, 200, 100);
-        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect);
+        t.apply_layout(Some(root), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
 
         assert_eq!(t.node(a).rect.width, 150, "clamped up to a's minimum width");
         assert_eq!(t.node(b).rect.width, 50);
@@ -2958,9 +3176,129 @@ mod tests {
         t.set_state(a, ClientState::Fullscreen);
 
         let mrect = Rect::new(0, 0, 1920, 1080);
-        t.apply_layout(Some(a), Rect::new(6, 6, 100, 100), 6, Layout::Tiled, mrect);
+        t.apply_layout(Some(a), Rect::new(6, 6, 100, 100), 6, Layout::Tiled, mrect, LayoutOptions::default());
 
         let tiled_rect = t.node(a).client.as_ref().unwrap().tiled_rectangle;
         assert_eq!(tiled_rect, mrect);
+    }
+
+    #[test]
+    fn monocle_keeps_the_window_gap_unless_gapless_monocle_is_set() {
+        // bspwm: `apply_layout()`'s `wg = gapless_monocle && MONOCLE ? 0 : window_gap`.
+        let s = settings();
+        let mrect = Rect::new(0, 0, 400, 200);
+        for (gapless, want_width) in [(false, 400 - 6 - 2), (true, 400 - 2)] {
+            let mut t = Tree::new();
+            let a = insert_client(&mut t, &s, None, 1);
+            t.apply_layout(Some(a), mrect, 6, Layout::Monocle, mrect, LayoutOptions { gapless_monocle: gapless, ..Default::default() });
+            let got = t.node(a).client.as_ref().unwrap().tiled_rectangle.width;
+            assert_eq!(got, want_width, "gapless_monocle = {gapless}");
+            assert_eq!(t.get_rectangle(a, 6, Layout::Monocle, gapless).width, want_width);
+        }
+        // A client-less node is measured the same way.
+        let mut t = Tree::new();
+        let r = t.new_node(&s);
+        t.insert_node(&s, r, None);
+        t.apply_layout(Some(r), mrect, 6, Layout::Monocle, mrect, LayoutOptions::default());
+        assert_eq!(t.get_rectangle(r, 6, Layout::Monocle, false).width, 394);
+        assert_eq!(t.get_rectangle(r, 6, Layout::Monocle, true).width, 400);
+    }
+
+    #[test]
+    fn a_floating_client_keeps_the_tiled_rectangle_it_last_had() {
+        // bspwm: `apply_layout()` only writes `tiled_rectangle` for tiled,
+        // pseudo-tiled and fullscreen clients.
+        let s = settings();
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        let mrect = Rect::new(0, 0, 400, 200);
+        t.apply_layout(Some(a), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
+        let slot = t.node(a).client.as_ref().unwrap().tiled_rectangle;
+        t.node_mut(a).client.as_mut().unwrap().floating_rectangle = Rect::new(10, 10, 50, 50);
+        t.set_state(a, ClientState::Floating);
+        t.apply_layout(Some(a), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
+        assert_eq!(t.node(a).client.as_ref().unwrap().tiled_rectangle, slot);
+    }
+
+    #[test]
+    fn find_public_ignores_leaves_with_no_area() {
+        // bspwm: `find_public()` starts both best areas at 0 and compares with `>`.
+        let s = settings();
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        assert_eq!(t.find_public(t.root), None, "a leaf never laid out has no area");
+        let mrect = Rect::new(0, 0, 400, 200);
+        t.apply_layout(Some(a), mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
+        assert_eq!(t.find_public(t.root), Some(a));
+    }
+
+    #[test]
+    fn borders_are_dropped_where_bspwm_drops_them() {
+        // bspwm: `apply_layout()`'s `bw = 0` cases.
+        let s = settings();
+        let mrect = Rect::new(0, 0, 400, 200);
+        let shown = |t: &Tree, n: NodeId| t.node(n).client.as_ref().unwrap().shown_border_width;
+
+        // borderless_monocle: tiled windows in monocle only.
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        let b = insert_client(&mut t, &s, Some(a), 2);
+        let borderless = LayoutOptions { borderless_monocle: true, ..Default::default() };
+        t.apply_layout(t.root, mrect, 0, Layout::Monocle, mrect, borderless);
+        assert_eq!((shown(&t, a), shown(&t, b)), (0, 0));
+        assert_eq!(t.node(a).client.as_ref().unwrap().tiled_rectangle.width, 400, "the border's room goes to the window");
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, borderless);
+        assert_eq!(shown(&t, a), 1);
+
+        // borderless_singleton: a lone window on the only monitor, not two.
+        let singleton = LayoutOptions { borderless_singleton: true, ..Default::default() };
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, singleton);
+        assert_eq!(shown(&t, a), 0);
+        let b = insert_client(&mut t, &s, Some(a), 2);
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, singleton);
+        assert_eq!((shown(&t, a), shown(&t, b)), (1, 1));
+
+        // A fullscreen window never has one, and the configured width is kept.
+        t.set_state(b, ClientState::Fullscreen);
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
+        assert_eq!(shown(&t, b), 0);
+        assert_eq!(t.node(b).client.as_ref().unwrap().border_width, 1);
+    }
+
+    #[test]
+    fn a_pseudo_tiled_window_is_centred_in_its_slot_when_asked() {
+        // bspwm: `apply_layout()`'s `center_pseudo_tiled` branch.
+        let s = settings();
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        t.node_mut(a).client.as_mut().unwrap().floating_rectangle = Rect::new(0, 0, 100, 50);
+        t.set_state(a, ClientState::PseudoTiled);
+        let mrect = Rect::new(0, 0, 400, 200);
+        let centred = LayoutOptions { center_pseudo_tiled: true, ..Default::default() };
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, centred);
+        let r = t.node(a).client.as_ref().unwrap().tiled_rectangle;
+        assert_eq!((r.width, r.height), (100, 50));
+        assert_eq!((r.x, r.y), (0 - 1 + (400 - 100) / 2, 0 - 1 + (200 - 50) / 2));
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, LayoutOptions::default());
+        assert_eq!(t.node(a).client.as_ref().unwrap().tiled_rectangle.x, 0);
+    }
+
+    #[test]
+    fn next_node_and_prev_node_walk_in_order_including_the_splits() {
+        // bspwm: `next_node()`/`prev_node()`: first subtree, the node, second subtree.
+        let s = settings();
+        let mut t = Tree::new();
+        let a = insert_client(&mut t, &s, None, 1);
+        let b = insert_client(&mut t, &s, Some(a), 2);
+        let split = t.root.unwrap();
+        assert_eq!(t.next_node(Some(a)), Some(split));
+        assert_eq!(t.next_node(Some(split)), Some(b));
+        assert_eq!(t.next_node(Some(b)), None);
+        assert_eq!(t.prev_node(Some(b)), Some(split));
+        assert_eq!(t.prev_node(Some(split)), Some(a));
+        assert_eq!(t.prev_node(Some(a)), None);
+        assert_eq!(t.next_node(None), None);
     }
 }

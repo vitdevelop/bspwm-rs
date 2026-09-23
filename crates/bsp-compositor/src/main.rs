@@ -33,9 +33,12 @@ mod extras;
 mod focus;
 mod gamma;
 mod hardware;
+mod headless;
 mod hotkeys;
 mod input;
 mod layers;
+#[cfg_attr(not(feature = "real"), allow(dead_code))]
+mod lifecycle;
 mod ipc;
 mod output_management;
 mod output_power;
@@ -52,6 +55,7 @@ mod toplevel_drag;
 mod virtual_pointer;
 mod workspaces;
 mod xwayland;
+mod xworker;
 #[cfg(feature = "real")]
 mod udev_backend;
 #[cfg(feature = "nested")]
@@ -86,4 +90,12 @@ fn main() {
     winit_backend::run();
     #[cfg(feature = "real")]
     udev_backend::run();
+    xwayland::remove_shim_dir();
+
+    // `bspc quit STATUS`: the compositor's own exit status (bspwm: `bspwm.c`'s
+    // `exit_status`).
+    let status = state::EXIT_STATUS.load(std::sync::atomic::Ordering::Relaxed);
+    if status != 0 {
+        std::process::exit(status);
+    }
 }

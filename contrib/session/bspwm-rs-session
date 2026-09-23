@@ -32,6 +32,10 @@ export XDG_CURRENT_DESKTOP=bspwm-rs XDG_SESSION_TYPE=wayland
 # (`journalctl -t bspwm-rs`).
 if [ -t 1 ]; then
 	LOG="${XDG_STATE_HOME:-$HOME/.local/state}/bspwm-rs.log"
+	# A second session (another VT) must not truncate the first one's log.
+	if pgrep -x bspwm-rs >/dev/null 2>&1; then
+		LOG="${LOG%.log}-vt${XDG_VTNR:-$$}.log"
+	fi
 	mkdir -p "$(dirname "$LOG")"
 	exec >"$LOG" 2>&1
 fi

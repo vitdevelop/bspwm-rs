@@ -151,6 +151,7 @@ fn on_pointer_motion_absolute<B: InputBackend, Bd: Backend + 'static>(
     );
     pointer.frame(state);
     crate::toplevel_drag::follow(state);
+    focus_follows_pointer(state);
 }
 
 pub(crate) fn on_pointer_button<B: InputBackend, Bd: Backend + 'static>(
@@ -194,6 +195,12 @@ pub(crate) fn deliver_button<Bd: Backend + 'static>(
             .current_focus()
             .is_some_and(|surface| crate::layers::focus_on_click(state, &surface, serial));
     if pressed && !on_layer && !crate::pointer_action::on_button_press(state, button, serial, time) {
+        state.swallowed_buttons.insert(button);
+        return;
+    }
+    // The release of a swallowed press goes nowhere either, unless a drag grab
+    // owns it (the grab ends on it).
+    if button_state == wl_pointer::ButtonState::Released && state.swallowed_buttons.remove(&button) && !state.pointer.is_grabbed() {
         return;
     }
 
@@ -307,7 +314,14 @@ pub(crate) fn sync_keyboard_focus<Bd: Backend + 'static>(state: &mut State<Bd>) 
 /// Warps the pointer to `location` (global logical coordinates) and tells
 /// the surface under it — the motion half shared by absolute devices and
 /// `zwlr_virtual_pointer_v1` (real relative motion, which also sends
-/// `relative_motion`, has its own path in `crate::udev_backend`).
+/// `relative_motion`, has its own path in `crate::udev_backend`), and by the
+/// compositor's own re-targeting and warps.
+///
+/// It does not apply `focus_follows_pointer`: bspwm changes focus only on real
+/// pointer motion (`src/events.c` `motion_notify()`; `enter_notify()` caused
+/// by a window appearing under a resting pointer only arms the motion
+/// recorder). Callers moving the pointer for a device call
+/// [`focus_follows_pointer`] themselves.
 pub(crate) fn pointer_motion_to<Bd: Backend + 'static>(
     state: &mut State<Bd>,
     location: smithay::utils::Point<f64, smithay::utils::Logical>,
@@ -322,6 +336,166 @@ pub(crate) fn pointer_motion_to<Bd: Backend + 'static>(
     crate::constraints::update(state);
     crate::toplevel_drag::follow(state);
     state.backend_data.queue_redraw();
+}
+
+/// `focus_follows_pointer`: focus the managed window the pointer has moved
+/// onto, or, over an empty stretch of another monitor, that monitor. Not while a
+/// button is held (a drag), a session is locked, or a panel or launcher has the
+/// pointer.
+///
+/// bspwm: `src/events.c` `enter_notify()` / `motion_notify()`.
+pub(crate) fn focus_follows_pointer<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    if !state.wm.settings.focus_follows_pointer || state.pointer.is_grabbed() || state.protocols.session_lock.locked {
+        return;
+    }
+    if let Some(surface) = state.pointer.current_focus() {
+        if crate::layers::namespace_of(state, &surface).is_some() {
+            return;
+        }
+    }
+    let location = state.pointer.current_location();
+    let serial = SERIAL_COUNTER.next_serial();
+    match state.space.element_under(location).map(|(w, _)| w.clone()) {
+        Some(window) => {
+            let Some((mi, di, node)) = state.adapter.id_of(&window).and_then(|id| locate_window(state, id)) else {
+                return;
+            };
+            let focused = state.wm.focused_monitor == Some(mi)
+                && state.wm.monitors[mi].focused == Some(di)
+                && state.wm.monitors[mi].desktops[di].tree.focus == Some(node);
+            if !focused {
+                set_focus(state, mi, di, node, serial);
+            }
+        }
+        None => {
+            let Some(name) = state.space.output_under(location).next().map(|o| o.name()) else {
+                return;
+            };
+            let Some(mi) = state.wm.monitors.iter().position(|m| m.name == name) else {
+                return;
+            };
+            if state.wm.focused_monitor != Some(mi) {
+                let Some(di) = state.wm.monitors[mi].focused else {
+                    return;
+                };
+                let dst = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: None };
+                crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::focus_node(ctx, dst, events));
+            }
+        }
+    }
+}
+
+/// What has focus: the focused monitor and its shown desktop and node.
+pub(crate) type FocusKey = Option<(usize, usize, Option<NodeId>)>;
+
+/// The current [`FocusKey`].
+pub(crate) fn focus_key<Bd: Backend + 'static>(state: &State<Bd>) -> FocusKey {
+    let mi = state.wm.focused_monitor?;
+    let di = state.wm.monitors[mi].focused?;
+    Some((mi, di, state.wm.monitors[mi].desktops[di].tree.focus))
+}
+
+/// `pointer_follows_focus` / `pointer_follows_monitor`: after a command moved
+/// the focus from `before`, put the pointer at the centre of the newly focused
+/// window, or, when only the monitor changed, of that monitor.
+///
+/// bspwm: `src/tree.c` `focus_node()`'s `center_pointer()` calls.
+pub(crate) fn warp_pointer_for_focus<Bd: Backend + 'static>(state: &mut State<Bd>, before: FocusKey) {
+    debug_assert!(!crate::pointer_action::in_grab_callback(), "moving the pointer inside a grab callback deadlocks");
+    let settings = &state.wm.settings;
+    if !settings.pointer_follows_focus && !settings.pointer_follows_monitor {
+        return;
+    }
+    let after = focus_key(state);
+    let (Some(before_key), Some((mi, di, node))) = (before, after) else {
+        return;
+    };
+    let mut target = None;
+    if before_key.0 != mi && settings.pointer_follows_monitor {
+        target = Some(state.wm.monitors[mi].rectangle);
+    }
+    if settings.pointer_follows_focus && (before_key.0, before_key.1, before_key.2) != (mi, di, node) {
+        if let Some(client) = node.and_then(|n| state.wm.monitors[mi].desktops[di].tree.node(n).client.as_ref()) {
+            target = Some(client.shown_rectangle());
+        }
+    }
+    if let Some(r) = target {
+        pointer_motion_to(state, ((r.x + r.width / 2) as f64, (r.y + r.height / 2) as f64).into(), 0);
+    }
+}
+
+/// Re-targets the pointer when the surface it is focused on is no longer under
+/// it (its desktop was switched away, its window closed): without a motion
+/// event the client keeps pointer focus, its lock and its (possibly hidden)
+/// cursor image, so the pointer looks gone and cannot click what is shown now.
+pub(crate) fn refresh_pointer_focus<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    debug_assert!(!crate::pointer_action::in_grab_callback(), "reading the pointer's focus inside a grab callback deadlocks");
+    let pointer = state.pointer.clone();
+    let focus = pointer.current_focus();
+    let location = pointer.current_location();
+    let under = crate::layers::surface_under(state, location).map(|(surface, _)| surface);
+    // Also when nothing had the pointer and a surface appeared under it (an X11
+    // window mapped again when its desktop is shown gets its surface later).
+    if under == focus || (focus.is_none() && pointer.is_grabbed()) {
+        return;
+    }
+    tracing::debug!("the pointer's surface is no longer under it; retargeting");
+    state.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
+    pointer_motion_to(state, location, 0);
+}
+
+/// The point of some output nearest to `p` (`p` itself if it is on one), so the
+/// pointer never rests where no output is: with outputs of different sizes or
+/// offsets, the bounding box of all of them contains such dead zones.
+///
+/// anvil: `input_handler.rs` `clamp_coords()`.
+pub(crate) fn clamp_to_outputs<Bd: Backend + 'static>(state: &State<Bd>, p: smithay::utils::Point<f64, smithay::utils::Logical>) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    let rects: Vec<_> = state.space.outputs().filter_map(|o| state.space.output_geometry(o)).map(|g| g.to_f64()).collect();
+    nearest_in_rects(&rects, p)
+}
+
+/// [`clamp_to_outputs`] over plain rectangles. The far edges are exclusive, so
+/// the point stops just inside them.
+fn nearest_in_rects(
+    rects: &[smithay::utils::Rectangle<f64, smithay::utils::Logical>],
+    p: smithay::utils::Point<f64, smithay::utils::Logical>,
+) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    let mut best: Option<(f64, smithay::utils::Point<f64, smithay::utils::Logical>)> = None;
+    for r in rects {
+        let q: smithay::utils::Point<f64, smithay::utils::Logical> = (
+            p.x.clamp(r.loc.x, r.loc.x + r.size.w - 1.0),
+            p.y.clamp(r.loc.y, r.loc.y + r.size.h - 1.0),
+        )
+            .into();
+        let d = (q.x - p.x).powi(2) + (q.y - p.y).powi(2);
+        if best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, q));
+        }
+    }
+    best.map_or(p, |(_, q)| q)
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::nearest_in_rects;
+    use smithay::utils::Rectangle;
+
+    #[test]
+    fn the_pointer_stays_on_an_output_even_where_the_bounding_box_has_a_gap() {
+        // A 1920x1080 output with a 1280x720 one to its right, tops aligned:
+        // the box around both has a dead corner below the small one.
+        let rects = [Rectangle::new((0.0, 0.0).into(), (1920.0, 1080.0).into()), Rectangle::new((1920.0, 0.0).into(), (1280.0, 720.0).into())];
+        let on = nearest_in_rects(&rects, (100.0, 100.0).into());
+        assert_eq!((on.x, on.y), (100.0, 100.0));
+        // In the dead corner: pulled onto the nearest output.
+        let corner = nearest_in_rects(&rects, (3000.0, 900.0).into());
+        assert_eq!((corner.x, corner.y), (3000.0, 719.0));
+        // Past every edge.
+        let far = nearest_in_rects(&rects, (-50.0, 5000.0).into());
+        assert_eq!((far.x, far.y), (0.0, 1079.0));
+        // No outputs: left alone.
+        assert_eq!(nearest_in_rects(&[], (5.0, 5.0).into()).x, 5.0);
+    }
 }
 
 /// The bounding box of every output, in global logical coordinates (where
@@ -391,9 +565,17 @@ pub(crate) fn set_focus<Bd: Backend + 'static>(
     node: NodeId,
     serial: smithay::utils::Serial,
 ) {
-    state.wm.monitors[mi].desktops[di].tree.focus = Some(node);
-    state.wm.focused_monitor = Some(mi);
-    state.wm.monitors[mi].focused = Some(di);
+    // bspwm's `focus_node()`: focus, urgent flag, occluding fullscreen windows,
+    // and the `node_focus`/`desktop_focus`/`monitor_focus` events and report.
+    let was_shown = state.wm.focused_monitor == Some(mi) && state.wm.monitors[mi].focused == Some(di);
+    let dst = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
+    if !crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::focus_node(ctx, dst, events)) {
+        return;
+    }
+    if !was_shown {
+        // Another desktop came on screen: show its windows and hide the old ones.
+        crate::shell::sync_wayland_from_core(state);
+    }
     let Some(client) = state.wm.monitors[mi].desktops[di]
         .tree
         .node(node)

@@ -168,14 +168,11 @@ fn resolve_modifiers(mods: &ModifiersState) -> HashSet<Modifier> {
     if mods.ctrl {
         set.insert(Modifier::Control);
     }
-    if mods.caps_lock {
-        set.insert(Modifier::Lock);
-    }
+    // CapsLock and NumLock are left out: sxhkd masks its `lockfield`
+    // (`num_lock | caps_lock | scroll_lock`) off the modifier state before
+    // matching (`src/sxhkd.c`), so a chord fires whatever their state.
     if mods.alt {
         set.insert(Modifier::Mod1);
-    }
-    if mods.num_lock {
-        set.insert(Modifier::Mod2);
     }
     if mods.iso_level5_shift {
         set.insert(Modifier::Mod3);
@@ -389,5 +386,18 @@ fn run_shell(command: &str) {
     match crate::spawn::clean_signal_mask(&mut sh).spawn() {
         Ok(child) => reap(child),
         Err(err) => tracing::warn!(command, "failed to spawn hotkey command: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_modifiers_do_not_change_the_resolved_set() {
+        let plain = ModifiersState { logo: true, ..Default::default() };
+        let locked = ModifiersState { logo: true, caps_lock: true, num_lock: true, ..Default::default() };
+        assert_eq!(resolve_modifiers(&plain), resolve_modifiers(&locked));
+        assert_eq!(resolve_modifiers(&locked), HashSet::from([Modifier::Mod4]));
     }
 }

@@ -113,6 +113,13 @@ pub struct Screencopy {
     pub frames_rendered: u64,
 }
 
+impl Screencopy {
+    /// Whether a capture is waiting to be answered.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
 impl<Bd: Backend + 'static> GlobalDispatch<ZwlrScreencopyManagerV1, (), State<Bd>> for State<Bd> {
     fn can_view(client: Client, _: &()) -> bool {
         crate::state::is_privileged(&client)

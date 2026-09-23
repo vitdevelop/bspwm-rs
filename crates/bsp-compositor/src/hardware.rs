@@ -21,6 +21,9 @@ pub const KEYBOARD: &str = "keyboard";
 /// output -m 1920x1080@60` must match a real 59.94 Hz mode.
 const REFRESH_TOLERANCE_MHZ: i32 = 500;
 
+/// Every virtual output is named this followed by a number (`HEADLESS-1`).
+pub const HEADLESS_PREFIX: &str = "HEADLESS-";
+
 /// One known output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HwOutput {
@@ -99,6 +102,25 @@ impl HwModel {
     /// Validates `action` against output `name`, records it in the model
     /// and queues it for the backend to apply.
     pub fn set_output(&mut self, name: &str, action: &OutputAction) -> Result<(), String> {
+        // Adding and removing virtual outputs change the list itself: queued for
+        // `ipc::apply_hardware_changes`, which owns the `Output`s.
+        match action {
+            OutputAction::CreateHeadless(_) => {
+                self.pending_outputs.push((String::new(), action.clone()));
+                return Ok(());
+            }
+            OutputAction::Remove => {
+                if !self.outputs.iter().any(|o| o.name == name) {
+                    return Err(format!("output: unknown output '{name}'.\n"));
+                }
+                if !name.starts_with(HEADLESS_PREFIX) {
+                    return Err(format!("output: '{name}' is a real output; only virtual ones can be removed.\n"));
+                }
+                self.pending_outputs.push((name.to_string(), action.clone()));
+                return Ok(());
+            }
+            _ => {}
+        }
         let Some(o) = self.outputs.iter_mut().find(|o| o.name == name) else {
             return Err(format!("output: unknown output '{name}'.\n"));
         };
@@ -128,6 +150,7 @@ impl HwModel {
                 o.transform = *t;
                 action.clone()
             }
+            OutputAction::CreateHeadless(_) | OutputAction::Remove => return Ok(()),
         };
         self.pending_outputs.push((name.to_string(), action));
         Ok(())
@@ -225,6 +248,26 @@ mod tests {
         assert!(m.set_output("HDMI-A-1", &OutputAction::SetScale(0.0)).is_err());
         assert!(m.set_output("HDMI-A-1", &OutputAction::SetMode(mode(1, 1, 60_000))).is_err());
         assert!(m.pending_outputs.is_empty());
+    }
+
+    #[test]
+    fn creating_a_virtual_output_needs_no_name_and_removing_one_only_accepts_virtual_outputs() {
+        let mut m = model();
+        m.set_output("", &OutputAction::CreateHeadless(None)).unwrap();
+        assert_eq!(m.pending_outputs.len(), 1);
+        // A real output cannot be removed; an unknown one is unknown.
+        assert!(m.set_output("HDMI-A-1", &OutputAction::Remove).unwrap_err().contains("real output"));
+        assert!(m.set_output("HEADLESS-9", &OutputAction::Remove).unwrap_err().contains("unknown"));
+        m.outputs.push(HwOutput {
+            name: "HEADLESS-1".to_string(),
+            modes: vec![mode(1920, 1080, 60_000)],
+            mode: mode(1920, 1080, 60_000),
+            scale: 1.0,
+            position: (1920, 0),
+            transform: Default::default(),
+        });
+        m.set_output("HEADLESS-1", &OutputAction::Remove).unwrap();
+        assert_eq!(m.pending_outputs.len(), 2);
     }
 
     #[test]

@@ -13,7 +13,8 @@
 //!
 //! It maps a toplevel showing a solid colour (a 64×64 shm buffer, scaled to
 //! the configured size when `--viewport` is given), and prints what it
-//! observes: `configured WxH`, `keyboard enter`, `pointer enter`,
+//! observes: `configured WxH` (then `states [...]`), `wm_capabilities [...]`,
+//! `keyboard enter`, `pointer enter`,
 //! `shortcuts inhibitor active`, `activation token …`. `--cursor` sets a
 //! `wp_cursor_shape` on the first pointer enter, `--activate-self-after`
 //! asks `xdg_activation_v1` (with the keyboard-enter serial) to activate this
@@ -141,7 +142,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for App {
         match interface.as_str() {
             "wl_compositor" => app.compositor = Some(registry.bind(name, version.min(4), qh, ())),
             "wl_shm" => app.shm = Some(registry.bind(name, 1, qh, ())),
-            "xdg_wm_base" => app.wm_base = Some(registry.bind(name, version.min(2), qh, ())),
+            "xdg_wm_base" => app.wm_base = Some(registry.bind(name, version.min(6), qh, ())),
             "wl_seat" if app.seat.is_none() => app.seat = Some(registry.bind(name, version.min(5), qh, ())),
             "zwp_idle_inhibit_manager_v1" => app.idle_inhibit = Some(registry.bind(name, 1, qh, ())),
             "zwp_keyboard_shortcuts_inhibit_manager_v1" => app.shortcuts = Some(registry.bind(name, 1, qh, ())),
@@ -448,9 +449,38 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for App {
 
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
     fn event(app: &mut Self, _: &xdg_toplevel::XdgToplevel, event: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let xdg_toplevel::Event::Configure { width, height, .. } = event {
-            app.size = (width, height);
-            println!("configured {width}x{height}");
+        match event {
+            xdg_toplevel::Event::Configure { width, height, states } => {
+                app.size = (width, height);
+                println!("configured {width}x{height}");
+                let names: Vec<&str> = states
+                    .chunks_exact(4)
+                    .map(|c| match u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) {
+                        1 => "maximized",
+                        2 => "fullscreen",
+                        3 => "resizing",
+                        4 => "activated",
+                        5..=8 => "tiled",
+                        9 => "suspended",
+                        _ => "other",
+                    })
+                    .collect();
+                println!("states {names:?}");
+            }
+            xdg_toplevel::Event::WmCapabilities { capabilities } => {
+                let names: Vec<&str> = capabilities
+                    .chunks_exact(4)
+                    .map(|c| match u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) {
+                        1 => "window_menu",
+                        2 => "maximize",
+                        3 => "fullscreen",
+                        4 => "minimize",
+                        _ => "other",
+                    })
+                    .collect();
+                println!("wm_capabilities {names:?}");
+            }
+            _ => {}
         }
     }
 }

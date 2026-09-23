@@ -34,6 +34,9 @@ use crate::wire::{self, Reply};
 pub struct Listener {
     inner: UnixListener,
     path: PathBuf,
+    /// The socket file's `(device, inode)` once bound: only that file is
+    /// removed on drop, never one another instance bound at the same path.
+    file_id: Option<(u64, u64)>,
 }
 
 impl Listener {
@@ -43,17 +46,31 @@ impl Listener {
     /// `XDG_RUNTIME_DIR` with mode 0600, in a directory only you can
     /// read" — the directory permission is the caller's responsibility,
     /// typically already `0700` for `XDG_RUNTIME_DIR`).
+    ///
+    /// Fails with [`io::ErrorKind::AddrInUse`] when a running server (another
+    /// instance on another VT) answers at `path`: its socket is left alone.
     pub fn bind(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
         if path.exists() {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, "another instance is listening there"));
+            }
             fs::remove_file(path)?;
         }
         let inner = UnixListener::bind(path)?;
         inner.set_nonblocking(true)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let file_id = fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
         Ok(Self {
             inner,
             path: path.to_path_buf(),
+            file_id,
         })
+    }
+
+    /// The path this listener is bound at.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Accepts a pending connection, if any. Returns `Ok(None)` rather
@@ -78,18 +95,26 @@ impl AsRawFd for Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt;
+        // Only our own socket file: a second instance may have bound the path
+        // since (it does not while we answer, but a stale file may be replaced).
+        let ours = fs::metadata(&self.path).ok().map(|m| (m.dev(), m.ino()));
+        if ours.is_some() && ours == self.file_id {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
 /// One accepted client connection.
 pub struct Connection {
     stream: UnixStream,
+    /// A reply the socket did not take yet (see [`Connection::send_reply`]).
+    queued: Vec<u8>,
 }
 
 impl Connection {
     fn new(stream: UnixStream) -> Self {
-        Self { stream }
+        Self { stream, queued: Vec::new() }
     }
 
     /// Attempts one non-blocking read of a whole request. `Ok(None)`
@@ -115,19 +140,52 @@ impl Connection {
     /// drops this `Connection` to close it (bspwm: `process_message()`
     /// `fflush`/`fclose`s the response stream for every domain but
     /// `subscribe`, which `return`s early to keep it open).
+    ///
+    /// The reply is queued and as much as the socket takes is written at once;
+    /// the rest stays queued and [`Connection::flush`] writes it later, so a
+    /// reply larger than the socket buffer (a `wm -d` dump, a big `query -T`)
+    /// never makes the compositor wait for a slow reader. The connection is
+    /// closed after the last byte, which is the caller's job (bspwm writes
+    /// through a blocking `FILE *`; waiting is not an option here).
     pub fn send_reply(&mut self, reply: Reply) -> io::Result<()> {
-        self.stream.write_all(&reply.into_bytes())
+        self.queued.extend_from_slice(&reply.into_bytes());
+        self.flush().map(|_| ())
     }
 
-    /// Writes one already-newline-terminated line to a `subscribe`d
-    /// connection (a report line or an event). Returns `false` — rather
-    /// than an `io::Error` — on any write failure, since the only
-    /// sensible response to a dead subscriber is to drop it (bspwm:
-    /// `src/subscribe.c` `put_status()`/`prune_dead_subscribers()`).
-    pub fn send_line(&mut self, line: &str) -> bool {
-        self.stream.write_all(line.as_bytes()).is_ok()
+    /// Writes as much of the queued reply as the socket takes now. `Ok(true)` when
+    /// nothing is left to write.
+    pub fn flush(&mut self) -> io::Result<bool> {
+        while !self.queued.is_empty() {
+            match self.stream.write(&self.queued) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "peer stopped reading")),
+                Ok(n) => {
+                    self.queued.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether part of a reply is still waiting for the socket.
+    pub fn has_queued(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    /// One non-blocking write of as much of `buf` as the socket takes now.
+    fn write_some(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
     }
 }
+
+/// How long a reply may wait for a slow reader before the connection is dropped.
+pub const REPLY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How much unread output a subscriber may have queued before it is dropped
+/// (a bar script that stopped reading must not grow the compositor forever).
+pub const MAX_QUEUED_BYTES: usize = 1 << 20;
 
 impl AsRawFd for Connection {
     fn as_raw_fd(&self) -> RawFd {
@@ -145,6 +203,10 @@ pub struct Subscriber {
     /// Remaining event deliveries before this subscriber is dropped, or
     /// `None` for unlimited (`-c`/`--count`).
     remaining: Option<u32>,
+    /// Lines the socket did not take yet, oldest first. A slow reader falls
+    /// behind here instead of being dropped; the queue is written out
+    /// whenever the next line is delivered.
+    queued: Vec<u8>,
 }
 
 impl Subscriber {
@@ -198,6 +260,23 @@ impl Subscriber {
         })
     }
 
+    /// Writes as much of the queue as the socket takes without blocking.
+    /// `false` if the connection is dead.
+    fn flush(&mut self) -> bool {
+        while !self.queued.is_empty() {
+            match self.connection.write_some(&self.queued) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    self.queued.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Whether this subscriber wants `report` lines.
     pub fn wants_report(&self) -> bool {
         self.masks
@@ -211,7 +290,8 @@ impl Subscriber {
     /// bspwm's `put_status()` does. Returns `false` if the subscriber
     /// should now be dropped (write failed, or its count ran out).
     fn deliver(&mut self, line: &str) -> bool {
-        if !self.connection.send_line(line) {
+        self.queued.extend_from_slice(line.as_bytes());
+        if !self.flush() || self.queued.len() > MAX_QUEUED_BYTES {
             return false;
         }
         if let Some(r) = &mut self.remaining {
@@ -255,6 +335,7 @@ impl Subscribers {
             connection,
             masks,
             remaining: count,
+            queued: Vec::new(),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -287,6 +368,20 @@ impl Subscribers {
             .retain(|_, sub| !sub.wants_report() || sub.deliver(&line));
     }
 
+    /// Writes every subscriber's queued lines as far as its socket takes them
+    /// and drops the ones whose connection is dead. Call it now and then (the
+    /// compositor does each event-loop turn while [`Subscribers::has_queued`]),
+    /// so lines held back by a full socket buffer are delivered once the reader
+    /// catches up, not only when the next event happens to arrive.
+    pub fn flush_all(&mut self) {
+        self.by_id.retain(|_, sub| sub.flush());
+    }
+
+    /// Whether any subscriber still has lines waiting for its socket.
+    pub fn has_queued(&self) -> bool {
+        self.by_id.values().any(|sub| !sub.queued.is_empty())
+    }
+
     /// Number of open subscribers.
     pub fn len(&self) -> usize {
         self.by_id.len()
@@ -309,6 +404,22 @@ mod tests {
         p.push(format!("bsp-ipc-test-{name}-{}.sock", std::process::id()));
         p
     }
+    #[test]
+    fn a_second_listener_does_not_take_or_delete_a_live_socket() {
+        let path = temp_socket_path("second");
+        let first = Listener::bind(&path).unwrap();
+        let err = Listener::bind(&path).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(UnixStream::connect(&path).is_ok(), "the first socket still answers");
+        drop(first);
+        assert!(!path.exists());
+        // A stale file (nobody listening) is replaced.
+        std::fs::write(&path, b"").unwrap();
+        let again = Listener::bind(&path).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(again);
+    }
+
 
     #[test]
     fn listener_binds_with_owner_only_permissions() {
@@ -473,5 +584,138 @@ mod tests {
         subs.add(conn, vec![SubscriberMask::All], None, "");
         subs.broadcast_event(&Event::MonitorFocus { id: 1 });
         assert_eq!(subs.len(), 0);
+    }
+
+    #[test]
+    fn a_slow_subscriber_is_kept_and_gets_every_line_in_order() {
+        // The socket buffer fills long before 20000 lines are out; the old
+        // `write_all` on a non-blocking socket failed there and dropped the
+        // subscriber.
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut subs = Subscribers::new();
+        subs.add(Connection::new(server), vec![SubscriberMask::All], None, "W\n");
+        let lines: Vec<String> = (0..20_000).map(|i| format!("node_focus 0x{i:08X} x\n")).collect();
+        for (sent, line) in lines.iter().enumerate() {
+            subs.by_id.values_mut().for_each(|s| {
+                assert!(s.deliver(line), "dropped after {sent} lines");
+            });
+        }
+        assert_eq!(subs.len(), 1);
+        // Now the reader catches up; a few more deliveries flush the queue.
+        client.set_nonblocking(true).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        for _ in 0..10_000 {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    subs.by_id.values_mut().for_each(|s| {
+                        s.flush();
+                    });
+                    if subs.by_id.values().all(|s| s.queued.is_empty()) {
+                        break;
+                    }
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let expected: String = std::iter::once("W\n".to_string()).chain(lines).collect();
+        assert_eq!(String::from_utf8(got).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_subscriber_that_never_reads_is_dropped_past_the_queue_limit() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut subs = Subscribers::new();
+        subs.add(Connection::new(server), vec![SubscriberMask::All], None, "W\n");
+        let line = "x".repeat(1000) + "\n";
+        let mut alive = true;
+        for _ in 0..3000 {
+            alive = subs.by_id.values_mut().all(|s| s.deliver(&line));
+            if !alive {
+                break;
+            }
+        }
+        assert!(!alive, "more than {MAX_QUEUED_BYTES} unread bytes must end the subscription");
+    }
+
+    #[test]
+    fn queued_lines_are_delivered_by_flush_all_without_another_event() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut subs = Subscribers::new();
+        subs.add(Connection::new(server), vec![SubscriberMask::All], None, "W\n");
+        let line = "y".repeat(999) + "\n";
+        // Fill the socket buffer and beyond; the reader has not read a byte.
+        for _ in 0..600 {
+            subs.by_id.values_mut().for_each(|s| {
+                s.deliver(&line);
+            });
+        }
+        assert!(subs.has_queued(), "the socket buffer cannot hold 600 kB");
+        client.set_nonblocking(true).unwrap();
+        let mut got = 0usize;
+        let mut buf = [0u8; 65536];
+        for _ in 0..1000 {
+            match client.read(&mut buf) {
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            subs.flush_all();
+            if !subs.has_queued() {
+                break;
+            }
+        }
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        assert!(!subs.has_queued());
+        assert_eq!(subs.len(), 1);
+        assert_eq!(got, 2 + 600 * 1000);
+    }
+
+    #[test]
+    fn a_reply_larger_than_the_socket_buffer_is_sent_in_pieces_and_never_blocks() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut conn = Connection::new(server);
+        let big = "z".repeat(1 << 20);
+        conn.send_reply(Reply::Ok(big.clone())).unwrap();
+        assert!(conn.has_queued(), "1 MiB does not fit the socket buffer");
+        client.set_nonblocking(true).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        for _ in 0..10_000 {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            if conn.flush().unwrap() && got.len() >= big.len() {
+                break;
+            }
+        }
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), big.len());
+        assert!(!conn.has_queued());
     }
 }

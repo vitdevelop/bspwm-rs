@@ -363,8 +363,9 @@ pub enum Event {
         detail: PreselDetail,
     },
     NodeStack {
-        below: WireNodeId,
-        above: WireNodeId,
+        node: WireNodeId,
+        above: bool,
+        sibling: WireNodeId,
     },
     NodeGeometry {
         monitor: WireMonitorId,
@@ -535,8 +536,8 @@ impl fmt::Display for Event {
                     PreselDetail::Cancel => write!(f, "cancel"),
                 }
             }
-            Event::NodeStack { below, above } => {
-                write!(f, "node_stack 0x{below:08X} below 0x{above:08X}")
+            Event::NodeStack { node, above, sibling } => {
+                write!(f, "node_stack 0x{node:08X} {} 0x{sibling:08X}", if *above { "above" } else { "below" })
             }
             Event::NodeGeometry { monitor, desktop, node, geometry } => {
                 write!(f, "node_geometry 0x{monitor:08X} 0x{desktop:08X} 0x{node:08X} ")?;
@@ -826,10 +827,8 @@ pub struct JsonMonitor {
 }
 
 impl JsonMonitor {
-    /// Builds the JSON shape for `m`. `randrId`/`wired` are always `0`/
-    /// `false`: RandR bookkeeping has no Wayland equivalent yet
-    /// (`crates/bsp-core/src/monitor.rs`'s own doc comment; the hardware backend adds
-    /// real output identity). See [`JsonNode::from_tree`] for
+    /// Builds the JSON shape for `m`. `randrId` is always `0` (there is no
+    /// RandR); `wired` is whether an output shows the monitor. See [`JsonNode::from_tree`] for
     /// `node_id`/`client_names`.
     pub fn from_monitor(
         m: &bsp_core::monitor::Monitor,
@@ -840,8 +839,8 @@ impl JsonMonitor {
             name: m.name.clone(),
             id: m.id.0,
             randr_id: 0,
-            wired: false,
-            sticky_count: m.sticky_count,
+            wired: m.wired,
+            sticky_count: m.sticky_count(),
             window_gap: m.window_gap,
             border_width: m.border_width,
             focused_desktop_id: m.focused.map_or(0, |i| m.desktops[i].id.0),
@@ -879,10 +878,11 @@ impl JsonState {
     /// no monitor is focused (bspwm never reaches this state — `mon` is
     /// always valid once a monitor exists — but an empty `Wm` can appear
     /// in tests). `focusHistory` lists `wm.history` oldest first;
-    /// `stackingList` is always empty (see this struct's own doc comment).
+    /// `stackingList` is the wire ids in stacking order, bottom first (`stacking`).
     pub fn new(
         wm: &bsp_core::wm::Wm,
         clients_count: i32,
+        stacking: Vec<WireNodeId>,
         node_id: &impl Fn(bsp_core::id::DesktopId, bsp_core::id::NodeId) -> WireNodeId,
         client_names: &impl Fn(bsp_core::id::WindowId) -> (String, String),
     ) -> JsonState {
@@ -917,7 +917,7 @@ impl JsonState {
                     serde_json::json!({"monitorId": l.monitor.0, "desktopId": l.desktop.0, "nodeId": node})
                 })
                 .collect(),
-            stacking_list: Vec::new(),
+            stacking_list: stacking.into_iter().map(serde_json::Value::from).collect(),
         }
     }
 }

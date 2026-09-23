@@ -9,6 +9,11 @@
 //! x11_probe clip TEXT [--secs N]        owns CLIPBOARD and serves TEXT as UTF8_STRING
 //! x11_probe paste                       asks for CLIPBOARD as UTF8_STRING and prints it
 //! x11_probe grab [--secs N]             maps a window, grabs the keyboard (`XGrabKeyboard`) and prints every key press
+//! x11_probe pgrab [--secs N]            maps a window and grabs the pointer (`XGrabPointer`), as a game does
+//! x11_probe urgent [--secs N]           maps a window and sets the ICCCM urgency hint after two seconds
+//!
+//! Every mapped window prints `button press <window>` for each click it gets,
+//! and `_NET_WM_STATE [...]` / `_NET_WM_DESKTOP n` whenever the window manager changes them.
 //! ```
 //!
 //! Every mode prints `mapped <id> <w>x<h>`-style lines a test script can grep.
@@ -60,7 +65,7 @@ fn main() {
         0,
         WindowClass::INPUT_OUTPUT,
         0,
-        &CreateWindowAux::new().background_pixel(screen.white_pixel).event_mask(EventMask::EXPOSURE | EventMask::PROPERTY_CHANGE | EventMask::KEY_PRESS),
+        &CreateWindowAux::new().background_pixel(screen.white_pixel).event_mask(EventMask::EXPOSURE | EventMask::PROPERTY_CHANGE | EventMask::KEY_PRESS | EventMask::BUTTON_PRESS),
     )
     .expect("create window");
     conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_CLASS, AtomEnum::STRING, b"x11probe\0X11Probe\0").expect("class");
@@ -111,6 +116,26 @@ fn main() {
         let status = conn.grab_keyboard(true, win, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC).expect("grab").reply().expect("grab reply").status;
         println!("keyboard grab: {status:?}");
     }
+    if mode == "urgent" {
+        std::thread::sleep(Duration::from_secs(2));
+        // WM_HINTS: flags (InputHint | XUrgencyHint), input = true, the rest unused.
+        let hints = [1u32 | 256, 1, 0, 0, 0, 0, 0, 0, 0];
+        conn.change_property32(PropMode::REPLACE, win, AtomEnum::WM_HINTS, AtomEnum::WM_HINTS, &hints).expect("hints");
+        conn.flush().expect("flush");
+        println!("urgency hint set");
+    }
+    let net_state = atom(&conn, "_NET_WM_STATE");
+    let net_desktop = atom(&conn, "_NET_WM_DESKTOP");
+    if mode == "pgrab" {
+        std::thread::sleep(Duration::from_millis(1500));
+        let status = conn
+            .grab_pointer(false, win, EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION, GrabMode::ASYNC, GrabMode::ASYNC, x11rb::NONE, x11rb::NONE, x11rb::CURRENT_TIME)
+            .expect("grab")
+            .reply()
+            .expect("grab reply")
+            .status;
+        println!("pointer grab: {status:?}");
+    }
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -151,6 +176,21 @@ fn main() {
                 }
             }
             Ok(Some(Event::KeyPress(key))) => println!("key press {}", key.detail),
+            Ok(Some(Event::ButtonPress(b))) => println!("button press {:#x} {}", b.event, b.detail),
+            Ok(Some(Event::PropertyNotify(p))) if p.window == win && (p.atom == net_state || p.atom == net_desktop) => {
+                let Ok(Ok(reply)) = conn.get_property(false, win, p.atom, AtomEnum::ANY, 0, 64).map(|c| c.reply()) else { continue };
+                let values: Vec<u32> = reply.value32().map(|v| v.collect()).unwrap_or_default();
+                if p.atom == net_desktop {
+                    println!("_NET_WM_DESKTOP {}", values.first().copied().unwrap_or(u32::MAX));
+                } else {
+                    let names: Vec<String> = values
+                        .iter()
+                        .filter_map(|a| conn.get_atom_name(*a).ok()?.reply().ok())
+                        .map(|r| String::from_utf8_lossy(&r.name).trim_start_matches("_NET_WM_STATE_").to_string())
+                        .collect();
+                    println!("_NET_WM_STATE {names:?}");
+                }
+            }
             Ok(Some(_)) => {}
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => break,

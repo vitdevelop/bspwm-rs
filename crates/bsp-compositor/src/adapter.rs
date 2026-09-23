@@ -26,6 +26,13 @@ pub struct WindowAdapter {
     next_id: u32,
     windows: HashMap<WindowId, Window>,
     classes: HashMap<WindowId, (String, String)>,
+    /// Windows `bspc node -k` asked to kill; `ipc::apply_pending_kills` does it,
+    /// where the display and the X connection are at hand.
+    pub pending_kills: Vec<Window>,
+    /// Where the pointer was, and the managed window under it, when the current
+    /// command started (`ipc::execute_and_broadcast` refreshes it): what the
+    /// `pointed` selector resolves against.
+    pub pointer: (Option<(i32, i32)>, Option<WindowId>),
     /// Outputs/input devices as `bspc output`/`bspc input` see them.
     pub hw: crate::hardware::HwModel,
 }
@@ -37,6 +44,8 @@ impl WindowAdapter {
             next_id: FIRST_WAYLAND_WINDOW_ID,
             windows: HashMap::new(),
             classes: HashMap::new(),
+            pending_kills: Vec::new(),
+            pointer: (None, None),
             hw: crate::hardware::HwModel {
                 // Matches `State::new`'s `seat.add_keyboard(_, 200, 25)`.
                 repeat: (25, 200),
@@ -50,8 +59,15 @@ impl WindowAdapter {
     pub fn insert(&mut self, window: Window) -> WindowId {
         let id = WindowId(self.next_id);
         self.next_id += 1;
+        window.user_data().insert_if_missing(|| crate::render::WindowKey(id));
         self.windows.insert(id, window);
         id
+    }
+
+    /// Every managed window, shown or not (a window on a desktop that is not
+    /// shown is out of the `Space` but still here).
+    pub fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
     }
 
     /// Forgets a destroyed window's mapping.
@@ -126,13 +142,14 @@ impl bsp_ipc::adapter::Adapter for WindowAdapter {
         }
     }
 
+    fn pointer_state(&self) -> (Option<(i32, i32)>, Option<WindowId>) {
+        self.pointer
+    }
+
     fn kill_window(&mut self, window: WindowId) {
-        // No signal-based kill exists for a Wayland client (unlike
-        // bspwm's `XKillClient` — there is no display-server-mediated
-        // forced termination in the Wayland protocol): ask it to close,
-        // same as `close_window`. A real force-kill needs the client's
-        // pid (from `wl_client_get_credentials`), not implemented yet.
-        self.close_window(window);
+        if let Some(w) = self.windows.get(&window) {
+            self.pending_kills.push(w.clone());
+        }
     }
 
     fn output_names(&self) -> Vec<String> {

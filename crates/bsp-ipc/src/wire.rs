@@ -29,9 +29,10 @@ pub const SOCKET_ENV_VAR: &str = "BSPWM_SOCKET";
 ///
 /// bspwm derives its default path from the X11 display/screen number
 /// (`src/common.h` `SOCKET_PATH_TPL`, `"/tmp/bspwm%s_%i_%i-socket"`), which
-/// has no Wayland equivalent (`docs/bsp-ipc.md`); a Wayland session has at
-/// most one compositor instance per `XDG_RUNTIME_DIR`, so a fixed name
-/// there is sufficient.
+/// has no Wayland equivalent (`docs/bsp-ipc.md`). The first instance takes
+/// this name; one started while it runs (another VT) binds
+/// `bspwm-rs-$WAYLAND_DISPLAY-socket` and exports `BSPWM_SOCKET` to its
+/// children (`bsp-compositor` `ipc::init`).
 pub const DEFAULT_SOCKET_NAME: &str = "bspwm-rs-socket";
 
 /// Resolves the control socket path: `BSPWM_SOCKET` if set, otherwise

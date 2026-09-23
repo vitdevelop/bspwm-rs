@@ -29,6 +29,14 @@ pub trait Adapter {
     /// `xcb_kill_client`; on Wayland this is killing the client process).
     fn kill_window(&mut self, window: WindowId);
 
+    /// Where the pointer is (global coordinates) and the window under it, for
+    /// the `pointed` selector. Defaults to "no pointer".
+    ///
+    /// bspwm: `src/query.c`'s `pointed` (`xcb_query_pointer`).
+    fn pointer_state(&self) -> (Option<(i32, i32)>, Option<WindowId>) {
+        (None, None)
+    }
+
     /// Real hardware output configuration (`bspc output`,
     /// `docs/design.md`'s "Configuration beyond bspwm" — not a bspwm
     /// command, `xrandr`'s replacement). Every method below defaults to
@@ -93,6 +101,8 @@ pub struct FakeAdapter {
     pub closed: Vec<WindowId>,
     /// Windows [`Adapter::kill_window`] was called with, in call order.
     pub killed: Vec<WindowId>,
+    /// The pointer position and the window under it, for `pointed`.
+    pub pointer: (Option<(i32, i32)>, Option<WindowId>),
 }
 
 impl FakeAdapter {
@@ -112,6 +122,10 @@ impl FakeAdapter {
 impl Adapter for FakeAdapter {
     fn window_class(&self, window: WindowId) -> (String, String) {
         self.classes.get(&window).cloned().unwrap_or_default()
+    }
+
+    fn pointer_state(&self) -> (Option<(i32, i32)>, Option<WindowId>) {
+        self.pointer
     }
 
     fn close_window(&mut self, window: WindowId) {

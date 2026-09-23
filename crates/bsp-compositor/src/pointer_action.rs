@@ -317,9 +317,8 @@ fn format_click_to_focus(c: ClickToFocus) -> String {
 /// scroll_lock | caps_lock)` — stripped before *every* comparison
 /// against `pointer_modifier` or a plain (no-modifier) click, so an
 /// incidental Caps Lock never breaks either match. `num_lock` is
-/// likewise excluded here by simply never being queried at all (unlike
-/// `crate::hotkeys::resolve_modifiers`, which needs it for `Mod2`
-/// coverage).
+/// likewise excluded here by simply never being queried at all (as
+/// `crate::hotkeys::resolve_modifiers` now does for both locks).
 ///
 /// Full modifier coverage (`docs/design.md`'s Hotkeys and config row): resolves
 /// `Mod1`/`Mod3`/`Mod4`/`Mod5` from `ModifiersState`'s own fields for
@@ -449,7 +448,11 @@ pub fn on_button_press<Bd: Backend + 'static>(
             ClickToFocus::Button(b) => b == index,
         };
         if matches {
-            return !click_to_focus(state, serial);
+            // bspwm: `replay = !grab_pointer(ACTION_FOCUS) || !swallow_first_click`:
+            // the click that moved focus reaches the client too, unless
+            // `swallow_first_click` is on.
+            let focus_changed = click_to_focus(state, serial);
+            return !focus_changed || !state.pointer_settings.swallow_first_click;
         }
     }
 
@@ -624,7 +627,9 @@ impl<Bd: Backend + 'static> DragGrab<Bd> {
                 .tree
                 .move_floating(self.node, dx, dy);
             if moved {
-                crate::shell::sync_wayland_from_core(data);
+                // Not now: this runs inside the pointer's own lock (a grab callback), and
+            // the sync reads the pointer's focus, which locks it again: deadlock.
+            data.request_sync();
             }
         }
     }
@@ -665,7 +670,9 @@ impl<Bd: Backend + 'static> DragGrab<Bd> {
         if swapped {
             let settings = data.wm.settings.clone();
             data.wm.monitors[self.monitor].arrange(self.desktop, &settings);
-            crate::shell::sync_wayland_from_core(data);
+            // Not now: this runs inside the pointer's own lock (a grab callback), and
+            // the sync reads the pointer's focus, which locks it again: deadlock.
+            data.request_sync();
         }
     }
 
@@ -676,9 +683,41 @@ impl<Bd: Backend + 'static> DragGrab<Bd> {
         if resized {
             let settings = data.wm.settings.clone();
             data.wm.monitors[self.monitor].arrange(self.desktop, &settings);
-            crate::shell::sync_wayland_from_core(data);
+            // Not now: this runs inside the pointer's own lock (a grab callback), and
+            // the sync reads the pointer's focus, which locks it again: deadlock.
+            data.request_sync();
         }
     }
+}
+
+thread_local! {
+    /// How many grab callbacks are running on this thread.
+    static IN_GRAB: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a grab callback as running while it lives. A grab's callbacks run
+/// under the pointer's own (non-reentrant) lock, so anything that reads the
+/// pointer's focus (`shell::sync_wayland_from_core`, `input::refresh_pointer_focus`)
+/// would deadlock: they `debug_assert!` on [`in_grab_callback`], so a regression
+/// fails a debug build at once instead of freezing a session.
+pub(crate) struct GrabGuard;
+
+impl GrabGuard {
+    pub(crate) fn enter() -> Self {
+        IN_GRAB.with(|g| g.set(g.get() + 1));
+        Self
+    }
+}
+
+impl Drop for GrabGuard {
+    fn drop(&mut self) {
+        IN_GRAB.with(|g| g.set(g.get().saturating_sub(1)));
+    }
+}
+
+/// Whether a pointer-grab callback is running on this thread.
+pub(crate) fn in_grab_callback() -> bool {
+    IN_GRAB.with(|g| g.get() > 0)
 }
 
 impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
@@ -692,6 +731,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         )>,
         event: &MotionEvent,
     ) {
+        let _guard = GrabGuard::enter();
         // Focus stays cleared for the whole drag (`Focus::Clear` at
         // grab start): the dragged/resized client sees no pointer
         // motion at all while the compositor is driving it, matching
@@ -727,6 +767,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         )>,
         event: &RelativeMotionEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.relative_motion(data, None, event);
     }
 
@@ -736,6 +777,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &ButtonEvent,
     ) {
+        let _guard = GrabGuard::enter();
         // bspwm's own X11 grab only listens for `BUTTON_RELEASE`/
         // `MOTION` while a drag is active (`grab_pointer()`'s
         // `xcb_grab_pointer(...XCB_EVENT_MASK_BUTTON_RELEASE|MOTION...)`)
@@ -763,10 +805,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
             .client
             .clone()
         {
-            let geometry = match client.state {
-                ClientState::Floating => client.floating_rectangle,
-                _ => client.tiled_rectangle,
-            };
+            let geometry = client.shown_rectangle();
             let (monitor, desktop, node) = wire_ids(data, self.monitor, self.desktop, self.node);
             data.subscribers.broadcast_event(&Event::NodeGeometry {
                 monitor,
@@ -786,10 +825,12 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         details: AxisFrame,
     ) {
+        let _guard = GrabGuard::enter();
         handle.axis(data, details);
     }
 
     fn frame(&mut self, data: &mut State<Bd>, handle: &mut PointerInnerHandle<'_, State<Bd>>) {
+        let _guard = GrabGuard::enter();
         handle.frame(data);
     }
 
@@ -799,6 +840,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeBeginEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_swipe_begin(data, event);
     }
 
@@ -808,6 +850,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeUpdateEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_swipe_update(data, event);
     }
 
@@ -817,6 +860,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureSwipeEndEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_swipe_end(data, event);
     }
 
@@ -826,6 +870,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchBeginEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_pinch_begin(data, event);
     }
 
@@ -835,6 +880,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchUpdateEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_pinch_update(data, event);
     }
 
@@ -844,6 +890,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GesturePinchEndEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_pinch_end(data, event);
     }
 
@@ -853,6 +900,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureHoldBeginEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_hold_begin(data, event);
     }
 
@@ -862,6 +910,7 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         handle: &mut PointerInnerHandle<'_, State<Bd>>,
         event: &GestureHoldEndEvent,
     ) {
+        let _guard = GrabGuard::enter();
         handle.gesture_hold_end(data, event);
     }
 

@@ -273,7 +273,11 @@ pub fn surface_under<Bd: Backend + 'static>(
         }
         None
     };
-    if let Some(hit) = from_layers(&[Layer::Overlay, Layer::Top]) {
+    // The top layer (a bar) is drawn under a fullscreen window, so it must not
+    // take clicks through it either.
+    let fullscreen = crate::render::has_fullscreen(&state.wm, crate::render::monitor_of(&state.wm, output)) || crate::render::unmanaged_covers(&state.space, output);
+    let above: &[Layer] = if fullscreen { &[Layer::Overlay] } else { &[Layer::Overlay, Layer::Top] };
+    if let Some(hit) = from_layers(above) {
         return Some(hit);
     }
     if let Some((window, loc)) = state.space.element_under(pos) {

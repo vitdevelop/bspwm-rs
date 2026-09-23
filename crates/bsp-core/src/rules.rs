@@ -10,6 +10,7 @@
 //! `external_rules_command` hook (populating `class`/`instance`/`title`
 //! from the window itself before matching) belong there too.
 
+use crate::geometry::Rect;
 use crate::tree::Direction;
 use crate::{node::ClientState, node::Layer};
 
@@ -97,8 +98,8 @@ pub fn match_rules(
 /// What a matched rule does to a window.
 ///
 /// bspwm: `src/types.h` `rule_consequence_t`. `monitor_desc`/
-/// `desktop_desc`/`node_desc` (raw selector strings) and `honor_size_hints`
-/// are left for `bsp-ipc` (IPC), which owns selector parsing;
+/// `desktop_desc`/`node_desc` are raw selector strings,
+/// left for `bsp-ipc` (IPC), which owns selector parsing;
 /// `manage`/`focus`/`border`/`center`/`follow` (all plain bools in bspwm)
 /// are included since they need no parsing.
 ///
@@ -134,10 +135,10 @@ pub struct RuleConsequence {
     /// Force the marked flag.
     pub marked: Option<bool>,
     /// Center the window (only meaningful together with `state:
-    /// Floating`).
-    pub center: bool,
-    /// Focus the desktop the window is inserted into.
-    pub follow: bool,
+    /// Floating`); unmentioned (`None`) means off.
+    pub center: Option<bool>,
+    /// Focus the desktop the window is inserted into; unmentioned means off.
+    pub follow: Option<bool>,
     /// `Some(false)` rejects the window outright (bspwm: `manage`);
     /// unmentioned (`None`) defaults to `true`, like every window that
     /// matches no rule at all.
@@ -147,15 +148,28 @@ pub struct RuleConsequence {
     pub focus: Option<bool>,
     /// Draw a border around the window; unmentioned defaults to `true`.
     pub border: Option<bool>,
+    /// `monitor=MONITOR_SEL`: the selector text, resolved when the window
+    /// is managed (bspwm: `monitor_desc`).
+    pub monitor_desc: Option<String>,
+    /// `desktop=DESKTOP_SEL`: the selector text (bspwm: `desktop_desc`).
+    pub desktop_desc: Option<String>,
+    /// `node=NODE_SEL`: the selector text (bspwm: `node_desc`).
+    pub node_desc: Option<String>,
+    /// `rectangle=WxH+X+Y`: the floating rectangle to start from.
+    pub rect: Option<Rect>,
+    /// `honor_size_hints=`: overrides the setting for this window.
+    ///
+    /// bspwm: `rule_consequence_t.honor_size_hints`, applied in
+    /// `src/window.c` `manage_window()`.
+    pub honor_size_hints: Option<crate::settings::HonorSizeHints>,
 }
 
 impl RuleConsequence {
     /// Merges `other` on top of `self`: every field `other` sets
     /// overwrites `self`'s, and every field `other` leaves unset is kept
-    /// as-is. `center`/`follow` are plain `bool`s that only ever turn a
-    /// flag on (bspwm never has a rule turn them back off relative to an
-    /// earlier match), so `other`'s `true` wins but its `false` does not
-    /// clear a `true` already set.
+    /// as-is. `center`/`follow` are `Option`s like the rest, so a later
+    /// rule's `center=off` clears an earlier `center=on` (bspwm:
+    /// `parse_key_value()` assigns every boolean key).
     ///
     /// Mirrors applying successive matching rules' `key=value` tokens onto
     /// one shared accumulator (bspwm: `src/rule.c` `apply_rules()`'s loop
@@ -181,8 +195,19 @@ impl RuleConsequence {
         take_some!(manage);
         take_some!(focus);
         take_some!(border);
-        self.center |= other.center;
-        self.follow |= other.follow;
+        take_some!(center);
+        take_some!(follow);
+        take_some!(honor_size_hints);
+        if other.monitor_desc.is_some() {
+            self.monitor_desc = other.monitor_desc.clone();
+        }
+        if other.desktop_desc.is_some() {
+            self.desktop_desc = other.desktop_desc.clone();
+        }
+        if other.node_desc.is_some() {
+            self.node_desc = other.node_desc.clone();
+        }
+        take_some!(rect);
     }
 
     /// Whether a window this consequence applies to should be managed
@@ -197,6 +222,18 @@ impl RuleConsequence {
     /// once managed. `true` unless a rule explicitly set `focus=off`.
     pub fn should_focus(&self) -> bool {
         self.focus.unwrap_or(true)
+    }
+
+    /// Whether the window is centred when it floats: `false` unless a rule
+    /// (or the window's own type) said `center=on`.
+    pub fn should_center(&self) -> bool {
+        self.center.unwrap_or(false)
+    }
+
+    /// Whether the desktop the window lands on is focused too: `false`
+    /// unless a rule said `follow=on`.
+    pub fn should_follow(&self) -> bool {
+        self.follow.unwrap_or(false)
     }
 
     /// Whether a window this consequence applies to should be bordered.
@@ -274,11 +311,21 @@ mod tests {
         };
         c.merge(&RuleConsequence {
             state: Some(ClientState::Tiled),
-            follow: true,
+            follow: Some(true),
             ..Default::default()
         });
         assert_eq!(c.state, Some(ClientState::Tiled));
-        assert!(c.follow);
+        assert!(c.should_follow());
+    }
+
+    #[test]
+    fn a_later_rule_can_turn_center_and_follow_back_off() {
+        // bspwm: `parse_key_value()` assigns `center`/`follow` like any boolean key.
+        let mut c = RuleConsequence { center: Some(true), follow: Some(true), ..Default::default() };
+        c.merge(&RuleConsequence { center: Some(false), ..Default::default() });
+        assert!(!c.should_center());
+        assert!(c.should_follow(), "an unmentioned field is kept");
+        assert!(!RuleConsequence::default().should_center());
     }
 
     fn rule_with(class: &str, one_shot: bool, consequence: RuleConsequence) -> Rule {

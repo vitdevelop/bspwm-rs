@@ -9,7 +9,8 @@
 //! makes, applied by `crate::ipc::apply_hardware_now`.
 //!
 //! Supported: mode (including custom modes that match a real one), position,
-//! scale. Not supported, and reported as a failed configuration: turning an
+//! scale, and switching a virtual (`HEADLESS-N`) output off, which removes it.
+//! Not supported, and reported as a failed configuration: turning a real
 //! output off, transforms other than `normal`, adaptive sync.
 //!
 //! Heads are diffed after every event-loop turn ([`sync`]).
@@ -327,16 +328,24 @@ impl<Bd: Backend + 'static> Dispatch<ZwlrOutputModeV1, ModeData, State<Bd>> for 
 /// why the configuration cannot be honoured.
 fn evaluate<Bd: Backend + 'static>(state: &mut State<Bd>, config: &Config, apply: bool) -> Result<(), String> {
     let outputs = state.adapter.hw.outputs.clone();
-    // Every currently enabled output must stay enabled: switching one off
-    // is not supported.
+    // A real output cannot be switched off. Switching a virtual one off removes
+    // it (there is nothing to keep of it once it is off).
+    let mut removals: Vec<(String, OutputAction)> = Vec::new();
     for hw in &outputs {
         let listed = config.heads.iter().find(|(name, _, _)| name == &hw.name);
         if !matches!(listed, Some((_, true, _))) {
+            if hw.name.starts_with(crate::hardware::HEADLESS_PREFIX) {
+                removals.push((hw.name.clone(), OutputAction::Remove));
+                continue;
+            }
             return Err(format!("turning output '{}' off is not supported", hw.name));
         }
     }
     let mut actions: Vec<(String, OutputAction)> = Vec::new();
-    for (name, _, change) in &config.heads {
+    for (name, enabled, change) in &config.heads {
+        if !enabled {
+            continue;
+        }
         let Some(hw) = outputs.iter().find(|o| &o.name == name) else {
             return Err(format!("unknown output '{name}'"));
         };
@@ -361,6 +370,7 @@ fn evaluate<Bd: Backend + 'static>(state: &mut State<Bd>, config: &Config, apply
             }
         }
     }
+    actions.extend(removals);
     for (name, action) in &actions {
         if apply {
             state.adapter.hw.set_output(name, action)?;

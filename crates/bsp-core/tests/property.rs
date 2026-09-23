@@ -171,7 +171,7 @@ proptest! {
         }
 
         let mrect = Rect::new(0, 0, 1920, 1080);
-        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect);
+        t.apply_layout(t.root, mrect, 0, Layout::Tiled, mrect, bsp_core::tree::LayoutOptions::default());
 
         let mut leaves = Vec::new();
         let mut f = t.first_extrema(t.root);
@@ -230,6 +230,106 @@ proptest! {
 
         prop_assert_eq!(t.root, None);
         prop_assert_eq!(t.focus, None);
+    }
+}
+
+/// Every parent/child link agrees, and a tree with `n` leaves has `2n - 1` nodes.
+fn tree_is_well_formed(t: &Tree) -> bool {
+    let leaves = leaf_windows(t).len();
+    let ids = t.node_ids();
+    let expected = if leaves == 0 { 0 } else { 2 * leaves - 1 };
+    if ids.len() != expected {
+        return false;
+    }
+    ids.iter().all(|&id| {
+        let node = t.node(id);
+        let children_ok = [node.first_child(), node.second_child()]
+            .into_iter()
+            .flatten()
+            .all(|c| t.node(c).parent() == Some(id));
+        let parent_ok = match node.parent() {
+            Some(p) => t.node(p).first_child() == Some(id) || t.node(p).second_child() == Some(id),
+            None => t.root == Some(id),
+        };
+        children_ok && parent_ok && (node.first_child().is_some() == node.second_child().is_some())
+    })
+}
+
+proptest! {
+    /// Moving, swapping and circulating between two trees never loses or
+    /// duplicates a window and never leaves a broken link.
+    #[test]
+    fn transplants_and_swaps_between_two_trees_keep_every_window(
+        na in 1usize..6,
+        nb in 1usize..6,
+        picks in prop::collection::vec(0usize..8, 0..8),
+        ops in prop::collection::vec((0u8..5, 0usize..16, 0usize..16), 0..24),
+    ) {
+        let settings = Settings::default();
+        let (mut a, wa) = build_tree(&settings, na, &picks);
+        // Window ids of the second tree do not overlap the first's.
+        let mut b = Tree::new();
+        let mut wb = Vec::new();
+        for i in 0..nb {
+            let window = 100 + i as u32;
+            let id = b.new_client_node(&settings, Client::new(WindowId(window), settings.border_width));
+            let anchor = b.first_extrema(b.root).filter(|_| i > 0);
+            b.insert_node(&settings, id, anchor);
+            wb.push(window);
+        }
+        let mut expected: Vec<u32> = wa.iter().chain(wb.iter()).copied().collect();
+        expected.sort_unstable();
+        let leaf_at = |t: &Tree, pick: usize| {
+            let mut leaves = Vec::new();
+            let mut f = t.first_extrema(t.root);
+            while let Some(n) = f {
+                leaves.push(n);
+                f = t.next_leaf(Some(n), t.root);
+            }
+            (!leaves.is_empty()).then(|| leaves[pick % leaves.len()])
+        };
+        for (kind, x, y) in ops {
+            match kind {
+                0 => {
+                    if let (Some(n1), Some(n2)) = (leaf_at(&a, x), leaf_at(&a, y)) {
+                        a.swap_nodes(n1, n2);
+                    }
+                }
+                1 => {
+                    // Move a leaf of `a` next to a leaf of `b` (only while `a` keeps one).
+                    if leaf_windows(&a).len() > 1 {
+                        if let Some(n) = leaf_at(&a, x) {
+                            let anchor = leaf_at(&b, y);
+                            a.transplant_to_mapped(&settings, n, &mut b, anchor);
+                        }
+                    }
+                }
+                2 => {
+                    if let (Some(n1), Some(n2)) = (leaf_at(&a, x), leaf_at(&b, y)) {
+                        a.swap_subtrees_with(n1, &mut b, n2);
+                    }
+                }
+                3 => {
+                    let root = b.root;
+                    b.circulate_leaves(&settings, root, CirculateDir::Forward);
+                }
+                _ => {
+                    if leaf_windows(&b).len() > 1 {
+                        if let Some(n) = leaf_at(&b, x) {
+                            let anchor = leaf_at(&a, y);
+                            b.transplant_to_mapped(&settings, n, &mut a, anchor);
+                        }
+                    }
+                }
+            }
+        }
+        let mut actual: Vec<u32> = leaf_windows(&a).into_iter().chain(leaf_windows(&b)).collect();
+        actual.sort_unstable();
+        prop_assert_eq!(actual, expected);
+        prop_assert!(tree_is_well_formed(&a));
+        prop_assert!(tree_is_well_formed(&b));
+        prop_assert!(all_ratios_in_bounds(&a, a.root));
+        prop_assert!(all_ratios_in_bounds(&b, b.root));
     }
 }
 

@@ -30,14 +30,34 @@ pub fn init<Bd: Backend + 'static>(state: &mut State<Bd>) {
         tracing::warn!("no BSPWM_SOCKET/XDG_RUNTIME_DIR: control socket disabled");
         return;
     };
-    let listener = match Listener::bind(&path) {
+    let explicit = std::env::var_os(wire::SOCKET_ENV_VAR).is_some();
+    let bound = match Listener::bind(&path) {
+        // Another bspwm-rs (another VT) answers at the default path: take a
+        // path of our own instead of taking over (or, on exit, deleting) its
+        // socket, which left the first session's `bspc` and hotkeys dead.
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && !explicit => {
+            let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| std::process::id().to_string());
+            let own = path.with_file_name(format!("bspwm-rs-{display}-socket"));
+            tracing::info!(taken = %path.display(), path = %own.display(), "another instance owns the control socket; using one of our own");
+            Listener::bind(&own)
+        }
+        other => other,
+    };
+    let listener = match bound {
         Ok(l) => l,
         Err(err) => {
             tracing::warn!(path = %path.display(), "failed to bind the control socket: {err}");
             return;
         }
     };
-    tracing::info!(path = %path.display(), "control socket listening");
+    tracing::info!(path = %listener.path().display(), "control socket listening");
+    // Our children (`bspwmrc`, hotkey commands, terminals) find this instance.
+    // SAFETY: process environment, set at startup before `bspwmrc` or any
+    // hotkey command is spawned and before the X worker thread exists, like
+    // `WAYLAND_DISPLAY` just before.
+    unsafe {
+        std::env::set_var(wire::SOCKET_ENV_VAR, listener.path());
+    }
 
     // SAFETY: `FdWrapper::new()` requires the wrapped value's `AsRawFd`
     // impl to always return a valid fd for the wrapper's lifetime; a
@@ -133,19 +153,16 @@ fn on_readable<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot
     let command = match bsp_ipc::command::parse(&args) {
         Ok(c) => c,
         Err(e) => {
-            reply_and_close(slot, Reply::Fail(e.message));
+            reply_and_close(state, slot, Reply::Fail(e.message));
             return PostAction::Remove;
         }
     };
 
     match command {
-        Command::Quit(_status) => {
-            // The exit status argument is not threaded through to the
-            // process's own exit code yet (`docs/bsp-compositor.md`,
-            // Nested compositor scope) — stopping the main loop is what matters for
-            // a nested development backend.
+        Command::Quit(status) => {
+            crate::state::EXIT_STATUS.store(status.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
             state.running = false;
-            reply_and_close(slot, Reply::Ok(String::new()));
+            reply_and_close(state, slot, Reply::Ok(String::new()));
             PostAction::Remove
         }
         Command::Subscribe { count, masks, .. } => {
@@ -161,7 +178,7 @@ fn on_readable<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot
                 .or_else(|| crate::pointer_action::try_config(state, &other))
                 .or_else(|| crate::xwayland::try_config(state, &other))
                 .unwrap_or_else(|| execute_and_broadcast(state, &other));
-            reply_and_close(slot, reply);
+            reply_and_close(state, slot, reply);
             PostAction::Remove
         }
     }
@@ -225,6 +242,10 @@ fn bool_str(b: bool) -> String {
 /// `SIGUSR1` does for the latter) — without disturbing any mapped
 /// client or `bsp-core` state.
 pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>, command: &Command) -> Reply {
+    let focus_before = crate::input::focus_key(state);
+    // What `pointed` refers to for this command.
+    let location = state.pointer.current_location();
+    state.adapter.pointer = (Some((location.x as i32, location.y as i32)), crate::input::window_under(state, location));
     let (mut reply, mut events) = {
         let mut ctx = ExecCtx {
             wm: &mut state.wm,
@@ -233,6 +254,7 @@ pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>
         };
         exec::execute(&mut ctx, command)
     };
+    apply_pending_kills(state);
     // `bspc output`/`bspc input` only validate and queue (`crate::hardware`);
     // the real change happens here, where `Output`s and the backend live.
     if let Err(msg) = apply_hardware_changes(state, &mut events) {
@@ -240,7 +262,13 @@ pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>
             reply = Reply::Fail(msg);
         }
     }
+    // A command that only reads (`query`, `config KEY`) changed nothing: no
+    // reconcile, no report, no redraw. Status bars poll `query` often.
+    if is_read_only(command) && events.is_empty() {
+        return reply;
+    }
     crate::shell::sync_wayland_from_core(state);
+    crate::input::warp_pointer_for_focus(state, focus_before);
     for event in &events {
         state.subscribers.broadcast_event(event);
     }
@@ -254,6 +282,69 @@ pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>
     }
 
     reply
+}
+
+/// Sends `events` to every `subscribe`d connection, then a fresh report line
+/// (bspwm puts a report after every change that alters what a bar shows).
+/// Does nothing for an empty list.
+pub(crate) fn broadcast_events<Bd: Backend + 'static>(state: &mut State<Bd>, events: &[bsp_ipc::report::Event]) {
+    if events.is_empty() {
+        return;
+    }
+    for event in events {
+        state.subscribers.broadcast_event(event);
+    }
+    let report = build_report(state);
+    state.subscribers.broadcast_report(&report);
+}
+
+/// Runs one of `bsp_ipc::exec`'s bspwm-shaped operations (`focus_node`,
+/// `activate_node`, `transfer_node` ...) on the live state, so a focus, map or
+/// unmap the compositor itself causes changes the tree exactly as the matching
+/// `bspc` command would, and reports what bspwm reports.
+pub(crate) fn with_ops<Bd: Backend + 'static, R>(
+    state: &mut State<Bd>,
+    f: impl FnOnce(&mut ExecCtx<crate::adapter::WindowAdapter>, &mut Vec<bsp_ipc::report::Event>) -> R,
+) -> R {
+    state.wm.sync_history();
+    let layouts = bsp_ipc::exec::layout_snapshot(&state.wm);
+    let mut events = Vec::new();
+    let result = {
+        let mut ctx = ExecCtx { wm: &mut state.wm, registry: &mut state.registry, adapter: &mut state.adapter };
+        f(&mut ctx, &mut events)
+    };
+    state.wm.sync_history();
+    state.registry.sync_with(&state.wm);
+    bsp_ipc::exec::push_layout_changes(&state.wm, &layouts, &mut events);
+    broadcast_events(state, &events);
+    // The operation may have raised a window (focus, state, layer): the
+    // stacking is applied by the one sync at the end of the event-loop turn.
+    state.request_sync();
+    result
+}
+
+/// Kills the clients of the windows `bspc node -k` queued.
+///
+/// bspwm: `xcb_kill_client()`. An X11 window's client is killed through the X
+/// server (never the whole Xwayland, which every X11 client shares). A Wayland
+/// window's client is disconnected, which destroys all its windows, so a client
+/// with several toplevels loses them all, as an X11 client would. The nodes
+/// leave the tree when the surfaces are destroyed (`shell::unmap_window`).
+fn apply_pending_kills<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    use smithay::reexports::wayland_server::backend::DisconnectReason;
+    use smithay::reexports::wayland_server::Resource;
+    use smithay::wayland::seat::WaylandFocus;
+    for window in std::mem::take(&mut state.adapter.pending_kills) {
+        if let Some(x11) = window.x11_surface() {
+            tracing::debug!(window = x11.window_id(), display = ?state.xwayland.display, "killing an X11 client");
+            if !crate::xwayland::kill_client(state, x11.window_id()) {
+                let _ = x11.close();
+            }
+        } else if let Some(client) = window.wl_surface().and_then(|s| s.client()) {
+            tracing::debug!("killing a Wayland client");
+            state.display_handle.backend_handle().kill_client(client.id(), DisconnectReason::ConnectionClosed);
+        }
+    }
 }
 
 /// Applies the output/input changes `crate::hardware::HwModel` queued
@@ -291,10 +382,33 @@ fn apply_hardware_changes<Bd: Backend + 'static>(
     let mut first_error: Option<String> = None;
 
     for (name, action) in outputs {
+        // Virtual outputs come and go here; nothing else applies to a name that
+        // does not exist yet.
+        match &action {
+            OutputAction::CreateHeadless(mode) => {
+                crate::headless::create(state, *mode, events);
+                continue;
+            }
+            OutputAction::Remove => {
+                if let Err(msg) = crate::headless::remove(state, &name, events) {
+                    first_error.get_or_insert(msg);
+                }
+                continue;
+            }
+            _ => {}
+        }
         let Some(output) = state.space.outputs().find(|o| o.name() == name).cloned() else {
             continue;
         };
         match action {
+            // A virtual output has no hardware to program: the mode is the state.
+            OutputAction::SetMode(mode) if crate::headless::is_headless(&output) => {
+                let wl_mode = smithay::output::Mode { size: (mode.width, mode.height).into(), refresh: mode.refresh_mhz };
+                output.add_mode(wl_mode);
+                output.set_preferred(wl_mode);
+                output.change_current_state(Some(wl_mode), None, None, None);
+            }
+            OutputAction::CreateHeadless(_) | OutputAction::Remove => {}
             OutputAction::SetMode(mode) => match state.backend_data.set_output_mode(&output, mode) {
                 Ok(wl_mode) => output.change_current_state(Some(wl_mode), None, None, None),
                 Err(msg) => {
@@ -368,7 +482,7 @@ fn apply_hardware_changes<Bd: Backend + 'static>(
 pub(crate) fn apply_hardware_now<Bd: Backend + 'static>(state: &mut State<Bd>) -> Result<(), String> {
     let mut events = Vec::new();
     let result = apply_hardware_changes(state, &mut events);
-    crate::shell::sync_wayland_from_core(state);
+    state.request_sync();
     for event in &events {
         state.subscribers.broadcast_event(event);
     }
@@ -376,6 +490,18 @@ pub(crate) fn apply_hardware_now<Bd: Backend + 'static>(state: &mut State<Bd>) -
     state.subscribers.broadcast_report(&report);
     state.backend_data.queue_redraw();
     result
+}
+
+/// Whether `command` cannot change anything: any `query`, a `config KEY` read,
+/// `wm -d`/`-g`.
+fn is_read_only(command: &Command) -> bool {
+    use bsp_ipc::command::WmAction;
+    match command {
+        Command::Query(_) => true,
+        Command::Config(c) => c.value.is_none(),
+        Command::Wm(actions) => actions.iter().all(|a| matches!(a, WmAction::DumpState | WmAction::GetStatus)),
+        _ => false,
+    }
 }
 
 fn requests_restart(command: &Command) -> bool {
@@ -387,9 +513,46 @@ fn requests_restart(command: &Command) -> bool {
 /// the fd from epoll *before* it is closed — closing it here (dropping
 /// the taken `Connection`) made that deregistration fail with EBADF, a
 /// warning per `bspc` call. Dropping the source afterward closes it.
-fn reply_and_close(slot: &mut ConnSlot, reply: Reply) {
-    if let Some(connection) = slot.conn.as_mut() {
-        let _ = connection.send_reply(reply);
+fn reply_and_close<Bd: Backend + 'static>(state: &mut State<Bd>, slot: &mut ConnSlot, reply: Reply) {
+    let Some(mut connection) = slot.conn.take() else {
+        return;
+    };
+    let sent = connection.send_reply(reply);
+    if sent.is_ok() && connection.has_queued() {
+        // The reader is slow: the rest is written as the socket takes it
+        // (`flush_ipc`), not waited for here. The connection moves out of the
+        // slot but stays open, so the source is still deregistered before the fd closes.
+        state.pending_replies.push(PendingReply { connection, since: std::time::Instant::now() });
+    } else {
+        slot.conn = Some(connection);
+    }
+}
+
+/// A reply the socket has not taken completely yet.
+pub struct PendingReply {
+    connection: Connection,
+    since: std::time::Instant,
+}
+
+/// Writes what the sockets of slow `bspc` and `subscribe` readers did not take
+/// yet, drops a connection that has been stuck for [`bsp_ipc::server::REPLY_WRITE_TIMEOUT`]
+/// or died, and, while anything is still queued, arms a timer so this runs
+/// again soon (a queue no event ever touches would otherwise stay stuck).
+pub fn flush_ipc<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    state.subscribers.flush_all();
+    state.pending_replies.retain_mut(|p| {
+        matches!(p.connection.flush(), Ok(false)) && p.since.elapsed() < bsp_ipc::server::REPLY_WRITE_TIMEOUT
+    });
+    if (state.subscribers.has_queued() || !state.pending_replies.is_empty()) && !state.ipc_flush_armed {
+        state.ipc_flush_armed = true;
+        let armed = state.handle.insert_source(Timer::from_duration(std::time::Duration::from_millis(20)), |_, _, state| {
+            state.ipc_flush_armed = false;
+            TimeoutAction::Drop
+        });
+        if armed.is_err() {
+            state.ipc_flush_armed = false;
+        }
     }
 }
 

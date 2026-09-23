@@ -6,7 +6,7 @@
 #   cd packaging/arch && makepkg -si
 #
 pkgname=bspwm-rs-git
-pkgver=0.1.0.r20.gd493239
+pkgver=0.1.0.r21.g35fb493
 pkgrel=1
 pkgdesc='A Wayland compositor that behaves like bspwm (Rust, Smithay)'
 arch=(x86_64)
@@ -16,8 +16,8 @@ makedepends=(cargo git)
 optdepends=(
   'xorg-xwayland: run X11 applications'
   'waybar: the bar used by the default session config'
-  'rofi: launcher used by the default hotkeys'
-  'alacritty: terminal used by the default hotkeys'
+  'rofi: application launcher (bind it in your sxhkdrc)'
+  'alacritty: terminal (bind it in your sxhkdrc)'
   'swaybg: wallpaper'
   'kanshi: output profiles'
   'gammastep: night light'

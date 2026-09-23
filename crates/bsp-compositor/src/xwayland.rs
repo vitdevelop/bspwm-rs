@@ -55,6 +55,8 @@
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
+use crate::xworker::{Job, Reply, X11Extra, XWorker};
+
 use smithay::desktop::Window;
 use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -77,24 +79,54 @@ use crate::state::{Backend, State};
 pub struct XWaylandState {
     /// The claimed X display number (kept across restarts, so `DISPLAY`
     /// stays valid for programs started earlier).
-    display: Option<u32>,
+    pub(crate) display: Option<u32>,
     /// The current (possibly still dormant) `Xwayland` instance's registration
     /// with the event loop, which owns the instance itself.
     token: Option<RegistrationToken>,
     /// The window manager connected to it.
     xwm: Option<X11Wm>,
+    /// The size Xwayland emulates per window, as the X worker last reported it
+    /// (asked again when a window reconfigures); `shell::sync_one_window` reads it
+    /// on every sync.
+    emulated: std::collections::HashMap<u32, Option<(i32, i32)>>,
+    /// Windows whose emulated size is being asked for.
+    emulated_asked: std::collections::HashSet<u32>,
+    /// The thread that talks to the X server (`crate::xworker`), started with the
+    /// first job, and where its answers arrive.
+    worker: Option<XWorker>,
+    replies: Option<smithay::reexports::calloop::channel::Sender<Reply>>,
+    /// X11 windows waiting for their properties before they are managed, and
+    /// override-redirect ones waiting to have their struts applied.
+    pending: std::collections::HashMap<u32, Pending>,
+    /// Windows managed without their properties because the X worker was too slow;
+    /// a late answer only applies their struts.
+    timed_out: std::collections::HashSet<u32>,
     /// X11 windows shown but not managed (override-redirect, menus, …).
     unmanaged: Vec<Window>,
+    /// The desktop list last written on the root window (`publish_ewmh`).
+    published_desktops: Option<(Vec<String>, u32)>,
     /// `bspc config ignore_ewmh_struts`: do not reserve space for panels.
     ignore_struts: bool,
-    /// `bspc config ignore_ewmh_focus`: accepted for compatibility; Smithay's
-    /// X11 window manager does not pass `_NET_ACTIVE_WINDOW` requests on.
-    ignore_focus: bool,
+    /// `bspc config ignore_ewmh_focus`: activation requests (`xdg_activation_v1`;
+    /// Smithay's X11 window manager does not pass `_NET_ACTIVE_WINDOW` on) do
+    /// not move focus.
+    pub(crate) ignore_focus: bool,
     /// An X11 client owns the clipboard or primary selection; its window may
     /// be gone but the server must stay up to serve it.
     selection_owned: bool,
     /// The pending "no X11 windows left" check (`schedule_idle_stop`).
     idle_timer: Option<RegistrationToken>,
+}
+
+/// How long a new X11 window waits for its properties before it is managed without them.
+const MAP_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What the X worker's answer to [`Job::Extra`] completes.
+enum Pending {
+    /// A managed window that maps once its type and state are known.
+    Map(Box<X11Surface>),
+    /// An override-redirect window (already shown) whose struts are still unknown.
+    Struts,
 }
 
 /// How long `Xwayland` is kept after its last window went away before it is
@@ -109,9 +141,13 @@ const SHIM_NAME: &str = "Xwayland";
 /// Smithay's `XWayland::spawn` runs `Xwayland` from `PATH` immediately; with
 /// this directory first on that `PATH` it runs the shim instead, which waits
 /// for the first X11 client before executing the real server.
+///
+/// One directory per compositor process (`bspwm-rs-xwayland-shim-<pid>`): a
+/// second instance on another VT, possibly another build, must not repoint the
+/// first one's shim. Removed again by [`remove_shim_dir`].
 fn shim_dir() -> Option<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let dir = PathBuf::from(runtime).join("bspwm-rs-xwayland-shim");
+    let dir = PathBuf::from(runtime).join(format!("{SHIM_DIR_PREFIX}{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let link = dir.join(SHIM_NAME);
     let exe = std::env::current_exe().ok()?;
@@ -175,11 +211,10 @@ pub fn run_shim_if_invoked() {
     }
 
     // The real server: the first `Xwayland` on PATH that is not this shim.
-    let shim = shim_dir_path();
     let real = std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .filter(|dir| Some(dir) != shim.as_ref())
+        .filter(|dir| !is_shim_dir(dir))
         .map(|dir| dir.join(SHIM_NAME))
         .find(|candidate| candidate.is_file());
     let Some(real) = real else {
@@ -191,9 +226,21 @@ pub fn run_shim_if_invoked() {
     std::process::exit(126);
 }
 
-/// The shim directory's path without creating it (for the shim itself).
-fn shim_dir_path() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR").map(|r| PathBuf::from(r).join("bspwm-rs-xwayland-shim"))
+/// The start of every instance's shim directory name.
+const SHIM_DIR_PREFIX: &str = "bspwm-rs-xwayland-shim-";
+
+/// Whether `dir` is a shim directory (of any instance).
+fn is_shim_dir(dir: &std::path::Path) -> bool {
+    dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(SHIM_DIR_PREFIX) || n == "bspwm-rs-xwayland-shim")
+}
+
+/// Removes this process's shim directory; call on exit.
+pub fn remove_shim_dir() {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(runtime).join(format!("{SHIM_DIR_PREFIX}{}", std::process::id()));
+        let _ = std::fs::remove_file(dir.join(SHIM_NAME));
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
 
 /// Starts the lazy `Xwayland` machinery: claims a display, exports `DISPLAY`
@@ -201,7 +248,66 @@ fn shim_dir_path() -> Option<PathBuf> {
 /// `bspwmrc` runs (its children inherit `DISPLAY`). Logs and continues
 /// without X11 support on failure.
 pub fn init<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    use smithay::reexports::calloop::channel::{channel, Event};
+    // The X worker's answers come back through this channel.
+    let (tx, rx) = channel::<Reply>();
+    match state.handle.insert_source(rx, |event, _, state| {
+        if let Event::Msg(reply) = event {
+            handle_reply(state, reply);
+        }
+    }) {
+        Ok(_) => state.xwayland.replies = Some(tx),
+        Err(err) => tracing::warn!("cannot register the X worker channel: {err}"),
+    }
     let _ = spawn(state);
+}
+
+/// Sends `job` to the X worker (starting it on the first call). `false` if there
+/// is no X display or worker to send it to.
+fn submit<Bd: Backend + 'static>(state: &mut State<Bd>, job: Job) -> bool {
+    let Some(display) = state.xwayland.display else {
+        return false;
+    };
+    if state.xwayland.worker.is_none() {
+        let Some(replies) = state.xwayland.replies.clone() else {
+            return false;
+        };
+        state.xwayland.worker = crate::xworker::spawn(display, replies);
+    }
+    state.xwayland.worker.as_ref().is_some_and(|w| w.submit(job))
+}
+
+/// The X worker answered.
+fn handle_reply<Bd: Backend + 'static>(state: &mut State<Bd>, reply: Reply) {
+    match reply {
+        Reply::Extra(window, extra) => match state.xwayland.pending.remove(&window) {
+            Some(Pending::Map(surface)) => {
+                // Closed while we were asking: nothing to map.
+                if surface.alive() {
+                    finish_map(state, *surface, extra);
+                }
+            }
+            Some(Pending::Struts) => apply_struts(state, extra.struts),
+            None if state.xwayland.timed_out.remove(&window) => apply_struts(state, extra.struts),
+            None => {}
+        },
+        Reply::Clients(clients) => idle_check(state, clients),
+        Reply::Emulated(window, size) => {
+            state.xwayland.emulated_asked.remove(&window);
+            if state.xwayland.emulated.insert(window, size) != Some(size) {
+                // A fullscreen window may now have to be resized.
+                crate::shell::sync_wayland_from_core(state);
+            }
+        }
+    }
+}
+
+/// Kills the X11 client that owns `window`, as `XKillClient` does; the worker
+/// does it and logs a failure.
+///
+/// bspwm: `src/tree.c` `kill_node()` (`xcb_kill_client`).
+pub fn kill_client<Bd: Backend + 'static>(state: &mut State<Bd>, window: u32) -> bool {
+    submit(state, Job::Kill(window))
 }
 
 /// Spawns (another) dormant instance on the same display number. `false` if
@@ -308,6 +414,15 @@ fn restart<Bd: Backend + 'static>(state: &mut State<Bd>) {
     tracing::info!("Xwayland finished; the next X11 client starts it again");
     state.xwayland.xwm = None;
     state.xwayland.selection_owned = false;
+    // The worker's connection is to the instance that is going away (and would keep a
+    // dormant one from being started by anything but a client): drop it, a new worker
+    // starts with the next job.
+    state.xwayland.worker = None;
+    state.xwayland.pending.clear();
+    state.xwayland.timed_out.clear();
+    state.xwayland.published_desktops = None;
+    state.xwayland.emulated.clear();
+    state.xwayland.emulated_asked.clear();
     if let Some(token) = state.xwayland.idle_timer.take() {
         state.handle.remove(token);
     }
@@ -316,7 +431,13 @@ fn restart<Bd: Backend + 'static>(state: &mut State<Bd>) {
     }
     // Removing the source above dropped the `XWayland` handle, which
     // released the display's lock file and sockets.
-    let windows: Vec<Window> = state.space.elements().filter(|w| w.x11_surface().is_some()).cloned().collect();
+    // Every X11 window goes, shown or on a hidden desktop.
+    let mut windows: Vec<Window> = Vec::new();
+    for w in state.space.elements().chain(state.adapter.windows()) {
+        if w.x11_surface().is_some() && !windows.contains(w) {
+            windows.push(w.clone());
+        }
+    }
     for window in windows {
         forget_window(state, &window);
     }
@@ -344,8 +465,17 @@ fn forget_window<Bd: Backend + 'static>(state: &mut State<Bd>, window: &Window) 
     state.backend_data.queue_redraw();
 }
 
+/// The window of `surface`: shown (in the space) or managed on a desktop that
+/// is not shown (only in the adapter). Looking in the space alone missed the
+/// latter, so a window closed on a hidden desktop was never forgotten: it kept
+/// its node and stayed in taskbars and the screen-share window list.
 fn window_of<Bd: Backend + 'static>(state: &State<Bd>, surface: &X11Surface) -> Option<Window> {
-    state.space.elements().find(|w| w.x11_surface() == Some(surface)).cloned()
+    state
+        .space
+        .elements()
+        .chain(state.adapter.windows())
+        .find(|w| w.x11_surface() == Some(surface))
+        .cloned()
 }
 
 /// Whether a window should be left to place itself: menus, tooltips,
@@ -359,42 +489,19 @@ fn is_unmanaged(window: &X11Surface) -> bool {
         )
 }
 
-/// What Smithay's `X11Surface` does not tell us about a window, read over a
-/// short-lived second connection to the X display.
-#[derive(Default)]
-struct X11Extra {
-    /// `_NET_WM_STRUT_PARTIAL`.
-    struts: Option<bsp_core::wm::EwmhStruts>,
-    /// `_NET_WM_WINDOW_TYPE` includes `_NET_WM_WINDOW_TYPE_DOCK`.
-    dock: bool,
-    /// `_NET_WM_WINDOW_TYPE` includes `_NET_WM_WINDOW_TYPE_DESKTOP`.
-    desktop: bool,
-}
-
-/// Reads [`X11Extra`] of X11 window `window` from display `display`
-/// (all-default if the server does not answer).
-fn read_extra(display: u32, window: u32) -> X11Extra {
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
-    fn read(display: u32, window: u32) -> Option<X11Extra> {
-        let (conn, _) = x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}"))).ok()?;
-        let atom = |name: &[u8]| conn.intern_atom(true, name).ok()?.reply().ok().map(|r| r.atom).filter(|a| *a != 0);
-        let mut extra = X11Extra::default();
-        if let Some(strut) = atom(b"_NET_WM_STRUT_PARTIAL") {
-            if let Ok(reply) = conn.get_property(false, window, strut, AtomEnum::CARDINAL, 0, 12).ok()?.reply() {
-                let values: Vec<u32> = reply.value32().map(|v| v.collect()).unwrap_or_default();
-                extra.struts = bsp_core::wm::EwmhStruts::from_cardinals(&values);
-            }
-        }
-        if let Some(kind) = atom(b"_NET_WM_WINDOW_TYPE") {
-            if let Ok(reply) = conn.get_property(false, window, kind, AtomEnum::ATOM, 0, 32).ok()?.reply() {
-                let types: Vec<u32> = reply.value32().map(|v| v.collect()).unwrap_or_default();
-                extra.dock = atom(b"_NET_WM_WINDOW_TYPE_DOCK").is_some_and(|a| types.contains(&a));
-                extra.desktop = atom(b"_NET_WM_WINDOW_TYPE_DESKTOP").is_some_and(|a| types.contains(&a));
-            }
-        }
-        Some(extra)
+/// Manages (or shows, if it is a menu or the like) an X11 window whose
+/// properties `extra` are now known.
+fn finish_map<Bd: Backend + 'static>(state: &mut State<Bd>, window: X11Surface, extra: X11Extra) {
+    let element = Window::new_x11_window(window.clone());
+    apply_struts(state, extra.struts);
+    if is_unmanaged(&window) {
+        let geometry = window.geometry();
+        state.space.map_element(element.clone(), geometry.loc, true);
+        state.xwayland.unmanaged.push(element);
+    } else {
+        crate::shell::map_new_window(state, element, window.class(), window.instance(), window.title(), type_defaults(&window, &extra));
     }
-    read(display, window).unwrap_or_default()
+    state.backend_data.queue_redraw();
 }
 
 /// What an X11 window's `_NET_WM_WINDOW_TYPE` asks for, before any rule.
@@ -402,12 +509,9 @@ fn read_extra(display: u32, window: u32) -> X11Extra {
 /// bspwm: `src/rule.c` `apply_rules()`: toolbar and utility windows are not
 /// focused, dialogs float centred, docks/desktops/notifications are not managed.
 fn type_defaults(window: &X11Surface, extra: &X11Extra) -> bsp_core::rules::RuleConsequence {
-    use bsp_core::node::ClientState;
+    use bsp_core::node::{ClientState, Layer};
     let mut consequence = bsp_core::rules::RuleConsequence::default();
-    // A game that maps already fullscreen (`_NET_WM_STATE_FULLSCREEN` in its initial state).
-    if window.is_fullscreen() {
-        consequence.state = Some(ClientState::Fullscreen);
-    }
+    // Window type first (bspwm: `_apply_window_type()`).
     if extra.dock || extra.desktop {
         consequence.manage = Some(false);
         return consequence;
@@ -416,12 +520,35 @@ fn type_defaults(window: &X11Surface, extra: &X11Extra) -> bsp_core::rules::Rule
         Some(WmWindowType::Toolbar | WmWindowType::Utility) => consequence.focus = Some(false),
         Some(WmWindowType::Dialog) => {
             consequence.state = Some(ClientState::Floating);
-            consequence.center = true;
+            consequence.center = Some(true);
         }
         Some(WmWindowType::Notification) => consequence.manage = Some(false),
         _ => {}
     }
+    // Then `_NET_WM_STATE` (`_apply_window_state()`): a game that maps already
+    // fullscreen, or asks to be above/below/sticky.
+    if window.is_fullscreen() {
+        consequence.state = Some(ClientState::Fullscreen);
+    }
+    if extra.below {
+        consequence.layer = Some(Layer::Below);
+    } else if extra.above {
+        consequence.layer = Some(Layer::Above);
+    }
+    if extra.sticky {
+        consequence.sticky = Some(true);
+    }
+    // A transient window floats (`_apply_transient()`), and so does one that
+    // cannot be resized (`_apply_hints()`: minimum size equals maximum size).
+    if window.is_transient_for().is_some() || fixed_size(window.min_size(), window.max_size()) {
+        consequence.state = Some(ClientState::Floating);
+    }
     consequence
+}
+
+/// Whether a window's minimum and maximum size are the same, non-empty size.
+pub(crate) fn fixed_size(min: Option<smithay::utils::Size<i32, Logical>>, max: Option<smithay::utils::Size<i32, Logical>>) -> bool {
+    matches!((min, max), (Some(min), Some(max)) if min == max && min.w > 0 && min.h > 0)
 }
 
 /// Shows an X11 `window` where it asked to be, outside the tree (a rule said
@@ -467,26 +594,121 @@ fn apply_struts<Bd: Backend + 'static>(state: &mut State<Bd>, struts: Option<bsp
     }
 }
 
-/// Whether any X11 window is still shown.
-fn has_x11_windows<Bd: Backend + 'static>(state: &State<Bd>) -> bool {
-    state.space.elements().any(|w| w.x11_surface().is_some())
+/// What was last written on a managed X11 window: its `_NET_WM_STATE` and
+/// `_NET_WM_DESKTOP`.
+struct PublishedEwmh(std::cell::Cell<Option<(crate::xworker::NetState, u32)>>);
+
+/// Keeps the EWMH properties X11 clients read in step with the tree: every
+/// managed window's `_NET_WM_STATE` (fullscreen, sticky, hidden, above, below,
+/// demands attention, focused) and `_NET_WM_DESKTOP`, and the root window's
+/// desktop list. Only what changed is written, by the X worker. Nothing while
+/// Xwayland is not running (writing would start it).
+///
+/// bspwm: `src/ewmh.c` `ewmh_wm_state_update()`, `ewmh_set_wm_desktop()`,
+/// `ewmh_update_number_of_desktops()`, `ewmh_update_desktop_names()`,
+/// `ewmh_update_current_desktop()`.
+pub(crate) fn publish_ewmh<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    use crate::xworker::NetState;
+    if state.xwayland.xwm.is_none() {
+        return;
+    }
+    // Desktops are numbered across every monitor, in order (bspwm's EWMH index).
+    let mut names = Vec::new();
+    let mut current = 0u32;
+    let mut per_window: std::collections::HashMap<bsp_core::id::WindowId, (NetState, u32)> = std::collections::HashMap::new();
+    let focused_window = state.wm.focused_monitor.and_then(|mi| {
+        let m = &state.wm.monitors[mi];
+        let t = &m.desktops[m.focused?].tree;
+        t.node(t.focus?).client.as_ref().map(|c| c.window)
+    });
+    for (mi, m) in state.wm.monitors.iter().enumerate() {
+        for (di, d) in m.desktops.iter().enumerate() {
+            let index = names.len() as u32;
+            names.push(d.name.clone());
+            if state.wm.focused_monitor == Some(mi) && m.focused == Some(di) {
+                current = index;
+            }
+            for n in d.tree.node_ids() {
+                let node = d.tree.node(n);
+                let Some(c) = node.client.as_ref() else { continue };
+                let net = NetState {
+                    fullscreen: c.state == bsp_core::node::ClientState::Fullscreen,
+                    sticky: node.sticky,
+                    hidden: node.hidden,
+                    above: c.layer == bsp_core::node::Layer::Above,
+                    below: c.layer == bsp_core::node::Layer::Below,
+                    demands_attention: c.urgent,
+                    focused: focused_window == Some(c.window),
+                };
+                per_window.insert(c.window, (net, index));
+            }
+        }
+    }
+    if state.xwayland.published_desktops.as_ref() != Some(&(names.clone(), current)) {
+        state.xwayland.published_desktops = Some((names.clone(), current));
+        submit(state, Job::SetDesktops { names, current });
+    }
+    let windows: Vec<(bsp_core::id::WindowId, Window)> = state
+        .adapter
+        .windows()
+        .filter(|w| w.x11_surface().is_some_and(|x| !x.is_override_redirect()))
+        .filter_map(|w| state.adapter.id_of(w).map(|id| (id, w.clone())))
+        .collect();
+    for (id, window) in windows {
+        let (Some(x11), Some(&wanted)) = (window.x11_surface(), per_window.get(&id)) else { continue };
+        let published = window.user_data().get_or_insert(|| PublishedEwmh(std::cell::Cell::new(None)));
+        let last = published.0.get();
+        if last == Some(wanted) {
+            continue;
+        }
+        published.0.set(Some(wanted));
+        let xid = x11.window_id();
+        if last.map(|l| l.0) != Some(wanted.0) {
+            submit(state, Job::SetNetState(xid, wanted.0));
+        }
+        if last.map(|l| l.1) != Some(wanted.1) {
+            submit(state, Job::SetWmDesktop(xid, wanted.1));
+        }
+    }
 }
 
-/// How many X11 clients other than this compositor are connected to display
-/// `display`, counted with the X Resource extension by client process id
-/// (`None` if the server does not answer, or does not have the extension).
-///
-/// A client can hold an X connection without ever mapping a window: Firefox
-/// opens one for WebRTC screen capture. Stopping Xwayland under such a client
-/// kills it with an XIO error.
-fn foreign_x_clients(display: u32) -> Option<usize> {
-    use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt};
-    let (conn, _) = x11rb::rust_connection::RustConnection::connect(Some(&format!(":{display}"))).ok()?;
-    let spec = ClientIdSpec { client: 0, mask: ClientIdMask::LOCAL_CLIENT_PID };
-    let reply = conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
-    let own = std::process::id();
-    // A client whose pid is unknown (not reported) counts as foreign.
-    Some(reply.ids.iter().filter(|id| id.value.first().copied() != Some(own)).count())
+/// Forgets managed X11 windows whose X window is gone although no destroy or
+/// unmap reached us, so none lingers in the tree, taskbars or the screen-share
+/// window list. A safety net; run with the periodic syncs.
+pub(crate) fn reap_dead<Bd: Backend + 'static>(state: &mut State<Bd>) {
+    let dead: Vec<Window> = state
+        .adapter
+        .windows()
+        .filter(|w| w.x11_surface().is_some_and(|x| !x.alive()))
+        .cloned()
+        .collect();
+    for window in dead {
+        tracing::info!("forgetting an X11 window that is gone");
+        forget_window(state, &window);
+    }
+}
+
+/// Whether any X11 window is still shown or managed (on a hidden desktop too).
+fn has_x11_windows<Bd: Backend + 'static>(state: &State<Bd>) -> bool {
+    state.space.elements().chain(state.adapter.windows()).any(|w| w.x11_surface().is_some())
+}
+
+
+/// Decides, once the X worker has counted the clients still connected, whether
+/// the idle `Xwayland` stops (`clients`: `None` if it could not tell).
+fn idle_check<Bd: Backend + 'static>(state: &mut State<Bd>, clients: Option<usize>) {
+    // Things may have changed while the X worker was answering.
+    if state.xwayland.xwm.is_some() && !has_x11_windows(state) && !state.xwayland.selection_owned {
+        // Unknown (the X worker could not tell) counts as connected: stopping
+        // Xwayland kills every X11 client, which is not a guess to make.
+        if clients.is_none_or(|n| n > 0) {
+            tracing::debug!(clients, "X11 clients without windows are connected (or unknown); keeping Xwayland");
+            schedule_idle_stop(state);
+        } else {
+            tracing::info!("no X11 windows or clients left; stopping Xwayland");
+            restart(state);
+        }
+    }
 }
 
 /// Arms the lazy stop: if, [`IDLE_STOP_AFTER`] from now, no X11 window is shown,
@@ -512,15 +734,10 @@ fn schedule_idle_stop<Bd: Backend + 'static>(state: &mut State<Bd>) {
                 running = state.xwayland.xwm.is_some(),
                 "Xwayland idle check"
             );
-            let clients = state.xwayland.display.and_then(foreign_x_clients);
-            if state.xwayland.xwm.is_some() && !has_x11_windows(state) && !state.xwayland.selection_owned {
-                if clients.is_some_and(|n| n > 0) {
-                    tracing::debug!(clients, "X11 clients without windows are connected; keeping Xwayland");
-                    schedule_idle_stop(state);
-                } else {
-                    tracing::info!("no X11 windows or clients left; stopping Xwayland");
-                    restart(state);
-                }
+            // Only if nothing shows a window or owns a selection is it worth asking who
+            // is still connected; the answer arrives as a message (`idle_check`).
+            if state.xwayland.xwm.is_some() && !has_x11_windows(state) && !state.xwayland.selection_owned && !submit(state, Job::Clients) {
+                idle_check(state, None);
             }
             TimeoutAction::Drop
         })
@@ -560,8 +777,12 @@ impl<Bd: Backend + 'static> XWaylandShellHandler for State<Bd> {
     /// and associated it — after the map request. Keyboard focus that was
     /// meant for the window (`focus_node` at map time found no surface yet)
     /// is completed here.
-    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, _surface: X11Surface) {
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, _surface: X11Surface) {
         crate::input::sync_keyboard_focus(self);
+        // An X11 window shown again (its desktop switched to) has no buffer until
+        // its next commit, so nothing is under the pointer yet: look again then,
+        // or the first click would need a motion first.
+        crate::shell::recheck_pointer_on_commit(&wl_surface);
         self.backend_data.queue_redraw();
     }
 }
@@ -585,29 +806,47 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
             tracing::warn!("cannot map an X11 window: {err}");
             return;
         }
-        let element = Window::new_x11_window(window.clone());
-        let extra = self.xwayland.display.map(|display| read_extra(display, window.window_id())).unwrap_or_default();
-        apply_struts(self, extra.struts);
-        if is_unmanaged(&window) {
-            let geometry = window.geometry();
-            self.space.map_element(element.clone(), geometry.loc, true);
-            self.xwayland.unmanaged.push(element);
-        } else {
-            crate::shell::map_new_window(self, element, window.class(), window.instance(), window.title(), type_defaults(&window, &extra));
+        // Its type, state and struts come from the X server without waiting for
+        // it here; the window is managed when they arrive (`finish_map`).
+        let id = window.window_id();
+        self.xwayland.pending.insert(id, Pending::Map(Box::new(window.clone())));
+        if !submit(self, Job::Extra(id)) {
+            self.xwayland.pending.remove(&id);
+            finish_map(self, window, X11Extra::default());
+            return;
         }
-        self.backend_data.queue_redraw();
+        // If the X server does not answer in time (stalled, connection broken), the
+        // window is managed without its properties instead of staying invisible,
+        // and the worker, which may be stuck, is replaced.
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let _ = self.handle.insert_source(Timer::from_duration(MAP_ANSWER_TIMEOUT), move |_, _, state| {
+            if let Some(Pending::Map(surface)) = state.xwayland.pending.remove(&id) {
+                tracing::warn!(window = id, "the X server did not answer in time; managing the window without its properties");
+                state.xwayland.worker = None;
+                state.xwayland.timed_out.insert(id);
+                finish_map(state, *surface, X11Extra::default());
+            }
+            TimeoutAction::Drop
+        });
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        let struts = self.xwayland.display.and_then(|display| read_extra(display, window.window_id()).struts);
-        apply_struts(self, struts);
+        // Shown at once; a strut it may carry is applied when the answer arrives.
+        let id = window.window_id();
         let element = Window::new_x11_window(window.clone());
         self.space.map_element(element.clone(), window.geometry().loc, true);
         self.xwayland.unmanaged.push(element);
         self.backend_data.queue_redraw();
+        self.xwayland.pending.insert(id, Pending::Struts);
+        if !submit(self, Job::Extra(id)) {
+            self.xwayland.pending.remove(&id);
+        }
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.xwayland.emulated.remove(&window.window_id());
+        self.xwayland.timed_out.remove(&window.window_id());
+        self.xwayland.pending.remove(&window.window_id());
         if let Some(element) = window_of(self, &window) {
             forget_window(self, &element);
         }
@@ -615,6 +854,9 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.xwayland.emulated.remove(&window.window_id());
+        self.xwayland.timed_out.remove(&window.window_id());
+        self.xwayland.pending.remove(&window.window_id());
         if let Some(element) = window_of(self, &window) {
             forget_window(self, &element);
         }
@@ -636,11 +878,25 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
         let managed = window_of(self, &window).and_then(|el| self.adapter.id_of(&el));
         let rect = match managed.and_then(|id| crate::input::locate_window(self, id)) {
             Some((mi, di, node)) => self.wm.monitors[mi].desktops[di].tree.node(node).client.as_ref().map(|c| {
-                let r = if c.state.is_tiled() { c.tiled_rectangle } else { c.floating_rectangle };
+                let r = c.shown_rectangle();
                 Rectangle::<i32, Logical>::new((r.x, r.y).into(), (r.width.max(1), r.height.max(1)).into())
             }),
             None => None,
         };
+        tracing::debug!(class = window.class(), ?x, ?y, ?w, ?h, fullscreen = window.is_fullscreen(), managed_rect = ?rect, "X11 configure request");
+        // A fullscreen game that changed the video mode keeps its emulated size.
+        let emulated = if window.is_fullscreen() {
+            // A reconfigure may follow a mode change: answer with what is known and
+            // ask again; a different answer re-syncs the window.
+            self.request_emulated_size(window.window_id());
+            self.emulated_size_cached(window.window_id())
+        } else {
+            None
+        };
+        let rect = rect.map(|r| match emulated {
+            Some((w, h)) if w <= r.size.w && h <= r.size.h => Rectangle::new(r.loc, (w, h).into()),
+            _ => r,
+        });
         let geometry = rect.unwrap_or_else(|| {
             let current = window.geometry();
             Rectangle::new(
@@ -669,15 +925,51 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
                 self.adapter.set_class(id, &window.class(), &window.instance());
             }
         }
+        // bspwm: `property_notify()` on `WM_HINTS`: the urgency hint makes the
+        // node urgent (unless it is the focused one, which `set_urgent` checks).
+        if matches!(property, WmWindowProperty::Hints) && window.hints().is_some_and(|h| h.urgent) {
+            if let Some((mi, di, node)) = window_of(self, &window)
+                .and_then(|el| self.adapter.id_of(&el))
+                .and_then(|id| crate::input::locate_window(self, id))
+            {
+                let trg = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
+                crate::ipc::with_ops(self, |ctx, events| bsp_ipc::exec::set_urgent(ctx, trg, true, events));
+            }
+        }
+        // bspwm: `property_notify()` re-reads `WM_NORMAL_HINTS`.
+        if matches!(property, WmWindowProperty::NormalHints) {
+            if let Some(el) = window_of(self, &window) {
+                if crate::shell::refresh_size_hints(self, &el) {
+                    self.request_sync();
+                }
+            }
+        }
         // Title changes reach taskbars through `crate::taskbar::sync`'s diffing.
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // `ignore_ewmh_fullscreen enter`.
+        if self.wm.settings.ignore_ewmh_fullscreen.enter {
+            return;
+        }
         self.x11_state_request(&window, "fullscreen");
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.x11_state_request(&window, "tiled");
+        // `ignore_ewmh_fullscreen exit`.
+        if self.wm.settings.ignore_ewmh_fullscreen.exit {
+            return;
+        }
+        // bspwm: `_NET_WM_STATE` remove goes back to `last_state`, and only if
+        // the window is fullscreen at all (a floating window stays floating).
+        let fullscreen = window_of(self, &window)
+            .and_then(|el| self.adapter.id_of(&el))
+            .and_then(|id| crate::input::locate_window(self, id))
+            .and_then(|(mi, di, node)| self.wm.monitors[mi].desktops[di].tree.node(node).client.as_ref().map(|c| c.state))
+            == Some(bsp_core::node::ClientState::Fullscreen);
+        if fullscreen {
+            self.x11_state_request(&window, "~fullscreen");
+        }
     }
 
     fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _edge: ResizeEdge) {}
@@ -730,6 +1022,23 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
 }
 
 impl<Bd: Backend + 'static> State<Bd> {
+    /// The size Xwayland emulates for X11 window `window`, as last reported by the
+    /// X worker (`None` until it has answered, or if the window has none). Asks
+    /// for it the first time; the answer re-syncs the windows.
+    pub fn emulated_size_cached(&mut self, window: u32) -> Option<(i32, i32)> {
+        if !self.xwayland.emulated.contains_key(&window) {
+            self.request_emulated_size(window);
+        }
+        self.xwayland.emulated.get(&window).copied().flatten()
+    }
+
+    /// Asks the X worker for window `window`'s emulated size, unless it is already asked.
+    fn request_emulated_size(&mut self, window: u32) {
+        if self.xwayland.emulated_asked.insert(window) && !submit(self, Job::Emulated(window)) {
+            self.xwayland.emulated_asked.remove(&window);
+        }
+    }
+
     /// Runs `bspc node ID -t STATE` for a managed X11 window's request.
     fn x11_state_request(&mut self, window: &X11Surface, node_state: &str) {
         tracing::debug!(class = window.class(), node_state, "X11 window state request");

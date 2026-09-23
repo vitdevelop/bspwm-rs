@@ -7,7 +7,7 @@
 //! against both spellings (`-f`/`--focus`) exactly as bspwm's `streq()`
 //! chains do.
 
-use crate::selector::{DesktopSelector, MonitorSelector, NodeSelector};
+use crate::selector::{DesktopModifiers, DesktopSelector, MonitorModifiers, MonitorSelector, NodeModifiers, NodeSelector};
 use crate::value::{parse_bool, parse_degree, parse_index, AlterState, CycleDir, ResizeHandle};
 use bsp_core::node::{ClientState, Layer};
 use bsp_core::rules::RuleConsequence;
@@ -246,17 +246,17 @@ pub enum NodeFlagKey {
     Marked,
 }
 
-fn parse_node_selector_arg(s: &str) -> Result<NodeSelector, ParseError> {
+pub(crate) fn parse_node_selector_arg(s: &str) -> Result<NodeSelector, ParseError> {
     NodeSelector::parse(s)
         .ok_or_else(|| ParseError::new("", format!("Invalid descriptor found in '{s}'.\n")))
 }
 
-fn parse_desktop_selector_arg(s: &str) -> Result<DesktopSelector, ParseError> {
+pub(crate) fn parse_desktop_selector_arg(s: &str) -> Result<DesktopSelector, ParseError> {
     DesktopSelector::parse(s)
         .ok_or_else(|| ParseError::new("", format!("Invalid descriptor found in '{s}'.\n")))
 }
 
-fn parse_monitor_selector_arg(s: &str) -> Result<MonitorSelector, ParseError> {
+pub(crate) fn parse_monitor_selector_arg(s: &str) -> Result<MonitorSelector, ParseError> {
     MonitorSelector::parse(s)
         .ok_or_else(|| ParseError::new("", format!("Invalid descriptor found in '{s}'.\n")))
 }
@@ -829,6 +829,14 @@ pub enum OutputAction {
     SetPosition(i32, i32),
     /// `-t`, `--transform NAME`: rotation and/or flip.
     SetTransform(OutputTransform),
+    /// `-c`, `--create-headless [WIDTHxHEIGHT@HZ]`: add a virtual output with
+    /// no display behind it (default `1920x1080@60`), named `HEADLESS-N`. Takes
+    /// no output name. Something to capture or stream (`wayvnc`, a screen
+    /// recorder) and to put windows on.
+    CreateHeadless(Option<OutputMode>),
+    /// `-r`, `--remove`: remove a virtual output; its windows move to another
+    /// monitor. A real output cannot be removed.
+    Remove,
 }
 
 /// An output's rotation (counter-clockwise, as in Wayland's `wl_output`) and
@@ -969,13 +977,27 @@ pub fn parse_output(args: &[String]) -> Result<Command, ParseError> {
                     .ok_or_else(|| ParseError::invalid_argument("output", flag, &raw))?;
                 OutputAction::SetTransform(transform)
             }
+            "-c" | "--create-headless" => {
+                // The mode is optional: it is there if the next word is not a flag.
+                let mode = match args.get(i) {
+                    Some(raw) if !raw.starts_with('-') => {
+                        i += 1;
+                        Some(parse_output_mode(raw).ok_or_else(|| ParseError::invalid_argument("output", flag, raw))?)
+                    }
+                    _ => None,
+                };
+                OutputAction::CreateHeadless(mode)
+            }
+            "-r" | "--remove" => OutputAction::Remove,
             other => return Err(ParseError::unknown_command("output", other)),
         };
         actions.push(action);
     }
 
-    if name.is_none() && !actions.is_empty() {
-        // No output named: `-m`/`-s`/`-p` would apply to nothing.
+    // No output named: `-m`/`-s`/`-p` would apply to nothing. Only creating a
+    // virtual output needs no name (it is given one).
+    let nameless_ok = actions.iter().all(|a| matches!(a, OutputAction::CreateHeadless(_)));
+    if name.is_none() && !actions.is_empty() && !nameless_ok {
         return Err(ParseError::missing_arguments("output"));
     }
 
@@ -1077,18 +1099,43 @@ pub enum QueryDomain {
 }
 
 /// A parsed `bspc query` request.
+///
+/// bspwm: `src/messages.c` `cmd_query()`. `-M/-D/-N SEL` set the reference
+/// the `-m/-d/-n` modifiers are relative to; `-m/-d/-n SEL` narrow the listing
+/// to that monitor, desktop or node (`trg`), and `-m/-d/-n .MODIFIERS` filter
+/// it (descriptor-free constraints).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryCommand {
     /// Which domain to list/dump.
     pub domain: QueryDomain,
-    /// `-m`/`--monitor`'s constraint, if given.
-    pub monitor: Option<MonitorSelector>,
-    /// `-d`/`--desktop`'s constraint, if given.
-    pub desktop: Option<DesktopSelector>,
-    /// `-n`/`--node`'s constraint, if given.
-    pub node: Option<NodeSelector>,
+    /// `-M SEL`: the monitor reference (bspwm `monitor_ref`).
+    pub monitor_ref: Option<MonitorSelector>,
+    /// `-D SEL`: the desktop reference (`desktop_ref`).
+    pub desktop_ref: Option<DesktopSelector>,
+    /// `-N SEL`: the node reference (`node_ref`).
+    pub node_ref: Option<NodeSelector>,
+    /// `-m`/`-d`/`-n` with a selector or none (the reference), in order.
+    pub targets: Vec<QueryTarget>,
+    /// `-m .MODIFIERS`.
+    pub monitor_filter: Option<MonitorModifiers>,
+    /// `-d .MODIFIERS`.
+    pub desktop_filter: Option<DesktopModifiers>,
+    /// `-n .MODIFIERS`.
+    pub node_filter: Option<NodeModifiers>,
     /// `--names`: print names instead of ids (`-M`/`-D` only).
     pub names: bool,
+}
+
+/// One `-m`/`-d`/`-n` target of `bspc query`; `None` is the flag given alone,
+/// which means the reference (the focused one unless `-M/-D/-N SEL` said).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryTarget {
+    /// `-m [MONITOR_SEL]`.
+    Monitor(Option<MonitorSelector>),
+    /// `-d [DESKTOP_SEL]`.
+    Desktop(Option<DesktopSelector>),
+    /// `-n [NODE_SEL]`.
+    Node(Option<NodeSelector>),
 }
 
 /// Parses `query COMMANDS [OPTIONS]`.
@@ -1100,15 +1147,18 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
     }
     let mut domain = None;
     let mut domain_count = 0;
-    let mut monitor = None;
-    let mut desktop = None;
-    let mut node = None;
+    let (mut monitor_ref, mut desktop_ref, mut node_ref) = (None, None, None);
+    let mut targets = Vec::new();
+    let (mut monitor_filter, mut desktop_filter, mut node_filter) = (None, None, None);
     let mut names = false;
+    // A modifier list alone (`.window`): parsed as `any.window`, keeping the modifiers.
+    let bad_modifiers = |flag: &str, arg: &str| ParseError::new("query", format!("query {flag}: Invalid modifiers found in '{arg}'.\n"));
 
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
         i += 1;
+        let next_is_filter = args.get(i).is_some_and(|a| a.starts_with('.'));
         match flag {
             "-T" | "--tree" => {
                 domain = Some(QueryDomain::Tree);
@@ -1117,29 +1167,36 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
             "-M" | "--monitors" => {
                 domain = Some(QueryDomain::Monitors);
                 domain_count += 1;
-                monitor = take_optional_selector(args, &mut i, parse_monitor_selector_arg)?;
+                monitor_ref = take_optional_selector(args, &mut i, parse_monitor_selector_arg)?.or(monitor_ref);
             }
             "-D" | "--desktops" => {
                 domain = Some(QueryDomain::Desktops);
                 domain_count += 1;
-                desktop = take_optional_selector(args, &mut i, parse_desktop_selector_arg)?;
+                desktop_ref = take_optional_selector(args, &mut i, parse_desktop_selector_arg)?.or(desktop_ref);
             }
             "-N" | "--nodes" => {
                 domain = Some(QueryDomain::Nodes);
                 domain_count += 1;
-                node = take_optional_selector(args, &mut i, parse_node_selector_arg)?;
+                node_ref = take_optional_selector(args, &mut i, parse_node_selector_arg)?.or(node_ref);
             }
-            "-m" | "--monitor" => {
-                monitor =
-                    take_optional_selector(args, &mut i, parse_monitor_selector_arg)?.or(monitor);
+            "-m" | "--monitor" if next_is_filter => {
+                let arg = &args[i];
+                i += 1;
+                monitor_filter = Some(parse_monitor_selector_arg(&format!("any{arg}")).map_err(|_| bad_modifiers("-m", arg))?.modifiers);
             }
-            "-d" | "--desktop" => {
-                desktop =
-                    take_optional_selector(args, &mut i, parse_desktop_selector_arg)?.or(desktop);
+            "-d" | "--desktop" if next_is_filter => {
+                let arg = &args[i];
+                i += 1;
+                desktop_filter = Some(parse_desktop_selector_arg(&format!("any{arg}")).map_err(|_| bad_modifiers("-d", arg))?.modifiers);
             }
-            "-n" | "--node" => {
-                node = take_optional_selector(args, &mut i, parse_node_selector_arg)?.or(node);
+            "-n" | "--node" if next_is_filter => {
+                let arg = &args[i];
+                i += 1;
+                node_filter = Some(parse_node_selector_arg(&format!("any{arg}")).map_err(|_| bad_modifiers("-n", arg))?.modifiers);
             }
+            "-m" | "--monitor" => targets.push(QueryTarget::Monitor(take_optional_selector(args, &mut i, parse_monitor_selector_arg)?)),
+            "-d" | "--desktop" => targets.push(QueryTarget::Desktop(take_optional_selector(args, &mut i, parse_desktop_selector_arg)?)),
+            "-n" | "--node" => targets.push(QueryTarget::Node(take_optional_selector(args, &mut i, parse_node_selector_arg)?)),
             "--names" => names = true,
             other => {
                 return Err(ParseError::new(
@@ -1150,9 +1207,9 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
         }
     }
 
-    let domain = match domain_count {
-        0 => return Err(ParseError::new("query", "query: No commands given.\n")),
-        1 => domain.unwrap(),
+    let domain = match (domain_count, domain) {
+        (0, _) => return Err(ParseError::new("query", "query: No commands given.\n")),
+        (1, Some(domain)) => domain,
         _ => {
             return Err(ParseError::new(
                 "query",
@@ -1171,8 +1228,9 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
             format!("query -{c}: --names only applies to -M and -D.\n"),
         ));
     }
-    if (domain == QueryDomain::Monitors && (desktop.is_some() || node.is_some()))
-        || (domain == QueryDomain::Desktops && node.is_some())
+    // bspwm: only the descriptor-free constraints (`-d .occupied`) are refused here.
+    if (domain == QueryDomain::Monitors && (desktop_filter.is_some() || node_filter.is_some()))
+        || (domain == QueryDomain::Desktops && node_filter.is_some())
     {
         let c = if domain == QueryDomain::Monitors {
             'M'
@@ -1187,9 +1245,13 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
 
     Ok(Command::Query(QueryCommand {
         domain,
-        monitor,
-        desktop,
-        node,
+        monitor_ref,
+        desktop_ref,
+        node_ref,
+        targets,
+        monitor_filter,
+        desktop_filter,
+        node_filter,
         names,
     }))
 }
@@ -1197,6 +1259,9 @@ pub fn parse_query(args: &[String]) -> Result<Command, ParseError> {
 // ---- rule --------------------------------------------------------------
 
 /// One `bspc rule` command.
+// `Add` carries a whole rule; the other variants are a few words. Rules are parsed
+// once per `bspc rule` command, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleAction {
     /// `-a`, `--add`.
@@ -1372,6 +1437,21 @@ fn split_rule_cause(s: &str) -> (String, String, String) {
     (class, instance, name)
 }
 
+/// Parses the `key=value` effects a rule command prints (what
+/// `external_rules_command` writes to its standard output), separated by any
+/// whitespace. A token that is not understood is skipped, as bspwm's
+/// `parse_key_value()` does.
+///
+/// bspwm: `src/rule.c` `parse_rule_consequence()`.
+pub fn parse_rule_effects(text: &str) -> RuleConsequence {
+    let mut consequence = RuleConsequence::default();
+    let mut target = RuleTarget::default();
+    for token in text.split_whitespace() {
+        let _ = apply_rule_effect_token(token, &mut consequence, &mut target);
+    }
+    consequence
+}
+
 fn apply_rule_effect_token(
     tok: &str,
     consequence: &mut RuleConsequence,
@@ -1390,10 +1470,23 @@ fn apply_rule_effect_token(
         )
     };
     match key {
-        "monitor" => target.monitor = Some(parse_monitor_selector_arg(value).map_err(|_| bad())?),
-        "desktop" => target.desktop = Some(parse_desktop_selector_arg(value).map_err(|_| bad())?),
-        "node" => target.node = Some(parse_node_selector_arg(value).map_err(|_| bad())?),
-        "rectangle" => target.rectangle = Some(parse_rectangle(value).ok_or_else(bad)?),
+        "monitor" => {
+            target.monitor = Some(parse_monitor_selector_arg(value).map_err(|_| bad())?);
+            consequence.monitor_desc = Some(value.to_string());
+        }
+        "desktop" => {
+            target.desktop = Some(parse_desktop_selector_arg(value).map_err(|_| bad())?);
+            consequence.desktop_desc = Some(value.to_string());
+        }
+        "node" => {
+            target.node = Some(parse_node_selector_arg(value).map_err(|_| bad())?);
+            consequence.node_desc = Some(value.to_string());
+        }
+        "rectangle" => {
+            let rect = parse_rectangle(value).ok_or_else(bad)?;
+            target.rectangle = Some(rect);
+            consequence.rect = Some(rect);
+        }
         "state" => consequence.state = Some(parse_client_state(value).ok_or_else(bad)?),
         "layer" => consequence.layer = Some(parse_layer(value).ok_or_else(bad)?),
         "split_dir" => {
@@ -1417,15 +1510,21 @@ fn apply_rule_effect_token(
                     Some(false) => HonorSizeHints::No,
                     None => return Err(bad()),
                 },
-            })
+            });
+            consequence.honor_size_hints = target.honor_size_hints.map(|h| match h {
+                HonorSizeHints::Yes => bsp_core::settings::HonorSizeHints::Yes,
+                HonorSizeHints::No => bsp_core::settings::HonorSizeHints::No,
+                HonorSizeHints::Tiled => bsp_core::settings::HonorSizeHints::Tiled,
+                HonorSizeHints::Floating => bsp_core::settings::HonorSizeHints::Floating,
+            });
         }
         "hidden" => consequence.hidden = Some(parse_bool(value).ok_or_else(bad)?),
         "sticky" => consequence.sticky = Some(parse_bool(value).ok_or_else(bad)?),
         "private" => consequence.private = Some(parse_bool(value).ok_or_else(bad)?),
         "locked" => consequence.locked = Some(parse_bool(value).ok_or_else(bad)?),
         "marked" => consequence.marked = Some(parse_bool(value).ok_or_else(bad)?),
-        "center" => consequence.center = parse_bool(value).ok_or_else(bad)?,
-        "follow" => consequence.follow = parse_bool(value).ok_or_else(bad)?,
+        "center" => consequence.center = Some(parse_bool(value).ok_or_else(bad)?),
+        "follow" => consequence.follow = Some(parse_bool(value).ok_or_else(bad)?),
         "manage" => consequence.manage = Some(parse_bool(value).ok_or_else(bad)?),
         "focus" => consequence.focus = Some(parse_bool(value).ok_or_else(bad)?),
         "border" => consequence.border = Some(parse_bool(value).ok_or_else(bad)?),
@@ -1949,6 +2048,28 @@ mod tests {
     }
 
     #[test]
+    fn output_create_headless_takes_no_name_and_an_optional_mode() {
+        assert_eq!(
+            parse(&args("output --create-headless")).unwrap(),
+            Command::Output { name: None, actions: vec![OutputAction::CreateHeadless(None)] }
+        );
+        match parse(&args("output -c 1280x720@30")).unwrap() {
+            Command::Output { name: None, actions } => match actions.as_slice() {
+                [OutputAction::CreateHeadless(Some(m))] => assert_eq!((m.width, m.height, m.refresh_mhz), (1280, 720, 30_000)),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&args("output -c 1280x720")).is_err(), "a mode needs its refresh rate");
+        // `-r` names what it removes.
+        assert!(parse(&args("output -r")).is_err());
+        assert_eq!(
+            parse(&args("output HEADLESS-1 --remove")).unwrap(),
+            Command::Output { name: Some("HEADLESS-1".to_string()), actions: vec![OutputAction::Remove] }
+        );
+    }
+
+    #[test]
     fn output_invalid_mode_is_rejected() {
         assert!(parse(&args("output eDP-1 -m garbage")).is_err());
     }
@@ -2000,7 +2121,7 @@ mod tests {
         match cmd {
             Command::Query(q) => {
                 assert_eq!(q.domain, QueryDomain::Tree);
-                assert!(q.node.is_some());
+                assert!(matches!(q.targets.as_slice(), [QueryTarget::Node(Some(_))]));
             }
             other => panic!("expected Query, got {other:?}"),
         }
@@ -2037,7 +2158,7 @@ mod tests {
                     assert_eq!(instance_name, "Navigator");
                     assert_eq!(name, "*");
                     assert_eq!(consequence.state, Some(ClientState::Floating));
-                    assert!(consequence.follow);
+                    assert!(consequence.should_follow());
                 }
                 other => panic!("expected Add, got {other:?}"),
             },
@@ -2062,7 +2183,7 @@ mod tests {
                     assert_eq!(instance_name, "*");
                     assert_eq!(name, "*");
                     assert!(one_shot);
-                    assert!(consequence.center);
+                    assert!(consequence.should_center());
                 }
                 other => panic!("expected Add, got {other:?}"),
             },

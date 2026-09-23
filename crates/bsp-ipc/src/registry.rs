@@ -20,6 +20,9 @@ use std::collections::HashMap;
 
 use bsp_core::id::{DesktopId, NodeId};
 
+/// A node's place: its desktop and arena id.
+pub type NodeKey = (DesktopId, NodeId);
+
 /// Maps stable, wire-visible node ids to their current `(DesktopId,
 /// NodeId)` location, and back.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +70,59 @@ impl NodeRegistry {
         if let Some(id) = self.forward.remove(&old) {
             self.forward.insert(new, id);
             self.backward.insert(id, new);
+        }
+    }
+
+    /// Registers `node` and, if the insertion that placed it created a split
+    /// (its parent) that has no id yet, that split too, so the ids exist for
+    /// the events of the same command.
+    pub fn register_with_split(&mut self, desktop: DesktopId, tree: &bsp_core::tree::Tree, node: NodeId) {
+        for n in std::iter::once(node).chain(tree.node(node).parent()) {
+            if !self.forward.contains_key(&(desktop, n)) {
+                self.register(desktop, n);
+            }
+        }
+    }
+
+    /// Carries several nodes to new positions at once, each keeping its stable
+    /// id. Unlike calling [`relocate`](Self::relocate) in a row, a new position
+    /// may be an old position of another node in the same batch (two subtrees
+    /// exchanging places between two trees).
+    pub fn relocate_many(&mut self, moves: &[(NodeKey, NodeKey)]) {
+        let taken: Vec<(u32, (DesktopId, NodeId))> =
+            moves.iter().filter_map(|(old, new)| self.forward.remove(old).map(|id| (id, *new))).collect();
+        for (id, new) in taken {
+            self.forward.insert(new, id);
+            self.backward.insert(id, new);
+        }
+    }
+
+    /// Brings the registry in line with the trees: every node in `wm`, splits
+    /// included, has an id (bspwm gives every node one), and ids of nodes that are
+    /// gone are forgotten. Ids already given are kept. Call after anything that
+    /// created or freed nodes (a command, a window mapped or unmapped); a split
+    /// is created by `Tree::insert_node`, which knows nothing of ids.
+    pub fn sync_with(&mut self, wm: &bsp_core::wm::Wm) {
+        let mut live = std::collections::HashSet::new();
+        for m in &wm.monitors {
+            for d in &m.desktops {
+                for n in d.tree.node_ids() {
+                    live.insert((d.id, n));
+                }
+            }
+        }
+        let stale: Vec<(DesktopId, NodeId)> = self.forward.keys().filter(|k| !live.contains(k)).copied().collect();
+        for key in stale {
+            self.unregister(key.0, key.1);
+        }
+        for m in &wm.monitors {
+            for d in &m.desktops {
+                for n in d.tree.node_ids() {
+                    if !self.forward.contains_key(&(d.id, n)) {
+                        self.register(d.id, n);
+                    }
+                }
+            }
         }
     }
 

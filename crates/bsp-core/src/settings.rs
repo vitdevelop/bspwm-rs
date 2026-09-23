@@ -76,9 +76,81 @@ pub struct Settings {
     /// `#817f7f` (`FOCUSED_BORDER_COLOR`).
     pub focused_border_color: String,
     /// Color of the preselection feedback. Default `#f4d775`
-    /// (`PRESEL_FEEDBACK_COLOR`). Stored and reported, but the compositor
-    /// does not draw preselection feedback yet.
+    /// (`PRESEL_FEEDBACK_COLOR`). Drawn by the compositor.
     pub presel_feedback_color: String,
+    /// Text printed before the first monitor of every status report
+    /// (`bspc wm -g`, `subscribe report`). Default `W` (`STATUS_PREFIX`).
+    pub status_prefix: String,
+    /// Focus the window under the pointer as it moves onto it. Default `false`.
+    pub focus_follows_pointer: bool,
+    /// Move the pointer to the centre of a window when it gets focus.
+    /// Default `false`.
+    pub pointer_follows_focus: bool,
+    /// Move the pointer to the centre of a monitor when it gets focus.
+    /// Default `false`.
+    pub pointer_follows_monitor: bool,
+    /// Draw the preselection feedback. Default `true`. Stored and reported; the
+    /// compositor draws it.
+    pub presel_feedback: bool,
+    /// How strictly directional focus keeps to a direction
+    /// (`directional_focus_tightness`). Default `High`.
+    pub directional_focus_tightness: Tightness,
+    /// Which fullscreen requests from windows are ignored
+    /// (`ignore_ewmh_fullscreen`). Default: none.
+    pub ignore_ewmh_fullscreen: StateTransition,
+    /// Command run for every new window to add rule effects
+    /// (`external_rules_command`). Default: empty (none).
+    pub external_rules_command: String,
+    /// Which windows honor their size hints (`honor_size_hints`). Stored and
+    /// reported; the compositor does not apply size hints yet. Default `false`.
+    pub honor_size_hints: HonorSizeHints,
+    /// `mapping_events_count`, an X11 keyboard mapping setting. Stored only.
+    pub mapping_events_count: i8,
+    /// `remove_disabled_monitors`. Stored only (monitors follow the outputs).
+    pub remove_disabled_monitors: bool,
+    /// `remove_unplugged_monitors`. Stored only.
+    pub remove_unplugged_monitors: bool,
+    /// `merge_overlapping_monitors`. Stored only.
+    pub merge_overlapping_monitors: bool,
+}
+
+/// How strictly directional focus keeps to a direction.
+///
+/// bspwm: `src/types.h` `tightness_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tightness {
+    /// A candidate only has to be partly in the direction.
+    Low,
+    /// A candidate has to be entirely on that side.
+    #[default]
+    High,
+}
+
+/// Which way of a window state change an `ignore_ewmh_*` setting covers.
+///
+/// bspwm: `src/types.h` `state_transition_t` (`STATE_TRANSITION_ENTER`/`EXIT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StateTransition {
+    /// Entering the state (going fullscreen) is ignored.
+    pub enter: bool,
+    /// Leaving the state is ignored.
+    pub exit: bool,
+}
+
+/// `honor_size_hints`' value.
+///
+/// bspwm: `src/types.h` `honor_size_hints_mode_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HonorSizeHints {
+    /// `false`.
+    #[default]
+    No,
+    /// `true`.
+    Yes,
+    /// `floating`.
+    Floating,
+    /// `tiled`.
+    Tiled,
 }
 
 /// Whether `s` is a valid color value for a `*_color` setting: `#` plus six
@@ -123,6 +195,19 @@ impl Default for Settings {
             active_border_color: "#474645".to_string(),
             focused_border_color: "#817f7f".to_string(),
             presel_feedback_color: "#f4d775".to_string(),
+            status_prefix: "W".to_string(),
+            focus_follows_pointer: false,
+            pointer_follows_focus: false,
+            pointer_follows_monitor: false,
+            presel_feedback: true,
+            directional_focus_tightness: Tightness::High,
+            ignore_ewmh_fullscreen: StateTransition::default(),
+            external_rules_command: String::new(),
+            honor_size_hints: HonorSizeHints::No,
+            mapping_events_count: 1,
+            remove_disabled_monitors: false,
+            remove_unplugged_monitors: false,
+            merge_overlapping_monitors: false,
         }
     }
 }
@@ -149,6 +234,7 @@ mod tests {
         assert_eq!(s.active_border_color, "#474645");
         assert_eq!(s.focused_border_color, "#817f7f");
         assert_eq!(s.presel_feedback_color, "#f4d775");
+        assert_eq!(s.status_prefix, "W");
     }
 
     #[test]

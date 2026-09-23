@@ -51,10 +51,33 @@ impl Desktop {
             name: name.unwrap_or(DEFAULT_DESK_NAME).to_string(),
             layout: Layout::Tiled,
             user_layout: Layout::Tiled,
-            padding: settings.padding,
+            // bspwm: `make_desktop()` starts from the constant `PADDING`, not the
+            // configured one: the monitor's padding (which is) is added on top.
+            padding: Padding::default(),
             window_gap: settings.window_gap,
             border_width: settings.border_width,
             tree: Tree::new(),
+        }
+    }
+
+    /// With `single_monocle`, a desktop holding at most one tiled window is in
+    /// monocle layout, and goes back to the layout the user chose when a
+    /// second one appears. Called before every layout, which covers every place
+    /// bspwm re-checks it (a window inserted, removed, hidden, changing state or
+    /// moving desktop).
+    ///
+    /// bspwm: `src/tree.c` `insert_receptacle()`, `manage_window()`,
+    /// `remove_node()`, `set_state()`, `set_hidden()`, `transfer_node()`
+    /// (`single_monocle` blocks).
+    pub fn apply_single_monocle(&mut self, single_monocle: bool) {
+        if !single_monocle {
+            return;
+        }
+        let tiled = self.tree.tiled_count(self.tree.root, true);
+        if self.layout != Layout::Monocle && tiled <= 1 {
+            self.layout = Layout::Monocle;
+        } else if self.layout == Layout::Monocle && tiled > 1 {
+            self.layout = self.user_layout;
         }
     }
 

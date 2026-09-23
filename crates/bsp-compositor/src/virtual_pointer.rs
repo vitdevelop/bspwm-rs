@@ -120,6 +120,7 @@ impl<Bd: Backend + 'static> Dispatch<ZwlrVirtualPointerV1, PointerData, State<Bd
                     .into();
                 tracing::debug!(?location, area = ?area, "virtual pointer: absolute motion");
                 crate::input::pointer_motion_to(state, location, time);
+                crate::input::focus_follows_pointer(state);
             }
             Request::Button { time, button, state: WEnum::Value(button_state) } => {
                 crate::input::deliver_button(state, button, button_state, time);

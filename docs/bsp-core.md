@@ -14,6 +14,7 @@ The pure-logic crate: it owns every piece of bspwm state and behavior and has no
 | `monitor` | Monitor name, rectangle, padding, panel `struts` (compositor-owned reserved space, added to padding in `arrange`), desktop list, focused desktop, `arrange`, `adapt_geometry` |
 | `rules` | `bspc rule` entries matched on class, instance and name; `RuleConsequence` |
 | `settings` | Every `bspc config` key the tree engine reads, with bspwm's defaults, including the four `*_color` settings |
+| `stack` | The stacking order of every managed window (`StackingList`, `StackMove`), a port of bspwm's `stack.c` (`stack()`, `limit_above()`, `limit_below()`); a window never leaves its level, `Client::stack_level` |
 | `history` | Focus history: `History`, `Loc`, `Dir`; a port of bspwm's `history.c` list operations |
 | `wm` | `Wm`: every monitor, the focused one, the global rule list and settings — bspwm's `mon_head`/`mon_tail`/`mon`/`rule_head` globals collected into one struct, for `bsp-ipc` (IPC) to resolve selectors and run commands against |
 | `event` / `effect` (planned) | `Event` enum, `Effect` enum tying `bsp-core` to an adapter — not started; needs the nested compositor's compositor layer to have a shape worth committing to |
@@ -66,7 +67,7 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Tree::clients_count_in` | `fn(&self, Option<NodeId>) -> u32` | `src/tree.c` `clients_count_in()`. |
 | `Tree::tiled_count` | `fn(&self, Option<NodeId>, bool) -> i32` | `src/tree.c` `tiled_count()`. |
 | `Tree::sticky_count`/`private_count`/`locked_count` | `fn(&self, Option<NodeId>) -> u32` | `src/tree.c` `DEF_FLAG_COUNT`. |
-| `Tree::get_rectangle` | `fn(&self, NodeId, i32, Layout) -> Rect` | `src/tree.c` `get_rectangle()`. |
+| `Tree::get_rectangle` | `fn(&self, NodeId, i32, Layout, bool) -> Rect` | `src/tree.c` `get_rectangle()`; the last argument is `gapless_monocle` (the window gap is dropped only when it is set and the layout is monocle). |
 | `Tree::node_area` | `fn(&self, NodeId) -> i64` | `src/tree.c` `node_area()` (simplified; see doc comment). |
 | `Tree::presel_dir` | `fn(&mut self, NodeId, Direction, f64)` | `src/tree.c` `presel_dir()`. |
 | `Tree::presel_ratio` | `fn(&mut self, NodeId, f64, Direction)` | `src/tree.c` `presel_ratio()`. |
@@ -99,13 +100,18 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Tree::swap_nodes` (**swap**) | `fn(&mut self, NodeId, NodeId) -> bool` | `src/tree.c` `swap_nodes()`, single-tree (see Core scope). |
 | `Tree::transplant_to`/`transplant_within` (**transplant**) | `fn(&mut self, &Settings, NodeId, ..) -> NodeId`/`bool` | `src/tree.c` `transfer_node()` (minus focus/history/EWMH/`single_monocle`). |
 | `Tree::circulate_leaves` | `fn(&mut self, &Settings, Option<NodeId>, CirculateDir)` | `src/tree.c` `circulate_leaves()` (minus refocus). |
-| `Tree::apply_layout` | `fn(&mut self, Option<NodeId>, Rect, i32, Layout, Rect)` | `src/tree.c` `apply_layout()` (geometry only; see doc comment). |
+| `Tree::apply_layout` | `fn(&mut self, Option<NodeId>, Rect, i32, Layout, Rect, LayoutOptions)` | `src/tree.c` `apply_layout()` (geometry only; see doc comment). `LayoutOptions` carries `gapless_monocle`, `borderless_monocle`, `borderless_singleton` (already ANDed with "only monitor") and `center_pseudo_tiled`; the layout stores each client's drawn border in `Client::shown_border_width` (0 for fullscreen, borderless monocle, the singleton) and centres pseudo-tiled windows. A floating client's `tiled_rectangle` is left alone, as in bspwm. |
 | `Desktop::new` | `fn(DesktopId, Option<&str>, &Settings) -> Desktop` | `src/desktop.c` `make_desktop()`. |
 | `Desktop::rename` | `fn(&mut self, &str)` | `src/desktop.c` `rename_desktop()`. |
 | `Desktop::set_layout` | `fn(&mut self, Layout, bool, Layout) -> bool` | `src/desktop.c` `set_layout()`. |
 | `Monitor::new` | `fn(MonitorId, Option<&str>, Rect, &Settings) -> Monitor` | `src/monitor.c` `make_monitor()`. |
 | `Monitor::rename` | `fn(&mut self, &str)` | `src/monitor.c` `rename_monitor()`. |
-| `Monitor::add_desktop` | `fn(&mut self, Desktop)` | `src/desktop.c` `add_desktop()`. |
+| `Monitor::add_desktop` | `fn(&mut self, Desktop)` | `src/desktop.c` `add_desktop()`: the desktop takes the monitor's gap and border width. |
+| `Settings` (bspwm settings kept for `bspc config`) | fields | Besides the tree settings: `focus_follows_pointer`, `pointer_follows_focus`, `pointer_follows_monitor` (acted on by the compositor), `directional_focus_tightness` (`Tightness`, read by directional selectors), `ignore_ewmh_fullscreen` (`StateTransition`), `external_rules_command`, and `presel_feedback` and `honor_size_hints` (`HonorSizeHints`, both acted on by the compositor), stored-only, `mapping_events_count`, `remove_disabled_monitors`, `remove_unplugged_monitors`, `merge_overlapping_monitors` |
+| `RuleConsequence::{monitor_desc, desktop_desc, node_desc, rect}` | fields | The placement a rule asks for (selector text, resolved when the window is managed) and its `rectangle=`; merged like every other field |
+| `Desktop::apply_single_monocle` | `fn(&mut self, bool)` | `single_monocle`: monocle layout while at most one tiled window, the user's layout otherwise. `Monitor::arrange` calls it before every layout, which covers every place bspwm re-checks it |
+| `Monitor::sole` / `Wm::refresh_sole` | field / `fn(&mut self)` | Whether this is the only monitor (`borderless_singleton` applies only then); kept current by `add_monitor`/`remove_monitor` |
+| `Monitor::insert_desktop` | `fn(&mut self, Desktop)` | `src/desktop.c` `insert_desktop()`: appends a desktop keeping its own gap and border width (used when a desktop moves between monitors). |
 | `Monitor::remove_desktop` | `fn(&mut self, usize) -> Desktop` | `src/desktop.c` `remove_desktop()`/`unlink_desktop()`. |
 | `Monitor::activate_desktop` | `fn(&mut self, usize) -> bool` | `src/desktop.c` `activate_desktop()`. |
 | `Monitor::swap_desktops` | `fn(&mut self, usize, usize)` | `src/desktop.c` `swap_desktops()`, single-monitor. |
@@ -114,6 +120,7 @@ Two structural simplifications, not bspwm behavior differences (so not entered i
 | `Rule::matches` | `fn(&self, &str, &str, &str) -> bool` | `src/rule.c` `apply_rules()`'s matching (exact string or `*`, not a glob). |
 | `match_rules` | `fn(&mut Vec<Rule>, &str, &str, &str) -> RuleConsequence` | `src/rule.c` `apply_rules()`'s full loop: merges every matching rule's consequence, removing (and stopping at) the first one-shot match. |
 | `RuleConsequence::merge` | `fn(&mut self, &RuleConsequence)` | Applies a further matched rule's fields on top, `Some`-over-`None`; mirrors `apply_rules()`'s loop merging every match onto one accumulator. |
+| `RuleConsequence::should_center`/`should_follow` | `fn(&self) -> bool` | `center`/`follow` are `Option<bool>` like the other keys (a later rule's `center=off` clears an earlier `on`, `parse_key_value()`); unmentioned means `false`. |
 | `RuleConsequence::should_manage`/`should_focus`/`should_border` | `fn(&self) -> bool` | Resolves `manage`/`focus`/`border` with bspwm's `make_rule_consequence()` default of `true` when no rule mentioned the field. |
 | `Wm::new` | `fn(Settings) -> Wm` | No monitors, no rules. |
 | `Wm::add_monitor` | `fn(&mut self, Monitor) -> usize` | `src/monitor.c` `add_monitor()` (minus RandR/EWMH); appends then walks it into on-screen-position order via `reorder_monitor`. |
@@ -143,7 +150,23 @@ Unit tests per operation (`crates/bsp-core/src/*.rs`, `#[cfg(test)] mod tests`),
 | `History::find_newest` | `fn(&self, impl Fn(&Loc) -> bool) -> Option<Loc>` | `history_find_newest_*()` |
 | `History::last_node` / `last_desktop` / `last_monitor` | see `history.rs` | `history_last_*()` |
 | `History::rank` | `fn(&self, WindowId) -> u32` | `history_rank()`, the tie-break of directional focus |
+| `Wm::fallback_focus` | `fn(&self, usize, usize) -> Option<NodeId>` | The node a desktop focuses when none is chosen: the last focused (`history_last_node()`), else the first focusable leaf. Reads only |
+| `Client::stack_level` | `fn(&self) -> i32` | `src/stack.c` `stack_level()`: `3 * layer + state`; used to decide which fullscreen window covers a focused one |
+| `Tree::next_node` / `Tree::prev_node` | `fn(&self, Option<NodeId>) -> Option<NodeId>` | `src/tree.c` `next_node()`/`prev_node()`: in-order walk over leaves and splits |
+| `Tree::transplant_to_mapped` | `fn(&mut self, &Settings, NodeId, &mut Tree, Option<NodeId>) -> (NodeId, Vec<(NodeId, NodeId)>)` | `transplant_to` plus every `(old, new)` node id pair of the moved subtree, so the registry can carry each wire id across |
+| `StackingList::stack` | `fn(&mut self, WindowId, bool, impl Fn(WindowId) -> Option<i32>) -> Option<StackMove>` | `src/stack.c` `stack()` for one window: on top of its level when focused, at the bottom of it otherwise; returns where it went (the `node_stack` event) |
+| `StackingList::remove` / `windows` | `fn(&mut self, WindowId)` / `fn(&self) -> &[WindowId]` | `remove_stack_node()`; the order, bottom first (`Wm::stacking`) |
 | `Wm::refocus_after_removal` | `fn(&mut self, monitor: usize, desktop: usize)` | Gives a desktop whose focused node was removed the most recently focused remaining window, else its first leaf; the compositor calls it after every unmap |
 | `History::locations` | `fn(&self) -> impl Iterator<Item = Loc>` | Oldest first, for `wm -d` |
 
-Settings gained `normal_border_color` (`#30302f`), `active_border_color` (`#474645`), `focused_border_color` (`#817f7f`) and `presel_feedback_color` (`#f4d775`), plus `settings::is_hex_color` and `parse_hex_color` (`src/helpers.c` `is_hex_color()`).
+Settings gained `normal_border_color` (`#30302f`), `active_border_color` (`#474645`), `focused_border_color` (`#817f7f`) `presel_feedback_color` (`#f4d775`) and `status_prefix` (`W`, the text a status report starts with), plus `settings::is_hex_color` and `parse_hex_color` (`src/helpers.c` `is_hex_color()`).
+
+`Tree::node_ids()` lists every node reachable from the root (splits included), pre-order; the registry sweep in `bsp-ipc` uses it.
+
+`Tree::swap_subtrees_with(n1, other, n2) -> SubtreeSwap` exchanges two subtrees of two trees in their exact slots (clone into the other arena, put in place, free the old ones), returning the `(old, new)` id pairs of both directions; a focus that left is replaced by the incoming subtree's focused or first leaf.
+
+`Tree::children(id)` (private) returns both children of a split; the tree code stops with a `debug_assert!` instead of unwrapping when a split lacks one. `tests/property.rs` also fuzzes swaps, transplants and circulation between two trees.
+
+`Monitor::wired` (bspwm `wired`). `node::SizeHints` and `Client::{size_hints, honor_size_hints}` with `should_honor_size_hints()` (`SHOULD_HONOR_SIZE_HINTS`), `apply_size_hints(w, h)` (`apply_size_hints()`) and `shown_rectangle()` (the layout or floating rectangle after the hints). Leaves keep `Constraints::default()`, as in bspwm. `RuleConsequence::honor_size_hints`.
+
+`tree::presel_rect(node_rect, presel, gap)` ports `draw_presel_feedback()`. `Monitor::sticky_count()` counts the sticky nodes of the monitor. `Tree::swap_subtrees_with` gives a tree whose focus left the incoming root (bspwm).

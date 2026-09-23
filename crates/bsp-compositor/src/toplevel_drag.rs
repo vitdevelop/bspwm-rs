@@ -157,7 +157,9 @@ pub fn follow<Bd: Backend + 'static>(state: &mut State<Bd>) {
     let (dx, dy) = (pointer.x.round() as i32 - x_offset - rect.x, pointer.y.round() as i32 - y_offset - rect.y);
     if (dx, dy) != (0, 0) && state.wm.monitors[mi].desktops[di].tree.move_floating(node, dx, dy) {
         crate::shell::sync_wayland_from_core(state);
-        state.space.raise_element(&window, false);
+        // Raise it through the stacking order (a plain `Space` raise would be undone).
+        let dst = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
+        crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::stack_node(ctx, dst, true, events));
         state.backend_data.queue_redraw();
     }
 }

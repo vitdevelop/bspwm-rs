@@ -31,6 +31,9 @@ use smithay::{delegate_compositor, delegate_output, delegate_seat, delegate_shm}
 
 use crate::adapter::WindowAdapter;
 
+/// The status `bspc quit STATUS` asked the process to exit with.
+pub static EXIT_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// What each backend (`crate::winit_backend::WinitData`, `crate::udev_backend::DrmData`)
 /// must provide so the rest of this crate can stay generic over `State<Bd>`
 /// — everything else (protocol globals, `bsp-core`/`bsp-ipc` state,
@@ -282,6 +285,23 @@ pub struct State<Bd: Backend + 'static> {
     /// (`crate::pointer_action`) — compositor-local for the same
     /// reason as `hotkeys_inline_bspc` above.
     pub pointer_settings: crate::pointer_action::PointerSettings,
+    /// Buttons whose press was swallowed (`swallow_first_click`, a drag binding):
+    /// their release is not forwarded either, or the client would see a release
+    /// with no press.
+    pub swallowed_buttons: std::collections::HashSet<u32>,
+    /// `sync_wayland_from_core` is wanted but the caller holds the pointer's lock
+    /// (a drag grab callback), so it runs after the event-loop turn
+    /// (`shell::run_deferred_sync`).
+    pub sync_pending: bool,
+    /// Replies to `bspc` clients that read slowly, still being written.
+    pub pending_replies: Vec<crate::ipc::PendingReply>,
+    /// Whether the timer that revisits queued IPC output is armed.
+    pub ipc_flush_armed: bool,
+    /// When `extras::periodic_syncs` last ran, and whether a timer is already
+    /// armed for the next run.
+    pub last_periodic_sync: Option<std::time::Instant>,
+    /// See `last_periodic_sync`.
+    pub periodic_timer_armed: bool,
 
     /// The backend: `crate::winit_backend::WinitData` (nested, cargo
     /// feature `nested`) or `crate::udev_backend::DrmData` (real
@@ -291,6 +311,14 @@ pub struct State<Bd: Backend + 'static> {
 }
 
 impl<Bd: Backend + 'static> State<Bd> {
+    /// Asks for `sync_wayland_from_core` to run once the current event-loop turn
+    /// is over, outside any Smithay lock (`shell::run_deferred_sync`). The way
+    /// for code that cannot sync now (a pointer-grab callback, a commit) to get
+    /// the tree reconciled with the surfaces; several requests make one sync.
+    pub fn request_sync(&mut self) {
+        self.sync_pending = true;
+    }
+
     /// Creates the compositor state and every protocol global, and starts
     /// listening on a Wayland socket.
     pub fn new(
@@ -304,7 +332,12 @@ impl<Bd: Backend + 'static> State<Bd> {
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let mut seat_state = SeatState::new();
-        let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        // Only fullscreen: bspwm has no maximize, minimize or window menu, and a
+        // client that is told they exist draws buttons for them that do nothing.
+        let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
+            &display_handle,
+            [smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities::Fullscreen],
+        );
 
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat0");
         let pointer = seat.add_pointer();
@@ -345,6 +378,12 @@ impl<Bd: Backend + 'static> State<Bd> {
             hotkey_matcher,
             hotkeys_inline_bspc: true,
             pointer_settings: crate::pointer_action::PointerSettings::default(),
+            swallowed_buttons: std::collections::HashSet::new(),
+            sync_pending: false,
+            pending_replies: Vec::new(),
+            ipc_flush_armed: false,
+            last_periodic_sync: None,
+            periodic_timer_armed: false,
             backend_data,
         }
     }
@@ -470,6 +509,7 @@ impl<Bd: Backend + 'static> SeatHandler for State<Bd> {
         let surface = focused.and_then(|target| target.wl_surface()).map(|s| s.into_owned());
         crate::protocols::keyboard_focus_changed(self, seat, surface.as_ref());
         self.activate_x11_focus(surface.as_ref());
+        self.update_activated(surface.as_ref());
     }
 
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {

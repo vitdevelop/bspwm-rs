@@ -91,6 +91,8 @@ pub struct Wm {
     /// Which node, desktop and monitor were focused, in order
     /// (`crate::history`).
     pub history: History,
+    /// Every managed window, bottom to top (`crate::stack`).
+    pub stacking: crate::stack::StackingList,
 }
 
 impl Wm {
@@ -102,6 +104,7 @@ impl Wm {
             rules: Vec::new(),
             settings,
             history: History::default(),
+            stacking: crate::stack::StackingList::new(),
         }
     }
 
@@ -119,6 +122,18 @@ impl Wm {
         if d.tree.focus.is_some() || d.tree.root.is_none() {
             return;
         }
+        let fallback = self.fallback_focus(monitor, desktop);
+        self.monitors[monitor].desktops[desktop].tree.focus = fallback;
+    }
+
+    /// The node a desktop should focus when none is chosen for it: the most
+    /// recently focused node still on it, else its first focusable leaf. Reads
+    /// only; [`refocus_after_removal`](Self::refocus_after_removal) stores it.
+    ///
+    /// bspwm: `src/tree.c` `focus_node()`/`activate_node()`'s `n == NULL` branch
+    /// (`history_last_node()`, then `first_focusable_leaf()`).
+    pub fn fallback_focus(&self, monitor: usize, desktop: usize) -> Option<NodeId> {
+        let d = &self.monitors[monitor].desktops[desktop];
         let mut usable: HashMap<WindowId, NodeId> = HashMap::new();
         let mut first = None;
         let mut n = d.tree.first_extrema(d.tree.root);
@@ -131,7 +146,7 @@ impl Wm {
             n = d.tree.next_leaf(Some(id), d.tree.root);
         }
         let by_history = self.history.last_node(d.id, |w| usable.contains_key(&w)).and_then(|w| usable.get(&w).copied());
-        self.monitors[monitor].desktops[desktop].tree.focus = by_history.or(first);
+        by_history.or(first)
     }
 
     /// Records whatever focus change happened since the last call into
@@ -224,6 +239,7 @@ impl Wm {
     /// expected to matter in practice.
     pub fn add_monitor(&mut self, m: Monitor) -> usize {
         self.monitors.push(m);
+        self.refresh_sole();
         let index = self.monitors.len() - 1;
         if self.focused_monitor.is_none() {
             self.focused_monitor = Some(index);
@@ -275,6 +291,7 @@ impl Wm {
     /// as `Monitor::remove_desktop` documents) and EWMH bookkeeping.
     pub fn remove_monitor(&mut self, index: usize) -> Monitor {
         let m = self.monitors.remove(index);
+        self.refresh_sole();
         self.focused_monitor = match self.focused_monitor {
             Some(f) if self.monitors.is_empty() => {
                 let _ = f;
@@ -285,6 +302,18 @@ impl Wm {
             other => other,
         };
         m
+    }
+
+    /// Updates every monitor's [`Monitor::sole`] flag; call after changing the
+    /// monitor list by hand.
+    pub fn refresh_sole(&mut self) {
+        // A virtual output (a capture target) is not a second screen: a real
+        // monitor is alone while it is the only real one.
+        let total = self.monitors.len();
+        let real = self.monitors.iter().filter(|m| !m.virtual_output).count();
+        for m in &mut self.monitors {
+            m.sole = if m.virtual_output { total == 1 } else { real == 1 };
+        }
     }
 
     /// Focuses the monitor at `index`. Returns `false` if it is already
@@ -462,6 +491,30 @@ mod tests {
             wm.monitors.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![MonitorId(2), MonitorId(1)]
         );
+    }
+
+    #[test]
+    fn a_virtual_output_does_not_end_the_sole_status_of_a_real_monitor() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor(1));
+        let mut v = monitor(2);
+        v.virtual_output = true;
+        wm.add_monitor(v);
+        assert!(wm.monitors[0].sole);
+        assert!(!wm.monitors[1].sole);
+        wm.add_monitor(monitor(3));
+        assert!(wm.monitors.iter().all(|m| !m.sole));
+    }
+
+    #[test]
+    fn sole_is_true_only_while_there_is_one_monitor() {
+        let mut wm = Wm::new(settings());
+        wm.add_monitor(monitor(1));
+        assert!(wm.monitors[0].sole);
+        wm.add_monitor(monitor(2));
+        assert!(wm.monitors.iter().all(|m| !m.sole));
+        wm.remove_monitor(1);
+        assert!(wm.monitors[0].sole);
     }
 
     #[test]

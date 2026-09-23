@@ -304,16 +304,16 @@ pub fn run() {
         }
 
         if event_loop
-            .dispatch(Some(Duration::from_millis(1)), &mut state)
+            .dispatch(Some(Duration::from_millis(16)), &mut state)
             .is_err()
         {
             state.running = false;
         } else {
+            // The one reconcile of this turn, before anything reads the space.
+            crate::shell::run_deferred_sync(&mut state);
             state.space.refresh();
             crate::protocols::refresh_idle_inhibit(&mut state);
-            crate::taskbar::sync(&mut state);
-            crate::workspaces::sync(&mut state);
-            crate::output_management::sync(&mut state);
+            crate::extras::periodic_syncs(&mut state);
             crate::screencopy::fulfill(&mut state);
             crate::ext_capture::fulfill(&mut state);
             crate::export_dmabuf::fulfill(&mut state);
