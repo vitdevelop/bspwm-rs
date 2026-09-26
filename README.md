@@ -27,18 +27,38 @@ Implemented and tested in a QEMU VM (virtio-gpu, software rendering):
 - the Wayland protocols bars, launchers, screen capture and lock screens need (layer-shell, foreign-toplevel, ext-workspace, screencopy, session lock, idle, output management, gamma, virtual input, and more);
 - XWayland, started on the first X11 client and stopped when unused.
 
-Not done or not verified: it has not run on real hardware, so the memory target (under 40 MB without XWayland) is unconfirmed; touch and touchpad gestures are untested; preselection feedback is not drawn; `_NET_ACTIVE_WINDOW` requests from X11 clients are ignored. `docs/design.md` has the full list.
+Not done: `_NET_ACTIVE_WINDOW` and `_NET_WM_STATE` requests from X11 clients other than fullscreen are not passed on by Smithay, `bspc wm -l` is refused (clients do not survive a compositor restart; `wm -r` reloads live), and input-method composition is missing. `docs/migrating.md` lists every difference from bspwm.
 
 ## Installation
 
-On Arch Linux:
+### Arch Linux
 
-```
-cd packaging/arch
-makepkg -si
-```
+`packaging/arch/PKGBUILD` builds a `bspwm-rs-git` package from this checkout (the working tree, so uncommitted changes are included).
 
-This builds the working tree and installs `bspwm-rs`, `bspc-rs`, a `bspwm-rs-session` launcher, default configuration, and a `bspwm-rs` entry in `/usr/share/wayland-sessions`, so greetd, GDM or SDDM offer it as a session. Add `-d` to `makepkg` if `cargo` comes from rustup.
+1. Install the build tools, if they are not there yet:
+
+   ```
+   sudo pacman -S --needed base-devel git rust
+   ```
+
+   `rustup` works instead of the `rust` package; then run `rustup default stable` once and add `-d` to the `makepkg` commands below (the package depends on `cargo`, which rustup does not register with pacman).
+
+2. Build, test and install:
+
+   ```
+   cd packaging/arch
+   makepkg -si
+   ```
+
+   `makepkg` runs the PKGBUILD's `build()`, then `check()` (the whole test suite, with the compositor built for the DRM backend that is packaged), then `package()`. A failing test stops the build before anything is packaged. `makepkg -si --nocheck` skips the tests. `-s` installs missing dependencies from the repositories, `-i` installs the package afterwards.
+
+3. Optional programs used by the default session config (waybar, rofi, alacritty, swaybg, kanshi, gammastep, dunst, …) are listed as optional dependencies: `pacman -Qi bspwm-rs-git` shows them. `xorg-xwayland` is needed for X11 applications.
+
+The package installs `bspwm-rs`, `bspc-rs`, the `bspwm-rs-session` launcher (with `bspc` on its `PATH`), `bspwm-rs-setup` and the default configuration it copies into `~/.config` on first run, and a `bspwm-rs` entry in `/usr/share/wayland-sessions`, so greetd, GDM or SDDM offer it as a session.
+
+To update, pull or edit the tree and run `makepkg -si` again; the version is taken from `Cargo.toml` and the git revision. Build files stay in `packaging/arch/src` and `packaging/arch/pkg`; `makepkg -C` starts from a clean build. To remove it: `sudo pacman -R bspwm-rs-git`.
+
+### Other systems
 
 From source:
 

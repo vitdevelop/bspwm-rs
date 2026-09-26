@@ -51,10 +51,15 @@ build() {
   cargo build --release --locked --no-default-features --features real -p bsp-compositor -p bspc-rs
 }
 
+# makepkg runs this after build() and before package(): a failing test stops
+# the package from being made (`makepkg --nocheck` skips it).
 check() {
   cd "$(_root)"
   export CARGO_TARGET_DIR="$srcdir/target"
-  cargo test --release --locked -p bsp-core -p bsp-ipc -p bsp-hotkeys
+  # Every crate but the compositor with its default features, then the
+  # compositor with the backend that is packaged.
+  cargo test --release --locked --workspace --exclude bsp-compositor
+  cargo test --release --locked --no-default-features --features real -p bsp-compositor
 }
 
 package() {
