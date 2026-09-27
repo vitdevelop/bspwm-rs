@@ -48,6 +48,20 @@ pub struct DesktopId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MonitorId(pub u32);
 
+/// The first [`MonitorId`] handed out. Monitor, desktop and node ids share
+/// one wire namespace, as bspwm's X ids do (a script may pass any of them
+/// where an id is expected): nodes count up from 1, monitors and desktops
+/// from their own high bases.
+pub const FIRST_MONITOR_ID: u32 = 0x7E00_0001;
+
+/// The first [`DesktopId`] handed out (see [`FIRST_MONITOR_ID`]).
+pub const FIRST_DESKTOP_ID: u32 = 0x7F00_0001;
+
+/// The name bspwm gives a desktop it makes itself (a new monitor's first one).
+///
+/// bspwm: `src/settings.h` `DEFAULT_DESK_NAME`.
+pub const DEFAULT_DESKTOP_NAME: &str = "Desktop";
+
 /// Monotonic generator for [`DesktopId`] and [`MonitorId`] values.
 ///
 /// bspwm generates these from the X server (`xcb_generate_id`); bsp-core

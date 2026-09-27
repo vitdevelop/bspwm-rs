@@ -170,3 +170,11 @@ Settings gained `normal_border_color` (`#30302f`), `active_border_color` (`#4746
 `Monitor::wired` (bspwm `wired`). `node::SizeHints` and `Client::{size_hints, honor_size_hints}` with `should_honor_size_hints()` (`SHOULD_HONOR_SIZE_HINTS`), `apply_size_hints(w, h)` (`apply_size_hints()`) and `shown_rectangle()` (the layout or floating rectangle after the hints). Leaves keep `Constraints::default()`, as in bspwm. `RuleConsequence::honor_size_hints`.
 
 `tree::presel_rect(node_rect, presel, gap)` ports `draw_presel_feedback()`. `Monitor::sticky_count()` counts the sticky nodes of the monitor. `Tree::swap_subtrees_with` gives a tree whose focus left the incoming root (bspwm).
+
+`id::FIRST_MONITOR_ID` (`0x7E000001`), `id::FIRST_DESKTOP_ID` (`0x7F000001`) and `id::DEFAULT_DESKTOP_NAME` (`Desktop`, bspwm's `DEFAULT_DESK_NAME`); `Wm::next_monitor_id()`/`next_desktop_id()` hand out ids above every existing one, so monitor, desktop and node wire ids (nodes count from 1) never collide, as bspwm's X ids do not.
+
+`Client::window_rectangle` is where the window was last put and reported (`node_geometry`): bspwm reads it back from the X window in `apply_layout()`.
+
+`Tree::private_insertion(f)` is the anchor `insert_node` uses next to a private node (a public leaf if there is one) and the preselection it makes when that is still private; `insert_node` calls it, and `bsp-ipc` reports that preselection.
+
+`Wm::sync_history` records a desktop when its monitor starts showing it (bspwm: `activate_desktop()`, `focus_node()`), not when it is made; the first sync records the focused window but not the desktop the session starts on.

@@ -532,7 +532,7 @@ impl fmt::Display for Event {
                 write!(f, "node_presel 0x{monitor:08X} 0x{desktop:08X} 0x{node:08X} ")?;
                 match detail {
                     PreselDetail::Dir(d) => write!(f, "dir {}", split_dir_str(*d)),
-                    PreselDetail::Ratio(r) => write!(f, "ratio {r}"),
+                    PreselDetail::Ratio(r) => write!(f, "ratio {r:.6}"),
                     PreselDetail::Cancel => write!(f, "cancel"),
                 }
             }
@@ -676,7 +676,10 @@ impl JsonClient {
     /// Builds the JSON shape for `c`, given the class/instance name the
     /// adapter reports for its window (`bsp-compositor`'s job once it
     /// exists; the fake adapter in tests supplies its own).
-    pub fn new(c: &Client, class_name: String, instance_name: String) -> Self {
+    /// `shown` is whether the window's desktop is the one its monitor shows
+    /// (bspwm's `client_t.shown`, set by `show_node()`/`hide_node()`; a hidden
+    /// window on a shown desktop counts as shown).
+    pub fn new(c: &Client, class_name: String, instance_name: String, shown: bool) -> Self {
         Self {
             class_name,
             instance_name,
@@ -686,7 +689,7 @@ impl JsonClient {
             layer: layer_str(c.layer),
             last_layer: layer_str(c.last_layer),
             urgent: c.urgent,
-            shown: true,
+            shown,
             tiled_rectangle: c.tiled_rectangle.into(),
             floating_rectangle: c.floating_rectangle.into(),
         }
@@ -730,13 +733,14 @@ impl JsonNode {
         tree: &bsp_core::tree::Tree,
         desktop: bsp_core::id::DesktopId,
         id: bsp_core::id::NodeId,
+        shown: bool,
         node_id: &impl Fn(bsp_core::id::DesktopId, bsp_core::id::NodeId) -> WireNodeId,
         client_names: &impl Fn(bsp_core::id::WindowId) -> (String, String),
     ) -> JsonNode {
         let node = tree.node(id);
         let client = node.client.as_ref().map(|c| {
             let (class_name, instance_name) = client_names(c.window);
-            JsonClient::new(c, class_name, instance_name)
+            JsonClient::new(c, class_name, instance_name, shown)
         });
         JsonNode {
             id: node_id(desktop, id),
@@ -753,10 +757,10 @@ impl JsonNode {
             constraints: node.constraints.into(),
             first_child: node
                 .first_child()
-                .map(|c| Box::new(JsonNode::from_tree(tree, desktop, c, node_id, client_names))),
+                .map(|c| Box::new(JsonNode::from_tree(tree, desktop, c, shown, node_id, client_names))),
             second_child: node
                 .second_child()
-                .map(|c| Box::new(JsonNode::from_tree(tree, desktop, c, node_id, client_names))),
+                .map(|c| Box::new(JsonNode::from_tree(tree, desktop, c, shown, node_id, client_names))),
             client,
         }
     }
@@ -782,9 +786,10 @@ pub struct JsonDesktop {
 
 impl JsonDesktop {
     /// Builds the JSON shape for `d`. See [`JsonNode::from_tree`] for
-    /// `node_id`/`client_names`.
+    /// `shown`/`node_id`/`client_names`.
     pub fn from_desktop(
         d: &bsp_core::desktop::Desktop,
+        shown: bool,
         node_id: &impl Fn(bsp_core::id::DesktopId, bsp_core::id::NodeId) -> WireNodeId,
         client_names: &impl Fn(bsp_core::id::WindowId) -> (String, String),
     ) -> JsonDesktop {
@@ -800,7 +805,7 @@ impl JsonDesktop {
             root: d
                 .tree
                 .root
-                .map(|r| JsonNode::from_tree(&d.tree, d.id, r, node_id, client_names)),
+                .map(|r| JsonNode::from_tree(&d.tree, d.id, r, shown, node_id, client_names)),
         }
     }
 }
@@ -849,7 +854,8 @@ impl JsonMonitor {
             desktops: m
                 .desktops
                 .iter()
-                .map(|d| JsonDesktop::from_desktop(d, node_id, client_names))
+                .enumerate()
+                .map(|(i, d)| JsonDesktop::from_desktop(d, m.focused == Some(i), node_id, client_names))
                 .collect(),
         }
     }
@@ -1031,7 +1037,7 @@ mod tests {
         let desktop = DesktopId(1);
         let node_id = |_: DesktopId, _: bsp_core::id::NodeId| 42u32;
         let client_names = |_: WindowId| ("Foo".to_string(), "bar".to_string());
-        let json = JsonNode::from_tree(&tree, desktop, n, &node_id, &client_names);
+        let json = JsonNode::from_tree(&tree, desktop, n, true, &node_id, &client_names);
         let s = serde_json::to_string(&json).unwrap();
         assert!(s.starts_with(r#"{"id":42,"splitType":"vertical""#));
         assert!(s.contains(r#""className":"Foo""#));

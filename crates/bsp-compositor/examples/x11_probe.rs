@@ -11,6 +11,7 @@
 //! x11_probe grab [--secs N]             maps a window, grabs the keyboard (`XGrabKeyboard`) and prints every key press
 //! x11_probe pgrab [--secs N]            maps a window and grabs the pointer (`XGrabPointer`), as a game does
 //! x11_probe urgent [--secs N]           maps a window and sets the ICCCM urgency hint after two seconds
+//! x11_probe fsreq [--secs N]            maps a window and at once asks for fullscreen (`_NET_WM_STATE` client message), as a game does
 //!
 //! Every mapped window prints `button press <window>` for each click it gets,
 //! and `_NET_WM_STATE [...]` / `_NET_WM_DESKTOP n` whenever the window manager changes them.
@@ -115,6 +116,15 @@ fn main() {
         std::thread::sleep(Duration::from_millis(1500));
         let status = conn.grab_keyboard(true, win, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC).expect("grab").reply().expect("grab reply").status;
         println!("keyboard grab: {status:?}");
+    }
+    if mode == "fsreq" {
+        // Right after the map, before the window manager has answered, as SDL does.
+        let (net_state, fullscreen) = (atom(&conn, "_NET_WM_STATE"), atom(&conn, "_NET_WM_STATE_FULLSCREEN"));
+        let event = x11rb::protocol::xproto::ClientMessageEvent::new(32, win, net_state, [1u32, fullscreen, 0, 1, 0]);
+        let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+        conn.send_event(false, screen.root, mask, event).expect("fullscreen request");
+        conn.flush().expect("flush");
+        println!("fullscreen requested");
     }
     if mode == "urgent" {
         std::thread::sleep(Duration::from_secs(2));

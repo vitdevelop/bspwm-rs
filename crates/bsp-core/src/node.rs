@@ -112,6 +112,13 @@ pub struct Client {
     ///
     /// bspwm: `client_t.honor_size_hints`.
     pub honor_size_hints: HonorSizeHints,
+    /// Where the window was last put and reported (`node_geometry`): an X11
+    /// window's own geometry when it is managed, `None` for a Wayland window
+    /// until it is first placed.
+    ///
+    /// bspwm: the X window's geometry, read back by `get_window_rectangle()`
+    /// in `apply_layout()`.
+    pub window_rectangle: Option<Rect>,
 }
 
 impl Client {
@@ -154,6 +161,7 @@ impl Client {
             urgent: false,
             size_hints: SizeHints::default(),
             honor_size_hints: HonorSizeHints::No,
+            window_rectangle: None,
         }
     }
 

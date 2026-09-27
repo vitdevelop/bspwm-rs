@@ -150,6 +150,7 @@ dependencies = [
  "drm-ffi",
  "libc",
  "rustix 1.1.5",
+ "serde_json",
  "smithay",
  "smithay-drm-extras",
  "tracing",

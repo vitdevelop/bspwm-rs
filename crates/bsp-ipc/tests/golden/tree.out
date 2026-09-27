@@ -1,0 +1,202 @@
+@monitor screen 1920x1080+0+0 Desktop
+> WMscreen:FDesktop:LT
+$ bspc monitor -d one two
+> desktop_rename 0x00200002 0x00200004 Desktop one
+> WMscreen:Fone:LT
+> WMscreen:Fone:LT
+> desktop_add 0x00200002 0x00200005 two
+> WMscreen:Fone:ftwo:LT
+$ window Alpha alpha
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_add 0x00200002 0x00200004 0x00000000 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x1066+6+6
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+$ window Beta beta
+> node_add 0x00200002 0x00200004 0x00400000 0x00600000
+> node_geometry 0x00200002 0x00200004 0x00400000 949x1066+6+6
+> node_geometry 0x00200002 0x00200004 0x00600000 949x1066+963+6
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ bspc node -p south
+> node_presel 0x00200002 0x00200004 0x00600000 dir south
+$ window Gamma gamma
+> node_presel 0x00200002 0x00200004 0x00600000 cancel
+> node_add 0x00200002 0x00200004 0x00600000 0x00800000
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+963+6
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+963+543
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00800000
+> node_stack 0x00800000 above 0x00600000
+$ bspc query -T -d
+{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":8388608,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":2097158,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":64,"min_height":64},"firstChild":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":949,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097160,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":64},"firstChild":{"id":6291456,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Beta","instanceName":"beta","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":6,"width":949,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":8388608,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Gamma","instanceName":"gamma","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":543,"width":949,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null}}
+$ bspc node @/ -R 90
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x529+6+6
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+963+543
+$ bspc node @/ -F vertical
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+963+543
+$ bspc node @/ -B
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x350+6+6
+> node_geometry 0x00200002 0x00200004 0x00600000 949x708+6+364
+> node_geometry 0x00200002 0x00200004 0x00800000 949x708+963+364
+$ bspc node @/ -E
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x529+6+6
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+963+543
+$ bspc node -f west
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00800000
+$ bspc node -s east
+> node_swap 0x00200002 0x00200004 0x00600000 0x00200002 0x00200004 0x00800000
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+963+543
+$ bspc node -r 0.3
+$ bspc node @parent -r 0.7
+> node_geometry 0x00200002 0x00200004 0x00800000 1331x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 567x529+1345+543
+$ bspc node -z right 20 0
+? exit 1
+$ bspc node -g locked
+> node_flag 0x00200002 0x00200004 0x00600000 locked on
+> WMscreen:Oone:ftwo:LT:TT:GL
+$ bspc node -g locked
+> node_flag 0x00200002 0x00200004 0x00600000 locked off
+> WMscreen:Oone:ftwo:LT:TT:G
+$ bspc node -g marked=on
+> node_flag 0x00200002 0x00200004 0x00600000 marked on
+> WMscreen:Oone:ftwo:LT:TT:GM
+$ bspc node -g private=on
+> node_flag 0x00200002 0x00200004 0x00600000 private on
+> WMscreen:Oone:ftwo:LT:TT:GPM
+$ bspc node -g sticky=on
+> node_flag 0x00200002 0x00200004 0x00600000 sticky on
+> WMscreen:Oone:ftwo:LT:TT:GSPM
+$ bspc node -g sticky=off
+> node_flag 0x00200002 0x00200004 0x00600000 sticky off
+> WMscreen:Oone:ftwo:LT:TT:GPM
+$ bspc node -l above
+> node_layer 0x00200002 0x00200004 0x00600000 above
+> node_stack 0x00600000 above 0x00800000
+$ bspc node -l normal
+> node_layer 0x00200002 0x00200004 0x00600000 normal
+> node_stack 0x00600000 above 0x00800000
+$ bspc node -t fullscreen
+> node_state 0x00200002 0x00200004 0x00600000 tiled off
+> node_stack 0x00600000 above 0x00800000
+> node_state 0x00200002 0x00200004 0x00600000 fullscreen on
+> WMscreen:Oone:ftwo:LT:T=:GPM
+> node_geometry 0x00200002 0x00200004 0x00800000 1906x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 1920x1080+0+0
+$ bspc node -t tiled
+> node_stack 0x00600000 above 0x00800000
+> node_state 0x00200002 0x00200004 0x00600000 fullscreen off
+> node_state 0x00200002 0x00200004 0x00600000 tiled on
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_geometry 0x00200002 0x00200004 0x00800000 1331x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 567x529+1345+543
+$ bspc node -t pseudo_tiled
+> node_state 0x00200002 0x00200004 0x00600000 tiled off
+> node_state 0x00200002 0x00200004 0x00600000 pseudo_tiled on
+> WMscreen:Oone:ftwo:LT:TP:GPM
+> node_geometry 0x00200002 0x00200004 0x00600000 400x300+1428+657
+$ bspc node -t ~tiled
+> node_state 0x00200002 0x00200004 0x00600000 pseudo_tiled off
+> node_state 0x00200002 0x00200004 0x00600000 tiled on
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_geometry 0x00200002 0x00200004 0x00600000 567x529+1345+543
+$ bspc node -d two
+> node_transfer 0x00200002 0x00200004 0x00600000 0x00200002 0x00200005 0x00000000
+> WMscreen:Oone:otwo:LT
+> node_stack 0x00600000 below 0x00400000
+> WMscreen:Oone:otwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00800000
+> node_stack 0x00800000 above 0x00400000
+> node_stack 0x00600000 above 0x00800000
+> WMscreen:Oone:otwo:LT:TT:G
+> node_activate 0x00200002 0x00200005 0x00600000
+> node_geometry 0x00200002 0x00200004 0x00800000 1906x529+6+543
+> node_geometry 0x00200002 0x00200005 0x00600000 1906x1066+6+6
+> WMscreen:Oone:otwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00800000
+> node_stack 0x00800000 above 0x00600000
+$ bspc query -N -d two
+0x00600000
+$ bspc desktop -f two
+> desktop_focus 0x00200002 0x00200005
+> WMscreen:oone:Otwo:LT:TT:GPM
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00800000
+> WMscreen:oone:Otwo:LT:TT:GPM
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00800000
+$ bspc node -d one --follow
+> node_transfer 0x00200002 0x00200005 0x00600000 0x00200002 0x00200004 0x00800000
+> WMscreen:oone:Ftwo:LT
+> node_stack 0x00600000 below 0x00400000
+> desktop_focus 0x00200002 0x00200004
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00800000
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+963+543
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00800000
+$ bspc desktop -l monocle
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x1066+6+6
+> node_geometry 0x00200002 0x00200004 0x00800000 1906x1066+6+6
+> node_geometry 0x00200002 0x00200004 0x00600000 1906x1066+6+6
+> desktop_layout 0x00200002 0x00200004 monocle
+> WMscreen:Oone:ftwo:LM:TT:GPM
+$ bspc desktop -l tiled
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x529+6+6
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 949x529+963+543
+> desktop_layout 0x00200002 0x00200004 tiled
+> WMscreen:Oone:ftwo:LT:TT:GPM
+$ bspc node -i
+> node_presel 0x00200002 0x00200004 0x00400000 dir east
+> node_presel 0x00200002 0x00200004 0x00400000 cancel
+> node_add 0x00200002 0x00200004 0x00600000 0x0020000A
+> node_geometry 0x00200002 0x00200004 0x00400000 949x529+6+6
+$ bspc node @/ -i
+> node_add 0x00200002 0x00200004 0x00200006 0x0020000C
+> node_geometry 0x00200002 0x00200004 0x00400000 470x529+6+6
+> node_geometry 0x00200002 0x00200004 0x00800000 470x529+6+543
+> node_geometry 0x00200002 0x00200004 0x00600000 471x529+484+543
+$ bspc query -N -n .leaf.!window
+0x0020000A
+0x0020000C
+$ bspc node -p cancel
+$ bspc node -p east -o 0.25
+> node_presel 0x00200002 0x00200004 0x00600000 dir east
+> node_presel 0x00200002 0x00200004 0x00600000 ratio 0.250000
+$ bspc node -p cancel
+> node_presel 0x00200002 0x00200004 0x00600000 cancel
+$ bspc node -c
+> WMscreen:Oone:ftwo:LT:TT:GPM
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00800000
+> node_remove 0x00200002 0x00200004 0x00600000
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00800000
+> node_stack 0x00800000 above 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+$ bspc node -k
+> node_geometry 0x00200002 0x00200004 0x00800000 949x529+6+543
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00800000
+> node_stack 0x00800000 above 0x00400000
+> node_remove 0x00200002 0x00200004 0x00800000
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 949x529+6+6
+$ bspc query -T -d
+{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":4194304,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":2097165,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":96,"min_height":32},"firstChild":{"id":2097163,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":1074},"constraints":{"min_width":64,"min_height":32},"firstChild":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":949,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097162,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":543,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":null},"client":null},"secondChild":{"id":2097164,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":null},"client":null}}
+$ bspc wm -d
+{"focusedMonitorId":2097154,"clientsCount":1,"monitors":[{"name":"screen","id":2097154,"randrId":60,"wired":true,"stickyCount":0,"windowGap":6,"borderWidth":1,"focusedDesktopId":2097156,"padding":{"top":0,"right":0,"bottom":0,"left":0},"rectangle":{"x":0,"y":0,"width":1920,"height":1080},"desktops":[{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":4194304,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":2097165,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":96,"min_height":32},"firstChild":{"id":2097163,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":1074},"constraints":{"min_width":64,"min_height":32},"firstChild":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":949,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097162,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":543,"width":957,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":null},"client":null},"secondChild":{"id":2097164,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":null},"client":null}},{"name":"two","id":2097157,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":null}]}],"focusHistory":[{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304},{"monitorId":2097154,"desktopId":2097157,"nodeId":0},{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304}],"stackingList":[4194304]}

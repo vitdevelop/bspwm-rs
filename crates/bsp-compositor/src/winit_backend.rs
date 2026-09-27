@@ -60,14 +60,14 @@ fn initial_wm(size: (i32, i32)) -> Wm {
     let settings = Settings::default();
     let mut wm = Wm::new(settings.clone());
     let mut monitor = CoreMonitor::new(
-        MonitorId(1),
+        MonitorId(bsp_core::id::FIRST_MONITOR_ID),
         Some(OUTPUT_NAME),
         Rect::new(0, 0, size.0, size.1),
         &settings,
     );
     monitor.add_desktop(bsp_core::desktop::Desktop::new(
-        DesktopId(1),
-        Some("I"),
+        DesktopId(bsp_core::id::FIRST_DESKTOP_ID),
+        Some(bsp_core::id::DEFAULT_DESKTOP_NAME),
         &settings,
     ));
     wm.add_monitor(monitor);
@@ -253,7 +253,7 @@ pub fn run() {
                 for di in 0..state.wm.monitors[0].desktops.len() {
                     state.wm.monitors[0].arrange(di, &settings);
                 }
-                crate::shell::sync_wayland_from_core(&mut state);
+                state.request_sync();
             }
             WinitEvent::Input(event) => {
                 crate::input::process_input_event(&mut state, event, &output)
@@ -265,6 +265,8 @@ pub fn run() {
             state.running = false;
             break;
         }
+        // A resize re-tiled the monitor: reconcile before drawing.
+        crate::shell::run_deferred_sync(&mut state);
 
         let backend = &mut state.backend_data.backend;
         let age = backend.buffer_age().unwrap_or(0);

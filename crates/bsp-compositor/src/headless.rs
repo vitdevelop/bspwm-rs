@@ -13,7 +13,6 @@ use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale, Subpixe
 use smithay::utils::Transform;
 
 use bsp_core::geometry::Rect;
-use bsp_core::id::{DesktopId, MonitorId};
 use bsp_core::monitor::Monitor;
 use bsp_ipc::command::OutputMode;
 use bsp_ipc::report::Event;
@@ -110,12 +109,11 @@ pub fn create<Bd: Backend + 'static>(state: &mut State<Bd>, mode: Option<OutputM
     state.space.map_output(&output, position);
 
     let settings = state.wm.settings.clone();
-    let monitor_id = MonitorId(state.wm.monitors.iter().map(|m| m.id.0).max().unwrap_or(0) + 1);
+    let monitor_id = state.wm.next_monitor_id();
     let rectangle = Rect::new(position.x, position.y, requested.width, requested.height);
     let mut monitor = Monitor::new(monitor_id, Some(&name), rectangle, &settings);
     monitor.virtual_output = true;
-    let desktop_id = state.wm.monitors.iter().flat_map(|m| m.desktops.iter().map(|d| d.id.0)).max().unwrap_or(0) + 1;
-    monitor.add_desktop(bsp_core::desktop::Desktop::new(DesktopId(desktop_id), Some("I"), &settings));
+    monitor.add_desktop(bsp_core::desktop::Desktop::new(state.wm.next_desktop_id(), Some(bsp_core::id::DEFAULT_DESKTOP_NAME), &settings));
     state.wm.add_monitor(monitor);
     events.push(Event::MonitorAdd { id: monitor_id.0, name: name.clone(), geometry: rectangle });
     state.adapter.hw.outputs.push(HwOutput {

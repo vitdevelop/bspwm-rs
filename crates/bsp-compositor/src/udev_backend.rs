@@ -47,7 +47,6 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use bsp_core::geometry::Rect;
 use bsp_ipc::command::OutputMode;
-use bsp_core::id::MonitorId;
 use bsp_core::monitor::Monitor as CoreMonitor;
 use bsp_core::settings::Settings;
 use bsp_core::wm::Wm;
@@ -960,24 +959,16 @@ impl State<DrmData> {
         let mut added = None;
         if rewired.is_none() {
             let settings = self.wm.settings.clone();
-            let monitor_id = MonitorId(self.wm.monitors.iter().map(|m| m.id.0).max().unwrap_or(0) + 1);
+            let monitor_id = self.wm.next_monitor_id();
             let mut monitor = CoreMonitor::new(
                 monitor_id,
                 Some(&output_name),
                 Rect::new(position.x, position.y, wl_mode.size.w, wl_mode.size.h),
                 &settings,
             );
-            let next_desktop_id = self
-                .wm
-                .monitors
-                .iter()
-                .flat_map(|m| m.desktops.iter().map(|d| d.id.0))
-                .max()
-                .unwrap_or(0)
-                + 1;
             monitor.add_desktop(bsp_core::desktop::Desktop::new(
-                bsp_core::id::DesktopId(next_desktop_id),
-                Some("I"),
+                self.wm.next_desktop_id(),
+                Some(bsp_core::id::DEFAULT_DESKTOP_NAME),
                 &settings,
             ));
             self.wm.add_monitor(monitor);
@@ -1461,6 +1452,9 @@ impl State<DrmData> {
 /// different handling — everything else (keyboard, buttons, axis) is
 /// identical and reused as-is from `crate::input`.
 fn process_input_event(state: &mut State<DrmData>, event: InputEvent<LibinputInputBackend>) {
+    // A key or click right after a command goes to what the command left
+    // focused and shown.
+    crate::shell::run_deferred_sync(state);
     // Any input may move the pointer, change focus or re-tile — and is
     // user activity for idle timers.
     state.backend_data.queue_redraw();

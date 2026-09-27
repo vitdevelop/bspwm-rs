@@ -1,0 +1,100 @@
+@monitor screen 1920x1080+0+0 Desktop
+> WMscreen:FDesktop:LT
+$ bspc monitor -d one two
+> desktop_rename 0x00200002 0x00200004 Desktop one
+> WMscreen:Fone:LT
+> WMscreen:Fone:LT
+> desktop_add 0x00200002 0x00200005 two
+> WMscreen:Fone:ftwo:LT
+$ window Alpha alpha
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_add 0x00200002 0x00200004 0x00000000 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x1066+6+6
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+$ window Beta beta
+> node_add 0x00200002 0x00200004 0x00400000 0x00600000
+> node_geometry 0x00200002 0x00200004 0x00400000 949x1066+6+6
+> node_geometry 0x00200002 0x00200004 0x00600000 949x1066+963+6
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ bspc config border_width
+1
+$ bspc config window_gap
+6
+$ bspc config split_ratio
+0.500000
+$ bspc config top_padding
+0
+$ bspc config focus_follows_pointer
+false
+$ bspc config single_monocle
+false
+$ bspc config borderless_monocle
+false
+$ bspc config gapless_monocle
+false
+$ bspc config automatic_scheme
+longest_side
+$ bspc config initial_polarity
+second_child
+$ bspc config directional_focus_tightness
+high
+$ bspc config removal_adjustment
+true
+$ bspc config normal_border_color
+#30302f
+$ bspc config focused_border_color
+#817f7f
+$ bspc config window_gap 12
+> node_geometry 0x00200002 0x00200004 0x00400000 940x1054+12+12
+> node_geometry 0x00200002 0x00200004 0x00600000 940x1054+966+12
+$ bspc config -d focused window_gap
+12
+$ bspc config -d focused window_gap 3
+> node_geometry 0x00200002 0x00200004 0x00400000 953x1072+3+3
+> node_geometry 0x00200002 0x00200004 0x00600000 954x1072+961+3
+$ bspc config window_gap
+12
+$ bspc config -m focused top_padding 20
+> node_geometry 0x00200002 0x00200004 0x00400000 953x1052+3+23
+> node_geometry 0x00200002 0x00200004 0x00600000 954x1052+961+23
+$ bspc config -m focused top_padding
+20
+$ bspc config -n focused border_width 5
+> node_geometry 0x00200002 0x00200004 0x00600000 946x1044+961+23
+$ bspc config -n focused border_width
+5
+$ bspc config border_width
+1
+$ bspc config split_ratio 0.4
+$ bspc config split_ratio 2
+! config: split_ratio: Invalid value: '2'.
+? exit 1
+$ bspc config nonexistent
+! config: Unknown setting: 'nonexistent'.
+? exit 1
+$ bspc config nonexistent 1
+! config: Unknown setting: 'nonexistent'.
+? exit 1
+$ bspc config single_monocle true
+> desktop_layout 0x00200002 0x00200005 monocle
+$ bspc node -c
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00400000
+> node_remove 0x00200002 0x00200004 0x00600000
+> desktop_layout 0x00200002 0x00200004 monocle
+> WMscreen:Oone:ftwo:LM
+> WMscreen:Oone:ftwo:LM:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 1912x1052+3+23
+$ bspc config single_monocle false
+> desktop_layout 0x00200002 0x00200004 tiled
+> WMscreen:Oone:ftwo:LT:TT:G
+> desktop_layout 0x00200002 0x00200005 tiled
+$ bspc query -T -d
+{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":3,"borderWidth":1,"focusedNodeId":4194304,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":3,"y":23,"width":1917,"height":1057},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":3,"y":23,"width":1912,"height":1052},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}}
+$ bspc wm -d
+{"focusedMonitorId":2097154,"clientsCount":1,"monitors":[{"name":"screen","id":2097154,"randrId":60,"wired":true,"stickyCount":0,"windowGap":12,"borderWidth":1,"focusedDesktopId":2097156,"padding":{"top":20,"right":0,"bottom":0,"left":0},"rectangle":{"x":0,"y":0,"width":1920,"height":1080},"desktops":[{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":3,"borderWidth":1,"focusedNodeId":4194304,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":3,"y":23,"width":1917,"height":1057},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":3,"y":23,"width":1912,"height":1052},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}},{"name":"two","id":2097157,"layout":"tiled","userLayout":"tiled","windowGap":12,"borderWidth":1,"focusedNodeId":0,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":null}]}],"focusHistory":[{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304}],"stackingList":[4194304]}

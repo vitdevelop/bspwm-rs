@@ -2,7 +2,8 @@
 //! loop: binds the socket, accepts connections, and for each request runs
 //! it through `bsp_ipc::exec::execute` (or handles `subscribe`/`quit`
 //! directly, which `execute` does not), reconciling the Wayland-visible
-//! state afterward via `crate::shell::sync_wayland_from_core`.
+//! state afterward via `crate::shell::sync_wayland_from_core` (deferred to the
+//! end of the event-loop turn, `State::request_sync`).
 //!
 //! bspwm's socket handling (`src/bspwm.c` `main()`) is a plain `select()`
 //! loop; this is the calloop equivalent, using `Generic` to drive
@@ -264,11 +265,13 @@ pub(crate) fn execute_and_broadcast<Bd: Backend + 'static>(state: &mut State<Bd>
     }
     // A command that only reads (`query`, `config KEY`) changed nothing: no
     // reconcile, no report, no redraw. Status bars poll `query` often.
-    if is_read_only(command) && events.is_empty() {
+    if command.is_read_only() && events.is_empty() {
         return reply;
     }
-    crate::shell::sync_wayland_from_core(state);
-    crate::input::warp_pointer_for_focus(state, focus_before);
+    // The windows follow the tree, and the pointer the focus, in the one sync
+    // at the end of this event-loop turn (or before the next input event), so
+    // a burst of commands in one turn reconciles once.
+    state.request_warp(focus_before);
     for event in &events {
         state.subscribers.broadcast_event(event);
     }
@@ -316,6 +319,7 @@ pub(crate) fn with_ops<Bd: Backend + 'static, R>(
     state.wm.sync_history();
     state.registry.sync_with(&state.wm);
     bsp_ipc::exec::push_layout_changes(&state.wm, &layouts, &mut events);
+    bsp_ipc::exec::push_geometry_changes(&mut state.wm, &state.registry, &mut events);
     broadcast_events(state, &events);
     // The operation may have raised a window (focus, state, layer): the
     // stacking is applied by the one sync at the end of the event-loop turn.
@@ -492,18 +496,7 @@ pub(crate) fn apply_hardware_now<Bd: Backend + 'static>(state: &mut State<Bd>) -
     result
 }
 
-/// Whether `command` cannot change anything: any `query`, a `config KEY` read,
-/// `wm -d`/`-g`.
-fn is_read_only(command: &Command) -> bool {
-    use bsp_ipc::command::WmAction;
-    match command {
-        Command::Query(_) => true,
-        Command::Config(c) => c.value.is_none(),
-        Command::Wm(actions) => actions.iter().all(|a| matches!(a, WmAction::DumpState | WmAction::GetStatus)),
-        _ => false,
-    }
-}
-
+/// Whether `command` is `wm -r`.
 fn requests_restart(command: &Command) -> bool {
     matches!(command, Command::Wm(actions) if actions.contains(&bsp_ipc::command::WmAction::Restart))
 }

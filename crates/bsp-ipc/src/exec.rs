@@ -52,6 +52,7 @@ pub fn execute<A: Adapter>(ctx: &mut ExecCtx<A>, cmd: &Command) -> (Reply, Vec<E
     ctx.wm.sync_history();
     // Splits made or freed by the command get and lose their ids.
     ctx.registry.sync_with(ctx.wm);
+    push_geometry_changes(ctx.wm, ctx.registry, &mut result.1);
     result
 }
 
@@ -117,9 +118,14 @@ fn resolve_monitor<A: Adapter>(
 /// to resolve reports either a syntax problem (unreachable here — the
 /// parser already rejected those) or, for `Unsupported`, a specific
 /// message; a bare `NoMatch` is bspwm's silent empty failure.
-fn resolve_err_reply(err: ResolveError) -> Reply {
+/// The reply for a selector that failed; `src` names the command and option,
+/// as bspwm's messages do.
+///
+/// bspwm: `src/messages.c` `handle_failure()`.
+fn resolve_err_reply(err: ResolveError, src: &str) -> Reply {
     match err {
         ResolveError::NoMatch => Reply::Fail(String::new()),
+        ResolveError::BadDescriptor(desc) => Reply::Fail(format!("{src}: Invalid descriptor found in '{desc}'.\n")),
         ResolveError::Unsupported(why) => Reply::Fail(format!("Not yet supported: {why}.\n")),
     }
 }
@@ -289,6 +295,39 @@ pub fn push_layout_changes(
     }
 }
 
+/// Reports `node_geometry` for every window whose rectangle (as its state
+/// shows it) is no longer where it was last put, and records the new one.
+/// Hidden windows too: bspwm lays them out like the others.
+///
+/// bspwm: `src/tree.c` `apply_layout()`, which compares with the window's
+/// geometry and reports each window it moves or resizes.
+pub fn push_geometry_changes(wm: &mut Wm, registry: &NodeRegistry, events: &mut Vec<Event>) {
+    for m in &mut wm.monitors {
+        let monitor = m.id.0;
+        let monitor_rect = m.rectangle;
+        for d in &mut m.desktops {
+            let desktop = d.id;
+            let t = &mut d.tree;
+            let mut leaf = t.first_extrema(t.root);
+            while let Some(n) = leaf {
+                leaf = t.next_leaf(Some(n), t.root);
+                let Some(c) = t.node_mut(n).client.as_mut() else { continue };
+                let r = if c.state == bsp_core::node::ClientState::Fullscreen { monitor_rect } else { c.shown_rectangle() };
+                if c.window_rectangle == Some(r) {
+                    continue;
+                }
+                c.window_rectangle = Some(r);
+                events.push(Event::NodeGeometry {
+                    monitor,
+                    desktop: desktop.0,
+                    node: registry.id_of(desktop, n).unwrap_or(0),
+                    geometry: r,
+                });
+            }
+        }
+    }
+}
+
 /// bspwm: `src/tree.c` `arrange()`, invoked via `crate::monitor::Monitor::arrange`.
 fn arrange<A: Adapter>(ctx: &mut ExecCtx<A>, c: Coordinates) {
     let settings = ctx.wm.settings.clone();
@@ -331,7 +370,7 @@ fn exec_node<A: Adapter>(
     let mut trg = match selector {
         Some(sel) => match resolve_node(ctx, reference, sel) {
             Ok(c) => c,
-            Err(e) => return (resolve_err_reply(e), Vec::new()),
+            Err(e) => return (resolve_err_reply(e, "node"), Vec::new()),
         },
         None => reference,
     };
@@ -346,7 +385,7 @@ fn exec_node<A: Adapter>(
                 let dst = match resolve_or_default(ctx, reference, sel.as_ref(), trg) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -f").into_message());
                         break 'actions;
                     }
                 };
@@ -359,7 +398,7 @@ fn exec_node<A: Adapter>(
                 let dst = match resolve_or_default(ctx, reference, sel.as_ref(), trg) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -a").into_message());
                         break 'actions;
                     }
                 };
@@ -372,7 +411,7 @@ fn exec_node<A: Adapter>(
                 let dst = match resolve_desktop(ctx, reference, sel) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -d").into_message());
                         break 'actions;
                     }
                 };
@@ -392,7 +431,7 @@ fn exec_node<A: Adapter>(
                 let m = match resolve_monitor(ctx, reference, sel) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -m").into_message());
                         break 'actions;
                     }
                 };
@@ -417,7 +456,7 @@ fn exec_node<A: Adapter>(
                 let dst = match resolve_node(ctx, reference, sel) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -n").into_message());
                         break 'actions;
                     }
                 };
@@ -437,7 +476,7 @@ fn exec_node<A: Adapter>(
                 let dst = match resolve_node(ctx, reference, sel) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "node -s").into_message());
                         break 'actions;
                     }
                 };
@@ -464,7 +503,8 @@ fn exec_node<A: Adapter>(
                 }
                 let default_ratio = ctx.wm.settings.split_ratio;
                 match arg {
-                    PreselDirArg::Cancel => {
+                    // bspwm: `cancel_presel()` reports only a preselection it removed.
+                    PreselDirArg::Cancel if t.node(n).presel.is_some() => {
                         tree_mut(ctx.wm, trg).cancel_presel(n);
                         events.push(Event::NodePresel {
                             monitor: monitor_wire_id(ctx.wm, trg.monitor),
@@ -473,6 +513,7 @@ fn exec_node<A: Adapter>(
                             detail: PreselDetail::Cancel,
                         });
                     }
+                    PreselDirArg::Cancel => {}
                     PreselDirArg::Set(dir, alternate) => {
                         let cancel =
                             *alternate && t.node(n).presel.is_some_and(|p| p.split_dir == *dir);
@@ -529,6 +570,9 @@ fn exec_node<A: Adapter>(
                 // succeeds for a non-tiled node, so this always fires
                 // together with it.
                 if let Some(geometry) = tree(ctx.wm, trg).node(n).client.as_ref().map(|c| c.floating_rectangle) {
+                    if let Some(c) = tree_mut(ctx.wm, trg).node_mut(n).client.as_mut() {
+                        c.window_rectangle = Some(geometry);
+                    }
                     events.push(Event::NodeGeometry {
                         monitor: monitor_wire_id(ctx.wm, trg.monitor),
                         desktop: desktop_id(ctx.wm, trg).0,
@@ -562,6 +606,9 @@ fn exec_node<A: Adapter>(
                     .filter(|c| c.state == bsp_core::node::ClientState::Floating)
                     .map(|c| c.floating_rectangle)
                 {
+                    if let Some(c) = tree_mut(ctx.wm, trg).node_mut(n).client.as_mut() {
+                        c.window_rectangle = Some(geometry);
+                    }
                     events.push(Event::NodeGeometry {
                         monitor: monitor_wire_id(ctx.wm, trg.monitor),
                         desktop: desktop_id(ctx.wm, trg).0,
@@ -680,11 +727,13 @@ fn exec_node<A: Adapter>(
             }
             NodeAction::InsertReceptacle => {
                 let settings = ctx.wm.settings.clone();
+                let before = presels_before_insert(ctx, trg, trg.node, &mut events);
                 let t = tree_mut(ctx.wm, trg);
                 let r = t.new_node(&settings);
                 t.insert_node(&settings, r, trg.node);
                 let d = desktop_id(ctx.wm, trg);
                 ctx.registry.register_with_split(d, tree(ctx.wm, trg), r);
+                push_consumed_presels(ctx, trg, &before, &mut events);
                 // bspwm: `insert_receptacle()` reports `node_add`.
                 events.push(Event::NodeAdd {
                     monitor: monitor_wire_id(ctx.wm, trg.monitor),
@@ -738,65 +787,10 @@ fn exec_node<A: Adapter>(
                     AlterState::Toggle => !current,
                     AlterState::Set(b) => *b,
                 };
-                let flag_name = match key {
-                    NodeFlagKey::Hidden => {
-                        let held_focus = {
-                            let t = tree(ctx.wm, trg);
-                            t.is_descendant(t.focus, Some(n))
-                        };
-                        tree_mut(ctx.wm, trg).set_hidden(n, value);
-                        changed = true;
-                        // bspwm: the desktop's focus moves off a node that was
-                        // just hidden, and lands on the next focusable one.
-                        if held_focus || tree(ctx.wm, trg).focus.is_none() {
-                            tree_mut(ctx.wm, trg).focus = None;
-                            let desk = Coordinates { node: None, ..trg };
-                            if is_focused_desktop(ctx.wm, trg) {
-                                focus_node(ctx, desk, &mut events);
-                            } else {
-                                activate_node(ctx, desk, &mut events);
-                            }
-                        }
-                        "hidden"
-                    }
-                    NodeFlagKey::Sticky => {
-                        // bspwm: `set_sticky()` first brings a node on a desktop
-                        // that is not shown to the one its monitor shows.
-                        if value != current && !is_focused_desktop_of_its_monitor(ctx.wm, trg) {
-                            if let Some(desktop) = ctx.wm.monitors[trg.monitor].focused {
-                                let dst = Coordinates { monitor: trg.monitor, desktop, node: None };
-                                let anchor = tree(ctx.wm, dst).focus;
-                                if let Ok(moved) = transfer_node_unchecked(ctx, trg, dst, anchor, false, &mut events) {
-                                    trg = moved;
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if let Some(n) = trg.node {
-                            tree_mut(ctx.wm, trg).set_sticky(n, value);
-                        }
-                        "sticky"
-                    }
-                    NodeFlagKey::Private => {
-                        tree_mut(ctx.wm, trg).set_private(n, value);
-                        "private"
-                    }
-                    NodeFlagKey::Locked => {
-                        tree_mut(ctx.wm, trg).set_locked(n, value);
-                        "locked"
-                    }
-                    NodeFlagKey::Marked => {
-                        tree_mut(ctx.wm, trg).set_marked(n, value);
-                        "marked"
-                    }
-                };
-                events.push(Event::NodeFlag {
-                    monitor: monitor_wire_id(ctx.wm, trg.monitor),
-                    desktop: desktop_id(ctx.wm, trg).0,
-                    node: wid(ctx, trg),
-                    flag: flag_name,
-                    on: value,
-                });
+                if value != current {
+                    trg = set_flag_reporting(ctx, trg, *key, value, &mut events);
+                    changed = true;
+                }
             }
             NodeAction::SetLayer(layer) => {
                 let Some(n) = trg.node else {
@@ -843,7 +837,7 @@ fn exec_node<A: Adapter>(
                     break 'actions;
                 };
                 if tree(ctx.wm, trg).is_receptacle(n) {
-                    remove_receptacle(ctx, trg, n, &mut events);
+                    remove_node_reporting(ctx, trg, n, &mut events);
                     changed = true;
                 } else {
                     for window in subtree_windows(tree(ctx.wm, trg), n) {
@@ -899,6 +893,241 @@ pub fn resolve_rule_target<A: Adapter>(ctx: &ExecCtx<A>, csq: &bsp_core::rules::
         return Some(Coordinates { node: tree(ctx.wm, c).focus, ..c });
     }
     None
+}
+
+/// A window about to be managed, as only the window system can describe it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewWindow {
+    /// Its id (already known to the adapter, with its class and instance).
+    pub window: WindowId,
+    /// The geometry it has of its own (an X11 window's, bspwm's
+    /// `initialize_floating_rectangle()`); `None` for a Wayland window, which
+    /// has none before its first configure.
+    pub geometry: Option<bsp_core::geometry::Rect>,
+    /// Its ICCCM `WM_NORMAL_HINTS` or xdg min/max size.
+    pub size_hints: bsp_core::node::SizeHints,
+}
+
+/// Puts a new window into the tree, as bspwm's `manage_window()` does from the
+/// rule target on: the node goes next to the target's focused node (after the
+/// rule's `split_dir`/`split_ratio` preselect it), gets the rule's state,
+/// layer and flags, is arranged, reported (`node_add`), and focused, activated
+/// or stacked. The `manage=off` branch and EWMH struts stay with the caller,
+/// as does showing it. Returns where it went, `None` when there is no focused
+/// desktop to put it on.
+///
+/// bspwm: `src/window.c` `manage_window()`.
+pub fn manage_window<A: Adapter>(
+    ctx: &mut ExecCtx<A>,
+    new: &NewWindow,
+    csq: &bsp_core::rules::RuleConsequence,
+    events: &mut Vec<Event>,
+) -> Option<Coordinates> {
+    let mi = ctx.wm.focused_monitor?;
+    let di = ctx.wm.monitors[mi].focused?;
+    // `monitor=`/`desktop=`/`node=` name where it goes; a sticky one stays on
+    // the focused desktop.
+    let trg = resolve_rule_target(ctx, csq).unwrap_or(Coordinates {
+        monitor: mi,
+        desktop: di,
+        node: ctx.wm.monitors[mi].desktops[di].tree.focus,
+    });
+    let settings = ctx.wm.settings.clone();
+    let desktop_border_width = ctx.wm.monitors[trg.monitor].desktops[trg.desktop].border_width;
+    let monitor_rect = ctx.wm.monitors[trg.monitor].rectangle;
+    let d = desktop_id(ctx.wm, trg);
+
+    if let Some(f) = trg.node {
+        let at = Coordinates { node: Some(f), ..trg };
+        if let Some(dir) = csq.split_dir {
+            tree_mut(ctx.wm, trg).presel_dir(f, dir, settings.split_ratio);
+            events.push(Event::NodePresel { monitor: monitor_wire_id(ctx.wm, trg.monitor), desktop: d.0, node: wid(ctx, at), detail: PreselDetail::Dir(dir) });
+        }
+        if let Some(ratio) = csq.split_ratio {
+            // `presel_ratio()` defaults to east when nothing is preselected.
+            tree_mut(ctx.wm, trg).presel_ratio(f, ratio, Direction::East);
+            events.push(Event::NodePresel { monitor: monitor_wire_id(ctx.wm, trg.monitor), desktop: d.0, node: wid(ctx, at), detail: PreselDetail::Ratio(ratio) });
+        }
+    }
+    let border_width = if csq.should_border() { desktop_border_width } else { 0 };
+    let mut client = bsp_core::node::Client::new(new.window, border_width);
+    client.size_hints = new.size_hints;
+    client.window_rectangle = new.geometry;
+    let mut center = csq.should_center();
+    if let Some(geometry) = new.geometry {
+        client.floating_rectangle = geometry;
+    }
+    if let Some(rect) = csq.rect {
+        client.floating_rectangle = rect;
+    } else if new.geometry.is_some_and(|g| g.x == 0 && g.y == 0) {
+        // A window that asked for no position is centred.
+        center = true;
+    }
+    if new.geometry.is_some() || csq.rect.is_some() {
+        // `embrace_client()` and `adapt_geometry()`: brought inside the
+        // monitor it overlaps, then moved proportionally onto the target's.
+        let from = monitor_from_rect(ctx.wm, client.floating_rectangle).unwrap_or(monitor_rect);
+        embrace_rect(&mut client.floating_rectangle, from);
+        client.floating_rectangle = adapted_rect(client.floating_rectangle, from, monitor_rect);
+    }
+    if center && (new.geometry.is_some() || csq.rect.is_some()) {
+        center_rect(&mut client.floating_rectangle, monitor_rect, border_width);
+    }
+
+    let t = tree_mut(ctx.wm, trg);
+    let n = t.new_client_node(&settings, client);
+    if let (Some(honor), Some(c)) = (csq.honor_size_hints, t.node_mut(n).client.as_mut()) {
+        c.honor_size_hints = honor;
+    }
+    // Kept out of the tiling while it is inserted when it will not tile.
+    let will_not_tile = matches!(csq.state, Some(bsp_core::node::ClientState::Floating | bsp_core::node::ClientState::Fullscreen))
+        || csq.hidden == Some(true);
+    t.node_mut(n).vacant = will_not_tile;
+    let before = presels_before_insert(ctx, trg, trg.node, events);
+    let t = tree_mut(ctx.wm, trg);
+    let used_anchor = t.insert_node(&settings, n, trg.node);
+    t.node_mut(n).vacant = false;
+    ctx.registry.register(d, n);
+    // The split the insertion made needs an id too.
+    ctx.registry.sync_with(ctx.wm);
+    push_consumed_presels(ctx, trg, &before, events);
+    events.push(Event::NodeAdd {
+        monitor: monitor_wire_id(ctx.wm, trg.monitor),
+        desktop: d.0,
+        ip_id: used_anchor.and_then(|a| ctx.registry.id_of(d, a)).unwrap_or(0),
+        node: ctx.registry.id_of(d, n).unwrap_or(0),
+    });
+
+    let at = Coordinates { node: Some(n), ..trg };
+    // A Wayland window has no geometry of its own: it floats where it tiles,
+    // the slot computed before its state can make it vacant (a vacant node
+    // gets no tiled rectangle).
+    let seed_from_slot = new.geometry.is_none() && csq.rect.is_none();
+    if seed_from_slot {
+        ctx.wm.monitors[trg.monitor].arrange(trg.desktop, &settings);
+        if let Some(c) = tree_mut(ctx.wm, at).node_mut(n).client.as_mut() {
+            c.floating_rectangle = c.tiled_rectangle;
+        }
+    }
+    let t = tree_mut(ctx.wm, at);
+    // A floating window opened over a window takes that window's layer.
+    if csq.state == Some(bsp_core::node::ClientState::Floating) {
+        if let Some(layer) = used_anchor.and_then(|a| t.node(a).client.as_ref()).map(|c| c.layer) {
+            if let Some(c) = t.node_mut(n).client.as_mut() {
+                c.layer = layer;
+            }
+        }
+    }
+    if let Some(layer) = csq.layer {
+        t.set_layer(n, layer);
+    }
+    if let Some(state) = csq.state {
+        set_state_reporting(ctx, at, state, events);
+    }
+    if seed_from_slot && center {
+        if let Some(c) = tree_mut(ctx.wm, at).node_mut(n).client.as_mut().filter(|c| !c.state.is_tiled()) {
+            center_rect(&mut c.floating_rectangle, monitor_rect, border_width);
+        }
+    }
+    // A new node's flags are all off: only those the rule turns on change.
+    let mut at = at;
+    for (key, value) in [
+        (NodeFlagKey::Hidden, csq.hidden),
+        (NodeFlagKey::Sticky, csq.sticky),
+        (NodeFlagKey::Private, csq.private),
+        (NodeFlagKey::Locked, csq.locked),
+        (NodeFlagKey::Marked, csq.marked),
+    ] {
+        if value == Some(true) {
+            at = set_flag_reporting(ctx, at, key, true, events);
+        }
+    }
+    ctx.wm.monitors[at.monitor].arrange(at.desktop, &settings);
+
+    if csq.hidden != Some(true) && csq.should_focus() {
+        if is_focused_desktop(ctx.wm, at) || csq.should_follow() {
+            focus_node(ctx, at, events);
+        } else {
+            activate_node(ctx, at, events);
+        }
+    } else {
+        // Not focused: the bottom of its level.
+        stack_node(ctx, at, false, events);
+    }
+    Some(at)
+}
+
+/// Takes a closed window's node out of the tree (`node_remove`), refocuses its
+/// desktop if it held the focus, and re-arranges the desktop. Returns where it
+/// was, `None` when it was not in the tree.
+///
+/// bspwm: `src/window.c` `unmanage_window()`.
+pub fn unmanage_window<A: Adapter>(ctx: &mut ExecCtx<A>, window: WindowId, events: &mut Vec<Event>) -> Option<Coordinates> {
+    let at = locate_window(ctx.wm, window)?;
+    let n = at.node?;
+    remove_node_reporting(ctx, at, n, events);
+    let settings = ctx.wm.settings.clone();
+    ctx.wm.monitors[at.monitor].arrange(at.desktop, &settings);
+    Some(at)
+}
+
+/// Where `window`'s node is.
+fn locate_window(wm: &Wm, window: WindowId) -> Option<Coordinates> {
+    wm.monitors.iter().enumerate().find_map(|(mi, m)| {
+        m.desktops.iter().enumerate().find_map(|(di, d)| {
+            node_of_window(&d.tree, window).map(|n| Coordinates { monitor: mi, desktop: di, node: Some(n) })
+        })
+    })
+}
+
+/// The rectangle of the monitor that holds `r`'s centre, or else the nearest
+/// one (bspwm: `monitor_from_client()`).
+fn monitor_from_rect(wm: &Wm, r: bsp_core::geometry::Rect) -> Option<bsp_core::geometry::Rect> {
+    let (xc, yc) = (r.x + r.width / 2, r.y + r.height / 2);
+    let rects = wm.monitors.iter().map(|m| m.rectangle);
+    rects
+        .clone()
+        .find(|m| xc >= m.x && xc < m.x + m.width && yc >= m.y && yc < m.y + m.height)
+        .or_else(|| rects.min_by_key(|m| ((m.x + m.width / 2) - xc).abs() + ((m.y + m.height / 2) - yc).abs()))
+}
+
+/// Brings a rectangle lying wholly outside `m` back to its edge (bspwm:
+/// `embrace_client()`).
+fn embrace_rect(r: &mut bsp_core::geometry::Rect, m: bsp_core::geometry::Rect) {
+    if r.x + r.width <= m.x {
+        r.x = m.x;
+    } else if r.x >= m.x + m.width {
+        r.x = m.x + m.width - r.width;
+    }
+    if r.y + r.height <= m.y {
+        r.y = m.y;
+    } else if r.y >= m.y + m.height {
+        r.y = m.y + m.height - r.height;
+    }
+}
+
+/// `r` moved from monitor rectangle `from` onto `to` as `adapt_geometry()`
+/// moves a floating window.
+fn adapted_rect(r: bsp_core::geometry::Rect, from: bsp_core::geometry::Rect, to: bsp_core::geometry::Rect) -> bsp_core::geometry::Rect {
+    if from == to {
+        return r;
+    }
+    let mut t = Tree::new();
+    let mut client = bsp_core::node::Client::new(WindowId(0), 0);
+    client.floating_rectangle = r;
+    let n = t.new_client_node(&bsp_core::settings::Settings::default(), client);
+    t.root = Some(n);
+    bsp_core::monitor::adapt_geometry(&mut t, Some(n), from, to);
+    t.node(n).client.as_ref().map_or(r, |c| c.floating_rectangle)
+}
+
+/// Centres `r` in `a`, pinned to its top left when it does not fit (bspwm:
+/// `window_center()`).
+pub fn center_rect(r: &mut bsp_core::geometry::Rect, a: bsp_core::geometry::Rect, border_width: i32) {
+    r.x = if r.width >= a.width { a.x } else { a.x + (a.width - r.width) / 2 };
+    r.y = if r.height >= a.height { a.y } else { a.y + (a.height - r.height) / 2 };
+    r.x -= border_width;
+    r.y -= border_width;
 }
 
 /// Swaps desktop `a` with desktop `b` (on the same monitor or on two): they trade
@@ -1152,11 +1381,75 @@ fn subtree_windows(t: &Tree, n: NodeId) -> Vec<WindowId> {
     windows
 }
 
-/// Removes an empty receptacle at once (`node_remove`), and refocuses the
-/// desktop if it was the focused node.
+/// Splits `s` at the colons not escaped with a backslash, dropping the escapes.
+///
+/// bspwm: `src/helpers.c` `tokenize_with_escape()` with `COL_TOK`.
+fn split_escaped_colons(s: &str) -> Vec<String> {
+    let mut fields = vec![String::new()];
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let (Some(next), Some(field)) = (chars.next(), fields.last_mut()) {
+                    field.push(next);
+                }
+            }
+            ':' => fields.push(String::new()),
+            c => {
+                if let Some(field) = fields.last_mut() {
+                    field.push(c);
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// Before inserting at `anchor` in `desk`: the nodes that have a
+/// preselection, for [`push_consumed_presels`], including the one the
+/// insertion makes itself next to a private node (reported here as bspwm's
+/// `presel_dir()` reports it).
+fn presels_before_insert<A: Adapter>(ctx: &ExecCtx<A>, desk: Coordinates, anchor: Option<NodeId>, events: &mut Vec<Event>) -> Vec<NodeId> {
+    let t = tree(ctx.wm, desk);
+    let mut before: Vec<NodeId> = t.node_ids().into_iter().filter(|&n| t.node(n).presel.is_some()).collect();
+    if let Some(f) = anchor.or(t.root).filter(|&f| !t.is_receptacle(f)) {
+        if let (f, Some(dir)) = t.private_insertion(f) {
+            events.push(Event::NodePresel {
+                monitor: monitor_wire_id(ctx.wm, desk.monitor),
+                desktop: desktop_id(ctx.wm, desk).0,
+                node: wid(ctx, Coordinates { node: Some(f), ..desk }),
+                detail: PreselDetail::Dir(dir),
+            });
+            before.push(f);
+        }
+    }
+    before
+}
+
+/// Reports `node_presel ... cancel` for each of `before` (the desktop's
+/// preselected nodes before an insertion) whose preselection the insertion
+/// used up.
+///
+/// bspwm: `src/tree.c` `insert_node()` -> `cancel_presel()`.
+fn push_consumed_presels<A: Adapter>(ctx: &ExecCtx<A>, desk: Coordinates, before: &[NodeId], events: &mut Vec<Event>) {
+    let t = tree(ctx.wm, desk);
+    for &n in before {
+        if t.contains(n) && t.node(n).presel.is_none() {
+            events.push(Event::NodePresel {
+                monitor: monitor_wire_id(ctx.wm, desk.monitor),
+                desktop: desktop_id(ctx.wm, desk).0,
+                node: wid(ctx, Coordinates { node: Some(n), ..desk }),
+                detail: PreselDetail::Cancel,
+            });
+        }
+    }
+}
+
+/// Removes a node at once (`node_remove`): a closed window's, or an empty
+/// receptacle's; and refocuses the desktop if it was the focused node.
 ///
 /// bspwm: `src/tree.c` `kill_node()`'s receptacle branch, `remove_node()`.
-fn remove_receptacle<A: Adapter>(ctx: &mut ExecCtx<A>, trg: Coordinates, n: NodeId, events: &mut Vec<Event>) {
+fn remove_node_reporting<A: Adapter>(ctx: &mut ExecCtx<A>, trg: Coordinates, n: NodeId, events: &mut Vec<Event>) {
     let d = desktop_id(ctx.wm, trg);
     events.push(Event::NodeRemove {
         monitor: monitor_wire_id(ctx.wm, trg.monitor),
@@ -1207,6 +1500,88 @@ fn is_focused_desktop(wm: &Wm, c: Coordinates) -> bool {
     wm.focused_monitor == Some(c.monitor) && wm.monitors[c.monitor].focused == Some(c.desktop)
 }
 
+/// Sets one of a node's flags to `value` (it differs from the current one) and
+/// reports it (`node_flag`). Hiding the focused node moves the focus on;
+/// making a node on a desktop that is not shown sticky first brings it to the
+/// shown one, and the returned coordinates are where it is then.
+///
+/// bspwm: `src/tree.c` `set_hidden()`, `set_sticky()`, `set_private()`,
+/// `set_locked()`, `set_marked()`.
+fn set_flag_reporting<A: Adapter>(
+    ctx: &mut ExecCtx<A>,
+    mut trg: Coordinates,
+    key: NodeFlagKey,
+    value: bool,
+    events: &mut Vec<Event>,
+) -> Coordinates {
+    let Some(n) = trg.node else { return trg };
+    let flag = match key {
+        NodeFlagKey::Hidden => {
+            let held_focus = {
+                let t = tree(ctx.wm, trg);
+                t.is_descendant(t.focus, Some(n))
+            };
+            tree_mut(ctx.wm, trg).set_hidden(n, value);
+            events.push(Event::NodeFlag {
+                monitor: monitor_wire_id(ctx.wm, trg.monitor),
+                desktop: desktop_id(ctx.wm, trg).0,
+                node: wid(ctx, trg),
+                flag: "hidden",
+                on: value,
+            });
+            // The desktop's focus moves off a node that was just hidden, and
+            // lands on the next focusable one.
+            if held_focus || tree(ctx.wm, trg).focus.is_none() {
+                tree_mut(ctx.wm, trg).focus = None;
+                let desk = Coordinates { node: None, ..trg };
+                if is_focused_desktop(ctx.wm, trg) {
+                    focus_node(ctx, desk, events);
+                } else {
+                    activate_node(ctx, desk, events);
+                }
+            }
+            return trg;
+        }
+        NodeFlagKey::Sticky => {
+            // A node on a desktop that is not shown first goes to the one its
+            // monitor shows.
+            if !is_focused_desktop_of_its_monitor(ctx.wm, trg) {
+                if let Some(desktop) = ctx.wm.monitors[trg.monitor].focused {
+                    let dst = Coordinates { monitor: trg.monitor, desktop, node: None };
+                    let anchor = tree(ctx.wm, dst).focus;
+                    if let Ok(moved) = transfer_node_unchecked(ctx, trg, dst, anchor, false, events) {
+                        trg = moved;
+                    }
+                }
+            }
+            if let Some(n) = trg.node {
+                tree_mut(ctx.wm, trg).set_sticky(n, value);
+            }
+            "sticky"
+        }
+        NodeFlagKey::Private => {
+            tree_mut(ctx.wm, trg).set_private(n, value);
+            "private"
+        }
+        NodeFlagKey::Locked => {
+            tree_mut(ctx.wm, trg).set_locked(n, value);
+            "locked"
+        }
+        NodeFlagKey::Marked => {
+            tree_mut(ctx.wm, trg).set_marked(n, value);
+            "marked"
+        }
+    };
+    events.push(Event::NodeFlag {
+        monitor: monitor_wire_id(ctx.wm, trg.monitor),
+        desktop: desktop_id(ctx.wm, trg).0,
+        node: wid(ctx, trg),
+        flag,
+        on: value,
+    });
+    trg
+}
+
 /// Sets `node`'s client state to `target`, reporting the state left (`off`)
 /// and the state entered (`on`); returns `false` if nothing changed. Leaving
 /// floating or fullscreen on the desktop's focused node also lowers any
@@ -1239,9 +1614,14 @@ fn set_state_reporting<A: Adapter>(
     if matches!(previous, ClientState::Floating | ClientState::Fullscreen) && tree(ctx.wm, trg).focus == Some(n) {
         neutralize_occluding_windows(ctx, trg, events);
     }
-    // The new state has a new level: bspwm's `stack(d, n, d->focus == n)`.
-    let focused = tree(ctx.wm, trg).focus == Some(n);
-    stack_node(ctx, trg, focused, events);
+    // Entering or leaving floating or fullscreen changes the level: bspwm's
+    // `set_floating()`/`set_fullscreen()` call `stack(d, n, d->focus == n)`
+    // (tiled and pseudo-tiled share one level).
+    let leveled = |s: ClientState| matches!(s, ClientState::Floating | ClientState::Fullscreen);
+    if leveled(previous) || leveled(target) {
+        let focused = tree(ctx.wm, trg).focus == Some(n);
+        stack_node(ctx, trg, focused, events);
+    }
     true
 }
 
@@ -1576,6 +1956,7 @@ fn transfer_node_unchecked<A: Adapter>(
         dst_node: anchor_id,
     });
 
+    let preselected_before = presels_before_insert(ctx, dst, anchor, events);
     let new_node = if same_desktop {
         if !tree_mut(ctx.wm, src).transplant_within(&settings, n, anchor) {
             return Err(String::new());
@@ -1606,6 +1987,7 @@ fn transfer_node_unchecked<A: Adapter>(
 
     // The split the insertion made gets its id now, for this command's events.
     ctx.registry.register_with_split(dst_desktop, tree(ctx.wm, dst), new_node);
+    push_consumed_presels(ctx, dst, &preselected_before, events);
     let new_trg = Coordinates { monitor: dst.monitor, desktop: dst.desktop, node: Some(new_node) };
     // bspwm: `stack(dd, ns, false)`.
     stack_node(ctx, new_trg, false, events);
@@ -1785,7 +2167,7 @@ fn exec_desktop<A: Adapter>(
     let mut trg = match selector {
         Some(sel) => match resolve_desktop(ctx, reference, sel) {
             Ok(c) => c,
-            Err(e) => return (resolve_err_reply(e), Vec::new()),
+            Err(e) => return (resolve_err_reply(e, "desktop"), Vec::new()),
         },
         None => reference,
     };
@@ -1800,7 +2182,7 @@ fn exec_desktop<A: Adapter>(
                     Some(s) => match resolve_desktop(ctx, reference, s) {
                         Ok(c) => c,
                         Err(e) => {
-                            fail = Some(resolve_err_reply(e).into_message());
+                            fail = Some(resolve_err_reply(e, "desktop -f").into_message());
                             break 'actions;
                         }
                     },
@@ -1815,7 +2197,7 @@ fn exec_desktop<A: Adapter>(
                     Some(s) => match resolve_desktop(ctx, reference, s) {
                         Ok(c) => c,
                         Err(e) => {
-                            fail = Some(resolve_err_reply(e).into_message());
+                            fail = Some(resolve_err_reply(e, "desktop -a").into_message());
                             break 'actions;
                         }
                     },
@@ -1842,7 +2224,7 @@ fn exec_desktop<A: Adapter>(
                 let dst_mon = match resolve_monitor(ctx, reference, sel) {
                     Ok(c) => c.monitor,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "desktop -m").into_message());
                         break 'actions;
                     }
                 };
@@ -1859,7 +2241,7 @@ fn exec_desktop<A: Adapter>(
                 let dst = match resolve_desktop(ctx, reference, sel) {
                     Ok(c) => c,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "desktop -s").into_message());
                         break 'actions;
                     }
                 };
@@ -1896,18 +2278,7 @@ fn exec_desktop<A: Adapter>(
                     arrange(ctx, trg);
                 }
             }
-            DesktopAction::Rename(name) => {
-                let old_name = ctx.wm.monitors[trg.monitor].desktops[trg.desktop]
-                    .name
-                    .clone();
-                ctx.wm.monitors[trg.monitor].desktops[trg.desktop].rename(name);
-                events.push(Event::DesktopRename {
-                    monitor: monitor_wire_id(ctx.wm, trg.monitor),
-                    desktop: desktop_id(ctx.wm, trg).0,
-                    old_name,
-                    new_name: name.clone(),
-                });
-            }
+            DesktopAction::Rename(name) => rename_desktop(ctx, trg, name, &mut events),
             DesktopAction::Bubble(cyc) => {
                 // bspwm: swap with the neighbour, one step at a time; past the
                 // end it keeps swapping until the desktop is at the other end.
@@ -1944,6 +2315,54 @@ fn exec_desktop<A: Adapter>(
     (reply, events)
 }
 
+/// Renames a desktop, reporting it even when the name is the same.
+///
+/// bspwm: `src/desktop.c` `rename_desktop()`.
+fn rename_desktop<A: Adapter>(ctx: &mut ExecCtx<A>, trg: Coordinates, name: &str, events: &mut Vec<Event>) {
+    let old_name = ctx.wm.monitors[trg.monitor].desktops[trg.desktop].name.clone();
+    events.push(Event::DesktopRename {
+        monitor: monitor_wire_id(ctx.wm, trg.monitor),
+        desktop: desktop_id(ctx.wm, trg).0,
+        old_name,
+        new_name: name.to_owned(),
+    });
+    ctx.wm.monitors[trg.monitor].desktops[trg.desktop].rename(name);
+}
+
+/// Appends a new desktop to monitor `m` (`desktop_add`).
+///
+/// bspwm: `src/desktop.c` `add_desktop(m, make_desktop(name, XCB_NONE))`.
+fn add_desktop<A: Adapter>(ctx: &mut ExecCtx<A>, m: usize, name: &str, events: &mut Vec<Event>) {
+    let settings = ctx.wm.settings.clone();
+    let id = ctx.wm.next_desktop_id();
+    events.push(Event::DesktopAdd { monitor: monitor_wire_id(ctx.wm, m), desktop: id.0, name: name.to_owned() });
+    ctx.wm.monitors[m].add_desktop(Desktop::new(id, Some(name), &settings));
+}
+
+/// Removes an (emptied) desktop (`desktop_remove`); a monitor left without
+/// its shown desktop shows another one.
+///
+/// bspwm: `src/desktop.c` `remove_desktop()`.
+fn remove_desktop<A: Adapter>(ctx: &mut ExecCtx<A>, trg: Coordinates, events: &mut Vec<Event>) {
+    let m = trg.monitor;
+    let id = ctx.wm.monitors[m].desktops[trg.desktop].id;
+    let was_shown = ctx.wm.monitors[m].focused == Some(trg.desktop);
+    events.push(Event::DesktopRemove { monitor: monitor_wire_id(ctx.wm, m), desktop: id.0 });
+    ctx.wm.monitors[m].remove_desktop(trg.desktop);
+    if was_shown {
+        if let Some(next) = desktop_after_removal(ctx.wm, m, id) {
+            ctx.wm.monitors[m].focused = Some(next);
+            let shown = Coordinates { monitor: m, desktop: next, node: None };
+            let shown = Coordinates { node: tree(ctx.wm, shown).focus, ..shown };
+            if ctx.wm.focused_monitor == Some(m) {
+                focus_node(ctx, shown, events);
+            } else {
+                activate_node(ctx, shown, events);
+            }
+        }
+    }
+}
+
 // ======================= monitor =======================
 
 fn exec_monitor<A: Adapter>(
@@ -1960,7 +2379,7 @@ fn exec_monitor<A: Adapter>(
     let trg = match selector {
         Some(sel) => match resolve_monitor(ctx, reference, sel) {
             Ok(c) => c,
-            Err(e) => return (resolve_err_reply(e), Vec::new()),
+            Err(e) => return (resolve_err_reply(e, "monitor"), Vec::new()),
         },
         None => reference,
     };
@@ -1976,7 +2395,7 @@ fn exec_monitor<A: Adapter>(
                     Some(s) => match resolve_monitor(ctx, reference, s) {
                         Ok(c) => c.monitor,
                         Err(e) => {
-                            fail = Some(resolve_err_reply(e).into_message());
+                            fail = Some(resolve_err_reply(e, "monitor -f").into_message());
                             break 'actions;
                         }
                     },
@@ -1993,7 +2412,7 @@ fn exec_monitor<A: Adapter>(
                 let dst_monitor = match resolve_monitor(ctx, reference, sel) {
                     Ok(c) => c.monitor,
                     Err(e) => {
-                        fail = Some(resolve_err_reply(e).into_message());
+                        fail = Some(resolve_err_reply(e, "monitor -s").into_message());
                         break 'actions;
                     }
                 };
@@ -2007,69 +2426,51 @@ fn exec_monitor<A: Adapter>(
                 trg_monitor = dst_monitor;
             }
             MonitorAction::AddDesktops(names) => {
-                let settings = ctx.wm.settings.clone();
                 for name in names {
-                    let id = bsp_core::id::DesktopId(next_desktop_id(ctx.wm));
-                    ctx.wm.monitors[trg_monitor].add_desktop(Desktop::new(
-                        id,
-                        Some(name),
-                        &settings,
-                    ));
-                    events.push(Event::DesktopAdd {
-                        monitor: monitor_wire_id(ctx.wm, trg_monitor),
-                        desktop: id.0,
-                        name: name.clone(),
-                    });
+                    add_desktop(ctx, trg_monitor, name, &mut events);
                 }
             }
             MonitorAction::ReorderDesktops(names) => {
-                let mut order = Vec::new();
-                for name in names {
-                    if let Some(idx) = ctx.wm.monitors[trg_monitor]
-                        .desktops
-                        .iter()
-                        .position(|d| &d.name == name)
-                    {
-                        order.push(idx);
-                    }
-                }
-                let desktops = &mut ctx.wm.monitors[trg_monitor].desktops;
-                let mut reordered: Vec<Desktop> =
-                    order.iter().map(|&i| desktops[i].clone()).collect();
-                let mut rest: Vec<Desktop> = desktops
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !order.contains(i))
-                    .map(|(_, d)| d.clone())
-                    .collect();
-                reordered.append(&mut rest);
-                *desktops = reordered;
-            }
-            MonitorAction::ResetDesktops(names) => {
-                let settings = ctx.wm.settings.clone();
-                let existing = ctx.wm.monitors[trg_monitor].desktops.len();
-                for (i, name) in names.iter().enumerate() {
-                    if i < existing {
-                        ctx.wm.monitors[trg_monitor].desktops[i].rename(name);
-                    } else {
-                        let id = bsp_core::id::DesktopId(next_desktop_id(ctx.wm));
-                        ctx.wm.monitors[trg_monitor].add_desktop(Desktop::new(
-                            id,
-                            Some(name),
-                            &settings,
-                        ));
-                    }
-                }
-                while ctx.wm.monitors[trg_monitor].desktops.len() > names.len().max(1) {
-                    let last = ctx.wm.monitors[trg_monitor].desktops.len() - 1;
-                    if ctx.wm.monitors[trg_monitor].desktops[last]
-                        .tree
-                        .root
-                        .is_some()
-                    {
+                // Position by position, the desktop there trades places with
+                // the one named (bspwm swaps them, reporting each swap).
+                for (p, name) in names.iter().enumerate() {
+                    if p >= ctx.wm.monitors[trg_monitor].desktops.len() {
                         break;
                     }
-                    ctx.wm.monitors[trg_monitor].remove_desktop(last);
+                    let Some(q) = ctx.wm.monitors[trg_monitor].desktops.iter().position(|d| &d.name == name) else {
+                        continue;
+                    };
+                    if q != p {
+                        let at = |desktop| Coordinates { monitor: trg_monitor, desktop, node: None };
+                        swap_desktops(ctx, at(p), at(q), false, &mut events);
+                    }
+                }
+            }
+            MonitorAction::ResetDesktops(names) => {
+                // The first desktops take the names, more are added, and the
+                // rest go, their windows onto the focused desktop.
+                let count = ctx.wm.monitors[trg_monitor].desktops.len();
+                let renamed = names.len().min(count);
+                for (i, name) in names.iter().take(renamed).enumerate() {
+                    rename_desktop(ctx, Coordinates { monitor: trg_monitor, desktop: i, node: None }, name, &mut events);
+                }
+                for name in &names[renamed..] {
+                    add_desktop(ctx, trg_monitor, name, &mut events);
+                }
+                for _ in renamed..count {
+                    let gone = Coordinates { monitor: trg_monitor, desktop: renamed, node: None };
+                    if is_focused_desktop(ctx.wm, gone) {
+                        let prev = Coordinates { desktop: renamed - 1, ..gone };
+                        focus_node(ctx, Coordinates { node: tree(ctx.wm, prev).focus, ..prev }, &mut events);
+                    }
+                    if let Some(root) = tree(ctx.wm, gone).root {
+                        if let Some(dst) = focused_coords(ctx) {
+                            let dst = Coordinates { node: None, ..dst };
+                            let anchor = tree(ctx.wm, dst).focus;
+                            let _ = transfer_node_unchecked(ctx, Coordinates { node: Some(root), ..gone }, dst, anchor, false, &mut events);
+                        }
+                    }
+                    remove_desktop(ctx, gone, &mut events);
                 }
             }
             MonitorAction::Remove => {
@@ -2095,6 +2496,11 @@ fn exec_monitor<A: Adapter>(
                 trg_monitor = set_monitor_rectangle(ctx, trg_monitor, *r, &mut events);
             }
             MonitorAction::Rename(name) => {
+                events.push(Event::MonitorRename {
+                    id: monitor_wire_id(ctx.wm, trg_monitor),
+                    old_name: ctx.wm.monitors[trg_monitor].name.clone(),
+                    new_name: name.clone(),
+                });
                 ctx.wm.monitors[trg_monitor].rename(name);
             }
         }
@@ -2105,19 +2511,6 @@ fn exec_monitor<A: Adapter>(
         None => Reply::Ok(String::new()),
     };
     (reply, events)
-}
-
-fn next_desktop_id(wm: &Wm) -> u32 {
-    wm.monitors
-        .iter()
-        .flat_map(|m| m.desktops.iter().map(|d| d.id.0))
-        .max()
-        .unwrap_or(0)
-        + 1
-}
-
-fn next_monitor_id(wm: &Wm) -> u32 {
-    wm.monitors.iter().map(|m| m.id.0).max().unwrap_or(0) + 1
 }
 
 // ======================= query =======================
@@ -2132,21 +2525,21 @@ fn exec_query<A: Adapter>(ctx: &mut ExecCtx<A>, q: &QueryCommand) -> Reply {
     let monitor_ref = match &q.monitor_ref {
         Some(sel) => match resolve_monitor(ctx, focused, sel) {
             Ok(c) => c,
-            Err(e) => return resolve_err_reply(e),
+            Err(e) => return resolve_err_reply(e, "query -M"),
         },
         None => focused,
     };
     let desktop_ref = match &q.desktop_ref {
         Some(sel) => match resolve_desktop(ctx, focused, sel) {
             Ok(c) => c,
-            Err(e) => return resolve_err_reply(e),
+            Err(e) => return resolve_err_reply(e, "query -D"),
         },
         None => Coordinates { node: None, ..focused },
     };
     let node_ref = match &q.node_ref {
         Some(sel) => match resolve_node(ctx, focused, sel) {
             Ok(c) => c,
-            Err(e) => return resolve_err_reply(e),
+            Err(e) => return resolve_err_reply(e, "query -N"),
         },
         None => focused,
     };
@@ -2157,18 +2550,18 @@ fn exec_query<A: Adapter>(ctx: &mut ExecCtx<A>, q: &QueryCommand) -> Reply {
         match target {
             QueryTarget::Monitor(Some(sel)) => match resolve_monitor(ctx, monitor_ref, sel) {
                 Ok(c) => trg_monitor = Some(c.monitor),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "query -m"),
             },
             QueryTarget::Monitor(None) => (trg_monitor, trg_desktop, trg_node) = (Some(monitor_ref.monitor), None, None),
             QueryTarget::Desktop(Some(sel)) => match resolve_desktop(ctx, desktop_ref, sel) {
                 Ok(c) => (trg_monitor, trg_desktop) = (Some(c.monitor), Some(c.desktop)),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "query -d"),
             },
             QueryTarget::Desktop(None) => (trg_monitor, trg_desktop, trg_node) = (Some(desktop_ref.monitor), Some(desktop_ref.desktop), None),
             QueryTarget::Node(Some(sel)) => match resolve_node(ctx, node_ref, sel) {
                 Ok(c) if c.node.is_some() => (trg_monitor, trg_desktop, trg_node) = (Some(c.monitor), Some(c.desktop), c.node),
                 Ok(_) => return Reply::Fail(String::new()),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "query -n"),
             },
             QueryTarget::Node(None) => {
                 // bspwm: `trg = node_ref`, and nothing focused fails.
@@ -2256,9 +2649,13 @@ fn exec_query<A: Adapter>(ctx: &mut ExecCtx<A>, q: &QueryCommand) -> Reply {
             let json = match (trg_desktop, trg_node) {
                 (Some(di), Some(n)) => {
                     let d = &ctx.wm.monitors[mi].desktops[di];
-                    serde_json::to_string(&JsonNode::from_tree(&d.tree, d.id, n, &node_id, &names))
+                    let shown = ctx.wm.monitors[mi].focused == Some(di);
+                    serde_json::to_string(&JsonNode::from_tree(&d.tree, d.id, n, shown, &node_id, &names))
                 }
-                (Some(di), None) => serde_json::to_string(&JsonDesktop::from_desktop(&ctx.wm.monitors[mi].desktops[di], &node_id, &names)),
+                (Some(di), None) => {
+                    let shown = ctx.wm.monitors[mi].focused == Some(di);
+                    serde_json::to_string(&JsonDesktop::from_desktop(&ctx.wm.monitors[mi].desktops[di], shown, &node_id, &names))
+                }
                 _ => serde_json::to_string(&JsonMonitor::from_monitor(&ctx.wm.monitors[mi], &node_id, &names)),
             };
             return match json {
@@ -2315,11 +2712,14 @@ fn exec_rule<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[RuleAction]) -> Reply 
                             ctx.wm.rules.pop();
                         }
                         RuleRemoval::Cause(cause) => {
-                            ctx.wm.rules.retain(|r| {
-                                let full =
-                                    format!("{}:{}:{}", r.class_name, r.instance_name, r.name);
-                                &full != cause && &r.class_name != cause
-                            });
+                            // bspwm 0.9.12 needs all three fields: `CLASS` alone
+                            // or `CLASS:INSTANCE` removes nothing.
+                            if let [class, instance, name] = split_escaped_colons(cause).as_slice() {
+                                let matches = |want: &str, have: &str| want == "*" || want == have;
+                                ctx.wm.rules.retain(|r| {
+                                    !(matches(class, &r.class_name) && matches(instance, &r.instance_name) && matches(name, &r.name))
+                                });
+                            }
                         }
                     }
                 }
@@ -2388,14 +2788,14 @@ fn exec_wm<A: Adapter>(ctx: &mut ExecCtx<A>, actions: &[WmAction]) -> (Reply, Ve
                 break 'actions;
             }
             WmAction::AddMonitor(name, rect) => {
-                let id = bsp_core::id::MonitorId(next_monitor_id(ctx.wm));
+                let id = ctx.wm.next_monitor_id();
                 let settings = ctx.wm.settings.clone();
                 let mut m = Monitor::new(id, Some(name), *rect, &settings);
                 // No output shows it: it is kept like an unplugged monitor, and an
                 // output of that name that appears later shows it (`bspc output
                 // --create-headless` makes one that is shown for capture).
                 m.wired = false;
-                let did = bsp_core::id::DesktopId(next_desktop_id(ctx.wm));
+                let did = ctx.wm.next_desktop_id();
                 m.add_desktop(Desktop::new(did, None, &settings));
                 ctx.wm.add_monitor(m);
                 events.push(Event::MonitorAdd {
@@ -2543,7 +2943,7 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
             };
             match resolve_monitor(ctx, reference, sel) {
                 Ok(c) => Some(c),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "config -m"),
             }
         }
         ConfigTarget::Desktop(sel) => {
@@ -2553,7 +2953,7 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
             match resolve_desktop(ctx, reference, sel) {
                 // A desktop target names no node, whatever the reference had.
                 Ok(c) => Some(Coordinates { node: None, ..c }),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "config -d"),
             }
         }
         ConfigTarget::Node(sel) => {
@@ -2562,7 +2962,7 @@ fn exec_config<A: Adapter>(ctx: &mut ExecCtx<A>, c: &ConfigCommand) -> Reply {
             };
             match resolve_node(ctx, reference, sel) {
                 Ok(c) => Some(c),
-                Err(e) => return resolve_err_reply(e),
+                Err(e) => return resolve_err_reply(e, "config -n"),
             }
         }
     };
@@ -2781,10 +3181,24 @@ fn set_setting<A: Adapter>(
             };
         }
         "single_monocle" => {
-            ctx.wm.settings.single_monocle = match crate::value::parse_bool(value) {
-                Some(b) => b,
-                None => return Reply::Fail(format!("config: {name}: Invalid value: '{value}'.\n")),
+            let Some(b) = crate::value::parse_bool(value) else {
+                return Reply::Fail(format!("config: {name}: Invalid value: '{value}'.\n"));
             };
+            // bspwm refuses the value it already has, and otherwise puts every
+            // desktop in monocle (at most one tiled window) or its own layout.
+            if b == ctx.wm.settings.single_monocle {
+                return Reply::Fail(String::new());
+            }
+            ctx.wm.settings.single_monocle = b;
+            let settings = ctx.wm.settings.clone();
+            for m in &mut ctx.wm.monitors {
+                for di in 0..m.desktops.len() {
+                    let d = &mut m.desktops[di];
+                    let single = b && d.tree.tiled_count(d.tree.root, true) <= 1;
+                    d.layout = if single { bsp_core::desktop::Layout::Monocle } else { d.user_layout };
+                    m.arrange(di, &settings);
+                }
+            }
         }
         "normal_border_color" | "active_border_color" | "focused_border_color" | "presel_feedback_color" => {
             if !bsp_core::settings::is_hex_color(value) {
@@ -2966,7 +3380,8 @@ fn set_setting<A: Adapter>(
 fn get_setting<A: Adapter>(ctx: &ExecCtx<A>, target: Option<Coordinates>, monitor_level: bool, name: &str) -> Reply {
     let s = &ctx.wm.settings;
     let out = match name {
-        "split_ratio" => format!("{}", s.split_ratio),
+        // bspwm prints it with `%lf`.
+        "split_ratio" => format!("{:.6}", s.split_ratio),
         "window_gap" => match target {
             Some(c) if monitor_level => format!("{}", ctx.wm.monitors[c.monitor].window_gap),
             Some(c) => format!("{}", ctx.wm.monitors[c.monitor].desktops[c.desktop].window_gap),
@@ -3129,6 +3544,8 @@ mod tests {
         wm.add_monitor(m2);
         wm.focus_monitor(0);
         wm.monitors[0].focused = Some(0);
+        // The windows are where the layout put them (the compositor placed them).
+        push_geometry_changes(&mut wm, &registry, &mut Vec::new());
 
         let adapter = FakeAdapter::new();
         (wm, registry, adapter)
@@ -3618,12 +4035,23 @@ mod tests {
         assert_eq!(reply, Reply::Ok(String::new()));
         let ratio_after = wm.monitors[0].desktops[0].tree.node(root).split_ratio;
         assert!(ratio_after > ratio_before);
-        // A tiled resize re-arranges instead of reporting its own
-        // `node_geometry` event (bspwm: `resize_client()` only does
-        // that for `STATE_FLOATING`).
-        assert!(!events
+        // A tiled resize re-arranges, and the re-arrangement reports both
+        // windows it moved (bspwm: `apply_layout()`; `resize_client()` reports
+        // on its own only for `STATE_FLOATING`).
+        let moved: Vec<Rect> = events
             .iter()
-            .any(|e| matches!(e, Event::NodeGeometry { .. })));
+            .filter_map(|e| match e {
+                Event::NodeGeometry { geometry, .. } => Some(*geometry),
+                _ => None,
+            })
+            .collect();
+        let t = &wm.monitors[0].desktops[0].tree;
+        let shown: Vec<Rect> = [t.node(root).first_child(), t.node(root).second_child()]
+            .into_iter()
+            .flatten()
+            .filter_map(|n| t.node(n).client.as_ref().map(|c| c.shown_rectangle()))
+            .collect();
+        assert_eq!(moved, shown);
     }
 
     #[test]

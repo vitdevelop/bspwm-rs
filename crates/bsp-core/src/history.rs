@@ -86,6 +86,11 @@ impl Needle {
 pub(crate) struct Snapshot {
     /// Each desktop's focused window.
     pub(crate) desk_focus: HashMap<DesktopId, Option<WindowId>>,
+    /// Each monitor's shown desktop at the last sync.
+    pub(crate) shown: HashMap<crate::id::MonitorId, DesktopId>,
+    /// Whether a sync has run: the first one only records where things start
+    /// (bspwm records nothing for its initial desktop).
+    pub(crate) primed: bool,
     /// The globally focused monitor, desktop and node.
     pub(crate) global: Option<Loc>,
 }

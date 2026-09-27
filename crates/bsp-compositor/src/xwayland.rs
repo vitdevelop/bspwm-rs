@@ -101,6 +101,12 @@ pub struct XWaylandState {
     /// Windows managed without their properties because the X worker was too slow;
     /// a late answer only applies their struts.
     timed_out: std::collections::HashSet<u32>,
+    /// Windows still `Pending::Map` that asked for fullscreen (a game's
+    /// `_NET_WM_STATE_FULLSCREEN` request can arrive before the X worker's
+    /// answer finishes mapping them): applied as a map-time default instead of
+    /// dropped, so the window is sized full screen from its first frame rather
+    /// than tiled until a later retry request lands.
+    pending_fullscreen: std::collections::HashSet<u32>,
     /// X11 windows shown but not managed (override-redirect, menus, …).
     unmanaged: Vec<Window>,
     /// The desktop list last written on the root window (`publish_ewmh`).
@@ -296,7 +302,7 @@ fn handle_reply<Bd: Backend + 'static>(state: &mut State<Bd>, reply: Reply) {
             state.xwayland.emulated_asked.remove(&window);
             if state.xwayland.emulated.insert(window, size) != Some(size) {
                 // A fullscreen window may now have to be resized.
-                crate::shell::sync_wayland_from_core(state);
+                state.request_sync();
             }
         }
     }
@@ -499,7 +505,14 @@ fn finish_map<Bd: Backend + 'static>(state: &mut State<Bd>, window: X11Surface, 
         state.space.map_element(element.clone(), geometry.loc, true);
         state.xwayland.unmanaged.push(element);
     } else {
-        crate::shell::map_new_window(state, element, window.class(), window.instance(), window.title(), type_defaults(&window, &extra));
+        let mut consequence = type_defaults(&window, &extra);
+        // A fullscreen request that raced the map (`x11_state_request`) wins
+        // over the type/state defaults above, same as a window that already
+        // carried `_NET_WM_STATE_FULLSCREEN` when its properties were read.
+        if state.xwayland.pending_fullscreen.remove(&window.window_id()) {
+            consequence.state = Some(bsp_core::node::ClientState::Fullscreen);
+        }
+        crate::shell::map_new_window(state, element, window.class(), window.instance(), window.title(), consequence);
     }
     state.backend_data.queue_redraw();
 }
@@ -590,7 +603,7 @@ fn apply_struts<Bd: Backend + 'static>(state: &mut State<Bd>, struts: Option<bsp
                 state.wm.monitors[mi].arrange(di, &settings);
             }
         }
-        crate::shell::sync_wayland_from_core(state);
+        state.request_sync();
     }
 }
 
@@ -847,6 +860,7 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
         self.xwayland.emulated.remove(&window.window_id());
         self.xwayland.timed_out.remove(&window.window_id());
         self.xwayland.pending.remove(&window.window_id());
+        self.xwayland.pending_fullscreen.remove(&window.window_id());
         if let Some(element) = window_of(self, &window) {
             forget_window(self, &element);
         }
@@ -857,6 +871,7 @@ impl<Bd: Backend + 'static> XwmHandler for State<Bd> {
         self.xwayland.emulated.remove(&window.window_id());
         self.xwayland.timed_out.remove(&window.window_id());
         self.xwayland.pending.remove(&window.window_id());
+        self.xwayland.pending_fullscreen.remove(&window.window_id());
         if let Some(element) = window_of(self, &window) {
             forget_window(self, &element);
         }
@@ -1043,6 +1058,14 @@ impl<Bd: Backend + 'static> State<Bd> {
     fn x11_state_request(&mut self, window: &X11Surface, node_state: &str) {
         tracing::debug!(class = window.class(), node_state, "X11 window state request");
         let Some(id) = window_of(self, window).and_then(|el| self.adapter.id_of(&el)) else {
+            // Not managed yet: still waiting on the X worker's reply
+            // (`Pending::Map`). A fullscreen request this early is common (a
+            // game asks for it right after mapping, sometimes before our
+            // worker answers); remembered here and applied as a map-time
+            // default in `finish_map` instead of silently dropped.
+            if node_state == "fullscreen" && matches!(self.xwayland.pending.get(&window.window_id()), Some(Pending::Map(_))) {
+                self.xwayland.pending_fullscreen.insert(window.window_id());
+            }
             return;
         };
         let Some((mi, di, node)) = crate::input::locate_window(self, id) else {

@@ -1,0 +1,51 @@
+# `bspc query` in every option form (REVIEW4 P14): flags alone, `.MODIFIERS`,
+# `-M/-D/-N SEL` references, names, and the errors.
+bspc monitor -d one two three
+window Alpha alpha
+window Beta beta
+window Gamma gamma
+bspc node -t floating
+bspc query -M
+bspc query -M -m
+bspc query -M --names
+bspc query -M -d
+bspc query -M -n
+bspc query -D
+bspc query -D --names
+bspc query -D -d
+bspc query -D -m
+bspc query -D -n
+bspc query -D -d .occupied --names
+bspc query -D -d .!occupied --names
+bspc query -D -d ^2 --names
+bspc query -D -d focused --names
+bspc query -D -d next --names
+bspc query -D -d prev.!occupied --names
+bspc query -D -d nonexistent
+bspc query -N
+bspc query -N -n
+bspc query -N -n .window
+bspc query -N -n .floating
+bspc query -N -n .tiled
+bspc query -N -n .leaf
+bspc query -N -n .!leaf
+bspc query -N -n .hidden
+bspc query -N -d
+bspc query -N -d one
+bspc query -N -d two
+bspc query -N -m
+bspc query -N -n @/
+bspc query -N -n @/1
+bspc query -N -n @/2
+bspc query -N -n last
+bspc query -N -n biggest.window
+bspc query -N -n smallest.window
+bspc query -N -n west
+bspc query -N -n east
+bspc query -N -m -d one
+bspc query -M -m nonexistent
+bspc query
+bspc query -T -d
+bspc query -T -m
+bspc query -T -n
+bspc wm -d

@@ -108,6 +108,18 @@ impl Wm {
         }
     }
 
+    /// An id for a new monitor, above every monitor's.
+    pub fn next_monitor_id(&self) -> crate::id::MonitorId {
+        let max = self.monitors.iter().map(|m| m.id.0).max().unwrap_or(0);
+        crate::id::MonitorId(max.max(crate::id::FIRST_MONITOR_ID - 1) + 1)
+    }
+
+    /// An id for a new desktop, above every desktop's.
+    pub fn next_desktop_id(&self) -> crate::id::DesktopId {
+        let max = self.monitors.iter().flat_map(|m| m.desktops.iter().map(|d| d.id.0)).max().unwrap_or(0);
+        crate::id::DesktopId(max.max(crate::id::FIRST_DESKTOP_ID - 1) + 1)
+    }
+
     /// Gives a desktop whose focused node was just removed a new one: the
     /// most recently focused node still on it, else its first focusable leaf.
     /// Does nothing if the desktop still has a focused node or is empty.
@@ -163,7 +175,11 @@ impl Wm {
         let mut windows: HashMap<WindowId, (MonitorId, DesktopId)> = HashMap::new();
         let mut desktops: HashMap<DesktopId, MonitorId> = HashMap::new();
         let mut focus: Vec<(MonitorId, DesktopId, Option<WindowId>)> = Vec::new();
+        let mut shown: HashMap<MonitorId, DesktopId> = HashMap::new();
         for m in &self.monitors {
+            if let Some(d) = m.focused.and_then(|i| m.desktops.get(i)) {
+                shown.insert(m.id, d.id);
+            }
             for d in &m.desktops {
                 desktops.insert(d.id, m.id);
                 let mut n = d.tree.first_extrema(d.tree.root);
@@ -191,11 +207,18 @@ impl Wm {
 
         let mut snapshot = std::mem::take(&mut self.history.snapshot);
         snapshot.desk_focus.retain(|d, _| desktops.contains_key(d));
+        // The first sync records focused windows, not the desktop it starts on.
+        let primed = std::mem::replace(&mut snapshot.primed, true);
         for (m, d, f) in focus {
             let is_global = global.is_some_and(|g| g.monitor == m && g.desktop == d);
+            // bspwm records a desktop when it is shown (`activate_desktop()`,
+            // `focus_node()`), not when it is made.
+            let newly_shown = shown.get(&m) == Some(&d) && snapshot.shown.get(&m) != Some(&d);
+            if primed && newly_shown && !is_global {
+                self.history.add(Loc { monitor: m, desktop: d, node: None }, false);
+            }
             match snapshot.desk_focus.insert(d, f) {
                 None => {
-                    self.history.add(Loc { monitor: m, desktop: d, node: None }, false);
                     if let (Some(w), false) = (f, is_global) {
                         self.history.add(Loc { monitor: m, desktop: d, node: Some(w) }, false);
                     }
@@ -208,12 +231,13 @@ impl Wm {
                 Some(_) => {}
             }
         }
-        if let Some(g) = global {
+        if let Some(g) = global.filter(|g| primed || g.node.is_some()) {
             if snapshot.global != Some(g) {
                 self.history.add(g, true);
             }
         }
         snapshot.global = global;
+        snapshot.shown = shown;
         self.history.snapshot = snapshot;
     }
 

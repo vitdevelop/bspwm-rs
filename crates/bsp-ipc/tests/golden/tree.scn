@@ -1,0 +1,45 @@
+# Tree operations and their events: splits, presel, rotate, flip, balance,
+# swap, transfer between desktops, flags, layers, states, receptacles.
+bspc monitor -d one two
+window Alpha alpha
+window Beta beta
+bspc node -p south
+window Gamma gamma
+bspc query -T -d
+bspc node @/ -R 90
+bspc node @/ -F vertical
+bspc node @/ -B
+bspc node @/ -E
+bspc node -f west
+bspc node -s east
+bspc node -r 0.3
+bspc node @parent -r 0.7
+bspc node -z right 20 0
+bspc node -g locked
+bspc node -g locked
+bspc node -g marked=on
+bspc node -g private=on
+bspc node -g sticky=on
+bspc node -g sticky=off
+bspc node -l above
+bspc node -l normal
+bspc node -t fullscreen
+bspc node -t tiled
+bspc node -t pseudo_tiled
+bspc node -t ~tiled
+bspc node -d two
+bspc query -N -d two
+bspc desktop -f two
+bspc node -d one --follow
+bspc desktop -l monocle
+bspc desktop -l tiled
+bspc node -i
+bspc node @/ -i
+bspc query -N -n .leaf.!window
+bspc node -p cancel
+bspc node -p east -o 0.25
+bspc node -p cancel
+bspc node -c
+bspc node -k
+bspc query -T -d
+bspc wm -d

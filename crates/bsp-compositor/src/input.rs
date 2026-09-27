@@ -37,6 +37,9 @@ pub fn process_input_event<B: InputBackend, Bd: Backend + 'static>(
     event: InputEvent<B>,
     output: &Output,
 ) {
+    // A key or click right after a command goes to what the command left
+    // focused and shown.
+    crate::shell::run_deferred_sync(state);
     crate::protocols::notify_activity(state);
     match event {
         InputEvent::Keyboard { event } => {
@@ -567,15 +570,12 @@ pub(crate) fn set_focus<Bd: Backend + 'static>(
 ) {
     // bspwm's `focus_node()`: focus, urgent flag, occluding fullscreen windows,
     // and the `node_focus`/`desktop_focus`/`monitor_focus` events and report.
-    let was_shown = state.wm.focused_monitor == Some(mi) && state.wm.monitors[mi].focused == Some(di);
     let dst = bsp_ipc::exec::Coordinates { monitor: mi, desktop: di, node: Some(node) };
     if !crate::ipc::with_ops(state, |ctx, events| bsp_ipc::exec::focus_node(ctx, dst, events)) {
         return;
     }
-    if !was_shown {
-        // Another desktop came on screen: show its windows and hide the old ones.
-        crate::shell::sync_wayland_from_core(state);
-    }
+    // Another desktop may have come on screen: `with_ops` asked for the sync
+    // that shows its windows and hides the old ones.
     let Some(client) = state.wm.monitors[mi].desktops[di]
         .tree
         .node(node)

@@ -1,0 +1,27 @@
+# Desktops: add, rename, reorder, swap, remove, focus history.
+bspc monitor -d one two three
+window Alpha alpha
+bspc desktop -f two
+window Beta beta
+bspc desktop -f three
+bspc desktop -f last
+bspc desktop -f older
+bspc desktop -f newer
+bspc desktop -n uno
+bspc desktop two -n dos
+bspc query -D --names
+bspc monitor -a four
+bspc desktop four -m focused
+bspc desktop dos -s three
+bspc query -D --names
+bspc desktop uno -b next
+bspc query -D --names
+bspc desktop three -r
+bspc desktop four -r
+bspc query -D --names
+bspc desktop ^1 -f
+bspc desktop next.occupied -f
+bspc monitor -d a b
+bspc monitor -o x y z
+bspc query -D --names
+bspc wm -d

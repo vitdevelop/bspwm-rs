@@ -839,7 +839,7 @@ fn resolve_desktop_descriptor(
                     });
                 }
             }
-            Err(ResolveError::NoMatch)
+            Err(ResolveError::BadDescriptor(name.clone()))
         }
         DesktopDescriptor::Last | DesktopDescriptor::Older => history_desktop(ctx, reference, modifiers, Some(Dir::Older)),
         DesktopDescriptor::Newer => history_desktop(ctx, reference, modifiers, Some(Dir::Newer)),
@@ -981,7 +981,7 @@ fn resolve_monitor_descriptor(
                 .monitors
                 .iter()
                 .position(|m| &m.name == name)
-                .ok_or(ResolveError::NoMatch)?;
+                .ok_or_else(|| ResolveError::BadDescriptor(name.clone()))?;
             Ok(at_focused_desktop(ctx, idx))
         }
         MonitorDescriptor::Last | MonitorDescriptor::Older => history_monitor(ctx, reference, modifiers, Some(Dir::Older)),

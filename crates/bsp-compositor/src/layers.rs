@@ -146,7 +146,7 @@ impl<Bd: Backend + 'static> State<Bd> {
         for di in 0..self.wm.monitors[mi].desktops.len() {
             self.wm.monitors[mi].arrange(di, &settings);
         }
-        crate::shell::sync_wayland_from_core(self);
+        self.request_sync();
     }
 }
 

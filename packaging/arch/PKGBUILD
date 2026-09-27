@@ -6,7 +6,7 @@
 #   cd packaging/arch && makepkg -si
 #
 pkgname=bspwm-rs-git
-pkgver=0.1.0.r21.g35fb493
+pkgver=0.1.0.r24.gf9e6773
 pkgrel=1
 pkgdesc='A Wayland compositor that behaves like bspwm (Rust, Smithay)'
 arch=(x86_64)

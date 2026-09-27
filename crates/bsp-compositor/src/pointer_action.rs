@@ -801,11 +801,12 @@ impl<Bd: Backend + 'static> PointerGrab<State<Bd>> for DragGrab<Bd> {
         );
         if let Some(client) = data.wm.monitors[self.monitor].desktops[self.desktop]
             .tree
-            .node(self.node)
+            .node_mut(self.node)
             .client
-            .clone()
+            .as_mut()
         {
             let geometry = client.shown_rectangle();
+            client.window_rectangle = Some(geometry);
             let (monitor, desktop, node) = wire_ids(data, self.monitor, self.desktop, self.node);
             data.subscribers.broadcast_event(&Event::NodeGeometry {
                 monitor,

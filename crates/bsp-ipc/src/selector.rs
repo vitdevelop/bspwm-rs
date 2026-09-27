@@ -548,6 +548,9 @@ fn parse_monitor_descriptor(s: &str) -> Option<MonitorDescriptor> {
 pub enum ResolveError {
     /// No node matched.
     NoMatch,
+    /// A monitor or desktop name (or an index or id, which bspwm then tries as
+    /// a name) that names nothing: bspwm's `SELECTOR_BAD_DESCRIPTOR`.
+    BadDescriptor(String),
     /// The selector names a descriptor or modifier that needs state this
     /// build does not track yet (focus history, the pointer, or the X11
     /// "primary monitor" concept) — see `docs/bsp-ipc.md`, IPC scope.

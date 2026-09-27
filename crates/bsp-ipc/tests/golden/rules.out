@@ -1,0 +1,106 @@
+@monitor screen 1920x1080+0+0 Desktop
+> WMscreen:FDesktop:LT
+$ bspc monitor -d one two
+> desktop_rename 0x00200002 0x00200004 Desktop one
+> WMscreen:Fone:LT
+> WMscreen:Fone:LT
+> desktop_add 0x00200002 0x00200005 two
+> WMscreen:Fone:ftwo:LT
+$ bspc rule -a Floaty state=floating
+$ bspc rule -a Elsewhere desktop=two
+$ bspc rule -a Quiet focus=off
+$ bspc rule -a Sticky sticky=on
+$ bspc rule -a Hidden hidden=on
+$ bspc rule -a Once:once -o state=floating
+$ bspc rule -a Split split_dir=west split_ratio=0.3
+$ bspc rule -l
+Floaty:*:* => state=floating
+Elsewhere:*:* => desktop=two
+Quiet:*:* => focus=off
+Sticky:*:* => sticky=on
+Hidden:*:* => hidden=on
+Once:once:* -> state=floating
+Split:*:* => split_dir=west split_ratio=0.3
+$ window Tiler tiler
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_add 0x00200002 0x00200004 0x00000000 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x1066+6+6
+> WMscreen:Oone:ftwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+$ window Floaty floaty
+> node_add 0x00200002 0x00200004 0x00400000 0x00600000
+> node_state 0x00200002 0x00200004 0x00600000 tiled off
+> node_stack 0x00600000 above 0x00400000
+> node_state 0x00200002 0x00200004 0x00600000 floating on
+> WMscreen:Oone:ftwo:LT:TF:G
+> node_focus 0x00200002 0x00200004 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ window Elsewhere elsewhere
+> WMscreen:Oone:otwo:LT:TF:G
+> node_add 0x00200002 0x00200005 0x00000000 0x00800000
+> node_geometry 0x00200002 0x00200005 0x00800000 1906x1066+6+6
+> node_stack 0x00800000 below 0x00600000
+> WMscreen:Oone:otwo:LT:TF:G
+> node_activate 0x00200002 0x00200005 0x00800000
+$ window Quiet quiet
+> node_add 0x00200002 0x00200004 0x00600000 0x00A00000
+> node_geometry 0x00200002 0x00200004 0x00400000 949x1066+6+6
+> node_geometry 0x00200002 0x00200004 0x00A00000 949x1066+963+6
+> node_stack 0x00A00000 below 0x00400000
+$ window Sticky sticky
+> node_add 0x00200002 0x00200004 0x00600000 0x00C00000
+> node_flag 0x00200002 0x00200004 0x00C00000 sticky on
+> node_geometry 0x00200002 0x00200004 0x00C00000 470x1066+963+6
+> node_geometry 0x00200002 0x00200004 0x00A00000 471x1066+1441+6
+> WMscreen:Oone:otwo:LT:TT:GS
+> node_focus 0x00200002 0x00200004 0x00C00000
+> node_stack 0x00C00000 below 0x00600000
+$ window Hidden hidden
+> node_add 0x00200002 0x00200004 0x00C00000 0x00E00000
+> node_flag 0x00200002 0x00200004 0x00E00000 hidden on
+> node_geometry 0x00200002 0x00200004 0x00E00000 470x1066+963+6
+> node_stack 0x00E00000 below 0x00A00000
+$ window Once once
+> node_add 0x00200002 0x00200004 0x00C00000 0x01000000
+> node_state 0x00200002 0x00200004 0x01000000 tiled off
+> node_stack 0x01000000 above 0x00C00000
+> node_state 0x00200002 0x00200004 0x01000000 floating on
+> WMscreen:Oone:otwo:LT:TF:G
+> node_focus 0x00200002 0x00200004 0x01000000
+> node_stack 0x01000000 above 0x00600000
+$ window Once once
+> node_add 0x00200002 0x00200004 0x01000000 0x01200000
+> node_geometry 0x00200002 0x00200004 0x00C00000 470x529+963+6
+> node_geometry 0x00200002 0x00200004 0x01200000 470x529+963+543
+> WMscreen:Oone:otwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x01200000
+> node_stack 0x01200000 below 0x00600000
+$ window Split split
+> node_presel 0x00200002 0x00200004 0x01200000 dir west
+> node_presel 0x00200002 0x00200004 0x01200000 ratio 0.300000
+> node_presel 0x00200002 0x00200004 0x01200000 cancel
+> node_add 0x00200002 0x00200004 0x01200000 0x01400000
+> node_geometry 0x00200002 0x00200004 0x01400000 135x529+963+543
+> node_geometry 0x00200002 0x00200004 0x01200000 327x529+1106+543
+> WMscreen:Oone:otwo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x01400000
+> node_stack 0x01400000 below 0x00600000
+$ bspc rule -l
+Floaty:*:* => state=floating
+Elsewhere:*:* => desktop=two
+Quiet:*:* => focus=off
+Sticky:*:* => sticky=on
+Hidden:*:* => hidden=on
+Split:*:* => split_dir=west split_ratio=0.3
+$ bspc rule -r Floaty
+$ bspc rule -r ^1
+$ bspc rule -l
+Elsewhere:*:* => desktop=two
+Quiet:*:* => focus=off
+Sticky:*:* => sticky=on
+Hidden:*:* => hidden=on
+Split:*:* => split_dir=west split_ratio=0.3
+$ bspc query -T -m
+{"name":"screen","id":2097154,"randrId":60,"wired":true,"stickyCount":1,"windowGap":6,"borderWidth":1,"focusedDesktopId":2097156,"padding":{"top":0,"right":0,"bottom":0,"left":0},"rectangle":{"x":0,"y":0,"width":1920,"height":1080},"desktops":[{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":20971520,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":2097158,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":128,"min_height":160},"firstChild":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Tiler","instanceName":"tiler","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":949,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097159,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":1074},"constraints":{"min_width":96,"min_height":160},"firstChild":{"id":2097160,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":160},"firstChild":{"id":6291456,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Floaty","instanceName":"floaty","borderWidth":1,"state":"floating","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":0,"y":0,"width":0,"height":0},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097161,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":128},"firstChild":{"id":2097162,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":96},"firstChild":{"id":12582912,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":true,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Sticky","instanceName":"sticky","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":6,"width":470,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097163,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":64,"min_height":64},"firstChild":{"id":16777216,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Once","instanceName":"once","borderWidth":1,"state":"floating","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":0,"y":0,"width":0,"height":0},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097164,"splitType":"vertical","splitRatio":0.300000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":64,"min_height":32},"firstChild":{"id":20971520,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":143,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Split","instanceName":"split","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":543,"width":135,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":18874368,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":1106,"y":543,"width":335,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Once","instanceName":"once","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":1106,"y":543,"width":327,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null},"client":null},"secondChild":{"id":14680064,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":true,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Hidden","instanceName":"hidden","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":6,"width":470,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null},"secondChild":{"id":10485760,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":1441,"y":6,"width":479,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Quiet","instanceName":"quiet","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":1441,"y":6,"width":471,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null}},{"name":"two","id":2097157,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":8388608,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":8388608,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Elsewhere","instanceName":"elsewhere","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":false,"tiledRectangle":{"x":6,"y":6,"width":1906,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}}]}
+$ bspc wm -d
+{"focusedMonitorId":2097154,"clientsCount":9,"monitors":[{"name":"screen","id":2097154,"randrId":60,"wired":true,"stickyCount":1,"windowGap":6,"borderWidth":1,"focusedDesktopId":2097156,"padding":{"top":0,"right":0,"bottom":0,"left":0},"rectangle":{"x":0,"y":0,"width":1920,"height":1080},"desktops":[{"name":"one","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":20971520,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":2097158,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":128,"min_height":160},"firstChild":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":957,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Tiler","instanceName":"tiler","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":949,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097159,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":957,"height":1074},"constraints":{"min_width":96,"min_height":160},"firstChild":{"id":2097160,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":160},"firstChild":{"id":6291456,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Floaty","instanceName":"floaty","borderWidth":1,"state":"floating","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":0,"y":0,"width":0,"height":0},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097161,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":128},"firstChild":{"id":2097162,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":64,"min_height":96},"firstChild":{"id":12582912,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":true,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Sticky","instanceName":"sticky","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":6,"width":470,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097163,"splitType":"horizontal","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":64,"min_height":64},"firstChild":{"id":16777216,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Once","instanceName":"once","borderWidth":1,"state":"floating","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":0,"y":0,"width":0,"height":0},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":2097164,"splitType":"vertical","splitRatio":0.300000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":478,"height":537},"constraints":{"min_width":64,"min_height":32},"firstChild":{"id":20971520,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":543,"width":143,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Split","instanceName":"split","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":543,"width":135,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"secondChild":{"id":18874368,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":1106,"y":543,"width":335,"height":537},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Once","instanceName":"once","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":1106,"y":543,"width":327,"height":529},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null},"client":null},"secondChild":{"id":14680064,"splitType":"vertical","splitRatio":0.500000,"vacant":true,"hidden":true,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":963,"y":6,"width":478,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Hidden","instanceName":"hidden","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":963,"y":6,"width":470,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null},"secondChild":{"id":10485760,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":1441,"y":6,"width":479,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Quiet","instanceName":"quiet","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":1441,"y":6,"width":471,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}},"client":null},"client":null}},{"name":"two","id":2097157,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":8388608,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":8388608,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Elsewhere","instanceName":"elsewhere","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":false,"tiledRectangle":{"x":6,"y":6,"width":1906,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}}]}],"focusHistory":[{"monitorId":2097154,"desktopId":2097157,"nodeId":8388608},{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304},{"monitorId":2097154,"desktopId":2097156,"nodeId":6291456},{"monitorId":2097154,"desktopId":2097156,"nodeId":12582912},{"monitorId":2097154,"desktopId":2097156,"nodeId":16777216},{"monitorId":2097154,"desktopId":2097156,"nodeId":18874368},{"monitorId":2097154,"desktopId":2097156,"nodeId":20971520}],"stackingList":[14680064,10485760,4194304,8388608,12582912,18874368,20971520,6291456,16777216]}

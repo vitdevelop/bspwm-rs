@@ -1,0 +1,109 @@
+@monitor screen 1920x1080+0+0 Desktop
+> WMscreen:FDesktop:LT
+$ bspc monitor -d one two three
+> desktop_rename 0x00200002 0x00200004 Desktop one
+> WMscreen:Fone:LT
+> WMscreen:Fone:LT
+> desktop_add 0x00200002 0x00200005 two
+> WMscreen:Fone:ftwo:LT
+> desktop_add 0x00200002 0x00200006 three
+> WMscreen:Fone:ftwo:fthree:LT
+$ window Alpha alpha
+> WMscreen:Oone:ftwo:fthree:LT:TT:G
+> node_add 0x00200002 0x00200004 0x00000000 0x00400000
+> node_geometry 0x00200002 0x00200004 0x00400000 1906x1066+6+6
+> WMscreen:Oone:ftwo:fthree:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+$ bspc desktop -f two
+> desktop_focus 0x00200002 0x00200005
+> WMscreen:oone:Ftwo:fthree:LT
+$ window Beta beta
+> WMscreen:oone:Otwo:fthree:LT:TT:G
+> node_add 0x00200002 0x00200005 0x00000000 0x00600000
+> node_geometry 0x00200002 0x00200005 0x00600000 1906x1066+6+6
+> WMscreen:oone:Otwo:fthree:LT:TT:G
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ bspc desktop -f three
+> desktop_focus 0x00200002 0x00200006
+> WMscreen:oone:otwo:Fthree:LT
+$ bspc desktop -f last
+> desktop_focus 0x00200002 0x00200005
+> WMscreen:oone:Otwo:fthree:LT:TT:G
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ bspc desktop -f older
+> desktop_focus 0x00200002 0x00200006
+> WMscreen:oone:otwo:Fthree:LT
+$ bspc desktop -f newer
+? exit 1
+$ bspc desktop -n uno
+> desktop_rename 0x00200002 0x00200006 three uno
+> WMscreen:oone:otwo:Funo:LT
+$ bspc desktop two -n dos
+> desktop_rename 0x00200002 0x00200005 two dos
+> WMscreen:oone:odos:Funo:LT
+$ bspc query -D --names
+one
+dos
+uno
+$ bspc monitor -a four
+> desktop_add 0x00200002 0x00200007 four
+> WMscreen:oone:odos:Funo:ffour:LT
+$ bspc desktop four -m focused
+? exit 1
+$ bspc desktop dos -s three
+! desktop -s: Invalid descriptor found in 'three'.
+? exit 1
+$ bspc query -D --names
+one
+dos
+uno
+four
+$ bspc desktop uno -b next
+> desktop_swap 0x00200002 0x00200006 0x00200002 0x00200007
+> desktop_focus 0x00200002 0x00200006
+> WMscreen:oone:odos:ffour:Funo:LT
+> WMscreen:oone:odos:ffour:Funo:LT
+$ bspc query -D --names
+one
+dos
+four
+uno
+$ bspc desktop three -r
+! desktop: Invalid descriptor found in 'three'.
+? exit 1
+$ bspc desktop four -r
+> desktop_remove 0x00200002 0x00200007
+> WMscreen:oone:odos:Funo:LT
+$ bspc query -D --names
+one
+dos
+uno
+$ bspc desktop ^1 -f
+> desktop_focus 0x00200002 0x00200004
+> WMscreen:Oone:odos:funo:LT:TT:G
+> node_focus 0x00200002 0x00200004 0x00400000
+> node_stack 0x00400000 above 0x00600000
+$ bspc desktop next.occupied -f
+> desktop_focus 0x00200002 0x00200005
+> WMscreen:oone:Odos:funo:LT:TT:G
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00400000
+> WMscreen:oone:Odos:funo:LT:TT:G
+> node_focus 0x00200002 0x00200005 0x00600000
+> node_stack 0x00600000 above 0x00400000
+$ bspc monitor -d a b
+> desktop_rename 0x00200002 0x00200004 one a
+> WMscreen:oa:Odos:funo:LT:TT:G
+> desktop_rename 0x00200002 0x00200005 dos b
+> WMscreen:oa:Ob:funo:LT:TT:G
+> WMscreen:oa:Ob:funo:LT:TT:G
+> desktop_remove 0x00200002 0x00200006
+> WMscreen:oa:Ob:LT:TT:G
+$ bspc monitor -o x y z
+$ bspc query -D --names
+a
+b
+$ bspc wm -d
+{"focusedMonitorId":2097154,"clientsCount":2,"monitors":[{"name":"screen","id":2097154,"randrId":60,"wired":true,"stickyCount":0,"windowGap":6,"borderWidth":1,"focusedDesktopId":2097157,"padding":{"top":0,"right":0,"bottom":0,"left":0},"rectangle":{"x":0,"y":0,"width":1920,"height":1080},"desktops":[{"name":"a","id":2097156,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":4194304,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":4194304,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Alpha","instanceName":"alpha","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":false,"tiledRectangle":{"x":6,"y":6,"width":1906,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}},{"name":"b","id":2097157,"layout":"tiled","userLayout":"tiled","windowGap":6,"borderWidth":1,"focusedNodeId":6291456,"padding":{"top":0,"right":0,"bottom":0,"left":0},"root":{"id":6291456,"splitType":"vertical","splitRatio":0.500000,"vacant":false,"hidden":false,"sticky":false,"private":false,"locked":false,"marked":false,"presel":null,"rectangle":{"x":6,"y":6,"width":1914,"height":1074},"constraints":{"min_width":32,"min_height":32},"firstChild":null,"secondChild":null,"client":{"className":"Beta","instanceName":"beta","borderWidth":1,"state":"tiled","lastState":"tiled","layer":"normal","lastLayer":"normal","urgent":false,"shown":true,"tiledRectangle":{"x":6,"y":6,"width":1906,"height":1066},"floatingRectangle":{"x":10,"y":10,"width":400,"height":300}}}}]}],"focusHistory":[{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304},{"monitorId":2097154,"desktopId":2097157,"nodeId":0},{"monitorId":2097154,"desktopId":2097157,"nodeId":6291456},{"monitorId":2097154,"desktopId":2097156,"nodeId":4194304},{"monitorId":2097154,"desktopId":2097157,"nodeId":6291456}],"stackingList":[4194304,6291456]}

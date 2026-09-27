@@ -132,6 +132,20 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Whether the command only reads (`query`, `config KEY`, `wm -d`/`-g`):
+    /// when it also reported no event, nothing changed, and the compositor
+    /// neither reconciles nor sends a report line.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Command::Query(_) => true,
+            Command::Config(c) => c.value.is_none(),
+            Command::Wm(actions) => actions.iter().all(|a| matches!(a, WmAction::DumpState | WmAction::GetStatus)),
+            _ => false,
+        }
+    }
+}
+
 // ---- node ----------------------------------------------------------------
 
 /// `node --to-desktop`/`--to-monitor`/`--to-node`/`--swap`'s `--follow`.

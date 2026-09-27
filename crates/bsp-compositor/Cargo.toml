@@ -70,6 +70,8 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable", "stagi
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 rustix = { version = "1", features = ["fs", "time", "process"] }
+# `examples/golden_record.rs` reads bspwm's `query -T` output.
+serde_json = "1"
 
 [[example]]
 name = "capture_probe"

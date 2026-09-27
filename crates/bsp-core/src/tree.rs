@@ -1053,6 +1053,28 @@ impl Tree {
         best_automatic.or(best_manual).map(|(n, _)| n)
     }
 
+    /// Where [`Tree::insert_node`] puts a node anchored at `f` when `f` is
+    /// private (or under a private node) and has no preselection: at a public
+    /// leaf instead, if there is one; and if that is still private, split
+    /// along the anchor's longer side, a preselection `insert_node` makes and
+    /// then uses up. Returns the anchor and that preselection.
+    ///
+    /// bspwm: `src/tree.c` `insert_node()`'s private branch.
+    pub fn private_insertion(&self, f: NodeId) -> (NodeId, Option<Direction>) {
+        let privately = |t: &Self, f: NodeId| {
+            t.node(f).presel.is_none() && (t.node(f).private || t.node(f).parent.is_some_and(|p| t.private_count(Some(p)) > 0))
+        };
+        if !privately(self, f) {
+            return (f, None);
+        }
+        let f = self.find_public(self.root).unwrap_or(f);
+        if !privately(self, f) {
+            return (f, None);
+        }
+        let rect = self.node(f).rect;
+        (f, Some(if rect.width >= rect.height { Direction::East } else { Direction::South }))
+    }
+
     /// Inserts node `n` (freshly made with [`Tree::new_node`] or
     /// [`Tree::new_client_node`]) next to anchor `f` (or at the root if
     /// `f` is `None`), splitting `f`'s slot in two unless `f` is an empty
@@ -1089,28 +1111,11 @@ impl Tree {
                 self.free_slot(f_id);
                 f = None;
             }
-            Some(mut f_id) => {
-                let mut p = self.node(f_id).parent;
-                if self.node(f_id).presel.is_none()
-                    && (self.node(f_id).private
-                        || p.is_some_and(|p| self.private_count(Some(p)) > 0))
-                {
-                    if let Some(k) = self.find_public(self.root) {
-                        f_id = k;
-                        p = self.node(f_id).parent;
-                    }
-                    if self.node(f_id).presel.is_none()
-                        && (self.node(f_id).private
-                            || p.is_some_and(|p| self.private_count(Some(p)) > 0))
-                    {
-                        let rect = self.node(f_id).rect;
-                        let dir = if rect.width >= rect.height {
-                            Direction::East
-                        } else {
-                            Direction::South
-                        };
-                        self.presel_dir(f_id, dir, settings.split_ratio);
-                    }
+            Some(f_id) => {
+                let (f_id, presel) = self.private_insertion(f_id);
+                let p = self.node(f_id).parent;
+                if let Some(dir) = presel {
+                    self.presel_dir(f_id, dir, settings.split_ratio);
                 }
 
                 let c = self.new_node(settings);

@@ -289,10 +289,13 @@ pub struct State<Bd: Backend + 'static> {
     /// their release is not forwarded either, or the client would see a release
     /// with no press.
     pub swallowed_buttons: std::collections::HashSet<u32>,
-    /// `sync_wayland_from_core` is wanted but the caller holds the pointer's lock
-    /// (a drag grab callback), so it runs after the event-loop turn
-    /// (`shell::run_deferred_sync`).
+    /// `sync_wayland_from_core` is wanted: it runs once, after the event-loop
+    /// turn or before the next input event (`shell::run_deferred_sync`).
     pub sync_pending: bool,
+    /// The focus before the first change of this turn that may move the
+    /// pointer (`bspc` commands, map, unmap): the pointer follows the focus
+    /// after the deferred sync, once the windows are where the tree says.
+    pub warp_from: Option<crate::input::FocusKey>,
     /// Replies to `bspc` clients that read slowly, still being written.
     pub pending_replies: Vec<crate::ipc::PendingReply>,
     /// Whether the timer that revisits queued IPC output is armed.
@@ -312,11 +315,20 @@ pub struct State<Bd: Backend + 'static> {
 
 impl<Bd: Backend + 'static> State<Bd> {
     /// Asks for `sync_wayland_from_core` to run once the current event-loop turn
-    /// is over, outside any Smithay lock (`shell::run_deferred_sync`). The way
-    /// for code that cannot sync now (a pointer-grab callback, a commit) to get
-    /// the tree reconciled with the surfaces; several requests make one sync.
+    /// is over, or before the next input event, outside any Smithay lock
+    /// (`shell::run_deferred_sync`). Every change to the tree reconciles the
+    /// surfaces this way; several requests in one turn make one sync.
     pub fn request_sync(&mut self) {
         self.sync_pending = true;
+    }
+
+    /// [`Self::request_sync`], and then moves the pointer to what is focused if
+    /// `pointer_follows_focus`/`pointer_follows_monitor` ask for it
+    /// (`input::warp_pointer_for_focus`). `before` is the focus before the
+    /// change; the first one of the turn is kept.
+    pub fn request_warp(&mut self, before: crate::input::FocusKey) {
+        self.warp_from.get_or_insert(before);
+        self.request_sync();
     }
 
     /// Creates the compositor state and every protocol global, and starts
@@ -380,6 +392,7 @@ impl<Bd: Backend + 'static> State<Bd> {
             pointer_settings: crate::pointer_action::PointerSettings::default(),
             swallowed_buttons: std::collections::HashSet::new(),
             sync_pending: false,
+            warp_from: None,
             pending_replies: Vec::new(),
             ipc_flush_armed: false,
             last_periodic_sync: None,

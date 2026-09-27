@@ -1,0 +1,25 @@
+# Rules applied when windows map.
+bspc monitor -d one two
+bspc rule -a Floaty state=floating
+bspc rule -a Elsewhere desktop=two
+bspc rule -a Quiet focus=off
+bspc rule -a Sticky sticky=on
+bspc rule -a Hidden hidden=on
+bspc rule -a Once:once -o state=floating
+bspc rule -a Split split_dir=west split_ratio=0.3
+bspc rule -l
+window Tiler tiler
+window Floaty floaty
+window Elsewhere elsewhere
+window Quiet quiet
+window Sticky sticky
+window Hidden hidden
+window Once once
+window Once once
+window Split split
+bspc rule -l
+bspc rule -r Floaty
+bspc rule -r ^1
+bspc rule -l
+bspc query -T -m
+bspc wm -d

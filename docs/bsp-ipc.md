@@ -96,6 +96,7 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | --- | --- | --- |
 | `parse` | `fn(&[String]) -> Result<Command, ParseError>` | Full request parse: domain word dispatch (bspwm: `messages.c` `process_message()`) |
 | `parse_node` / `parse_desktop` / `parse_monitor` / `parse_query` / `parse_rule` / `parse_wm` / `parse_subscribe` / `parse_quit` / `parse_config` | `fn(&[String]) -> Result<Command, ParseError>` | One per domain, mirroring `cmd_node()` … `cmd_config()`; every flag accepts both its short and long spelling |
+| `Command::is_read_only` | `fn(&self) -> bool` | `query`, `config KEY`, `wm -d`/`-g`: with no event, nothing changed and the compositor sends no report |
 | `parse_output` / `parse_input` | `fn(&[String]) -> Result<Command, ParseError>` | Not bspwm domains — this project's own `xrandr`/`setxkbmap`/`xset r rate`/`xinput` replacements (`docs/design.md`) |
 
 ### `registry`
@@ -115,7 +116,7 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | `Report`'s `Display` impl | — | The `subscribe report`/`wm -g` status line, byte-for-byte (bspwm: `subscribe.c` `print_report()`) |
 | `Event`'s `Display` impl | — | One line per `subscribe` event, matching every format in `doc/bspwm.1.asciidoc`'s Events section |
 | `Event::kind` | `fn(&self) -> EventKind` | The event's category, for `subscribe` mask matching |
-| `JsonNode::from_tree` / `JsonDesktop::from_desktop` / `JsonMonitor::from_monitor` / `JsonState::new` | `fn(...) -> Self` | Builds bspwm's exact `query -T`/`wm -d` JSON shape (field names and order) from `bsp-core` state, given adapter-supplied node ids and client class/instance names |
+| `JsonNode::from_tree` / `JsonDesktop::from_desktop` / `JsonMonitor::from_monitor` / `JsonState::new` | `fn(...) -> Self` | Builds bspwm's exact `query -T`/`wm -d` JSON shape (field names and order) from `bsp-core` state, given adapter-supplied node ids and client class/instance names. `shown` (a client's) is whether its desktop is the one its monitor shows (`show_node()`/`hide_node()`) |
 
 ### `adapter`
 
@@ -144,6 +145,10 @@ None of these silently produce a wrong answer: every gap above is either a `Reso
 | `exec::set_urgent` | `fn(&mut ExecCtx<A>, Coordinates, bool, &mut Vec<Event>)` | `src/tree.c` `set_urgent()`: `node_flag ... urgent on/off`; a window already focused on the focused desktop cannot become urgent |
 | `exec::Coordinates` | struct | Monitor index, desktop index and optional node of a target; re-exported for the compositor's calls above |
 | `exec::set_monitor_rectangle` | `fn(&mut ExecCtx<A>, usize, Rect, &mut Vec<Event>) -> usize` | Applies a new monitor rectangle (adapt tree geometry, re-arrange, `MonitorGeometry` event, `reorder_monitor`); extracted from `bspc monitor -g`, shared with the compositor's output changes. Returns the monitor's index after reordering |
+| `exec::manage_window` / `exec::NewWindow` | `fn(&mut ExecCtx<A>, &NewWindow, &RuleConsequence, &mut Vec<Event>) -> Option<Coordinates>` | `src/window.c` `manage_window()` from the rule target on: a sticky window stays on the focused desktop; the rule's `split_dir`/`split_ratio` preselect the anchor (`node_presel`); the floating rectangle is the window's own geometry (`NewWindow::geometry`, an X11 window's; centred when it asked for no position, brought onto the target monitor with `embrace_client()`/`adapt_geometry()`), a rule's `rectangle=`, or for a Wayland window the tiled slot; the node is kept vacant while inserted when it will not tile; `node_add`, the state (`node_state`), the flags the rule turns on (`node_flag`), a floating window takes the anchor's layer; then focused, activated or stacked at the bottom. `None` without a focused desktop |
+| `exec::unmanage_window` | `fn(&mut ExecCtx<A>, WindowId, &mut Vec<Event>) -> Option<Coordinates>` | `src/window.c` `unmanage_window()`: `node_remove`, the node out of the tree (the focus moves on if it held it), the desktop re-arranged |
+| `exec::push_geometry_changes` | `fn(&mut Wm, &NodeRegistry, &mut Vec<Event>)` | `src/tree.c` `apply_layout()`'s report: `node_geometry` for every window (hidden ones too) whose rectangle as its state shows it (the monitor for fullscreen) differs from `Client::window_rectangle`, which it then updates. `execute` and the compositor's `with_ops` run it; `node -v`/`-z` and pointer drags record what they report |
+| `exec::center_rect` | `fn(&mut Rect, Rect, i32)` | `src/window.c` `window_center()` |
 | `exec_output` / `exec_input` | `fn(&mut ExecCtx<A>, Option<&str>, &[OutputAction]/&[InputAction]) -> Reply` | List/get/set over `Adapter`'s output/input methods; no hardware knowledge of its own |
 
 ### `server`
@@ -196,3 +201,19 @@ REVIEW3 batches 4–5 and query:
 - `bspc query` (`QueryCommand { monitor_ref, desktop_ref, node_ref, targets: Vec<QueryTarget>, monitor_filter, desktop_filter, node_filter, names }`) is a port of `cmd_query()`/`query_*_ids()`.
 
 The control socket: the first instance binds `$XDG_RUNTIME_DIR/bspwm-rs-socket`; `Listener::bind` refuses (`AddrInUse`) a path another server answers on, and the compositor then binds `bspwm-rs-$WAYLAND_DISPLAY-socket` and exports `BSPWM_SOCKET`. A `Listener` removes only its own socket file when dropped. `^n` without a monitor indexes the desktops of all monitors in order.
+
+## Golden tests (REVIEW4 R2)
+
+`tests/golden.rs` compares bspwm-rs with the real bspwm 0.9.12. Each `tests/golden/NAME.scn` is a scenario (`bspc ...`, `window CLASS INSTANCE [WxH+X+Y]`, `close N`); `NAME.out` is bspwm's transcript, recorded under Xvfb by `bsp-compositor`'s `examples/golden_record.rs` through `contrib/golden/record.sh` (run in the QEMU test VM: `pacman -S bspwm xorg-server-xvfb xorg-xprop` in the live system). The test replays each scenario through `exec::execute`, `exec::manage_window`/`unmanage_window` and the compositor's report rule, names every id by its first appearance, and compares each step's output, errors and exit status in order, its events as a sorted list, and the latest report line. `KNOWN` lists the steps where bspwm does something bspwm-rs cannot, with the reason (the X server's `FocusIn` makes bspwm focus again; focus history within one command). After changing a scenario, record it again and commit the new `.out`.
+
+What the first recording found, now as bspwm does it:
+- `monitor -d` renames (`desktop_rename`, even to the same name), adds (`desktop_add`) and removes the rest (`desktop_remove`), their windows moved to the focused desktop, the focus first moving off a desktop that goes; `monitor -o` swaps position by position (`desktop_swap`); `monitor -n` reports `monitor_rename`.
+- `node_geometry` for windows the layout moves (`push_geometry_changes`), not only for `node -v`/`-z` and drags.
+- `node_presel ... cancel` when an insertion uses up a preselection, and `dir` then `cancel` for the one `insert_node()` makes next to a private node (`Tree::private_insertion`); `node -p cancel` reports only a preselection it removed; a rule's `split_dir`/`split_ratio` report `node_presel`; ratios print with `%lf` (`0.300000`), as does `config split_ratio`.
+- `node -t` between tiled and pseudo-tiled does not restack (`set_floating()`/`set_fullscreen()` do).
+- `node -g FLAG` reports only a change (`set_flag_reporting`, shared with `manage_window`).
+- A monitor or desktop name that names nothing fails with `CMD: Invalid descriptor found in 'NAME'.` (`ResolveError::BadDescriptor`, bspwm's `handle_failure()`).
+- `rule -r CAUSE` needs `CLASS:INSTANCE:NAME` (with `*`), as bspwm 0.9.12's `remove_rule_by_cause()`; `rule -r CLASS` removes nothing.
+- `config single_monocle` refuses the value it has and otherwise puts every desktop in monocle or its own layout (`desktop_layout`).
+- Monitor, desktop and node ids never collide; a monitor's first desktop is `Desktop`.
+- The focus history records a desktop when it is shown, not when it is made, and not the desktop a session starts on.
